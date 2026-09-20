@@ -99,18 +99,18 @@ test('all non-ready states remove quota card percentages and data',()=>{
   const html=renderContent(buildViewModel({...state(),status},now));assert.doesNotMatch(html,/role="progressbar"|42%|17%/);
  }
 });
-test('provider setup is shown only for a detected session that needs connecting',()=>{
+test('provider setup renders exact and generic actions only when offered',()=>{
  for(const status of ['ready','loading','unavailable','ambiguous','unsupported','no-terminal']) {
   const html=renderContent(buildViewModel({...state(),status},now));
   assert.doesNotMatch(html,/<button\b/);
  }
- for(const provider of ['claude','antigravity']) {
+ for(const [provider,label] of [['claude','Connect Claude'],['codex','Connect Codex'],['antigravity','Connect Antigravity'],[null,'Connect Provider']]) {
   const html=renderContent(buildViewModel({status:'unavailable',setupTarget:{provider}},now));
   const buttons=[...html.matchAll(/<button\b([^>]*)>([^<]*)<\/button>/g)];
   assert.equal(buttons.length,1,`${provider} must offer one provider connection action`);
   assert.match(buttons[0][1],/type="button"/);
   assert.match(buttons[0][1],/data-action="connect"/);
-  assert.equal(buttons[0][2],provider==='claude'?'Connect Claude':'Connect Antigravity');
+  assert.equal(buttons[0][2],label);
   assert.doesNotMatch(buttons[0][1],/disabled|tabindex="-1"/);
  }
 });

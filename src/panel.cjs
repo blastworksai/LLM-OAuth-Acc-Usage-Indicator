@@ -17,8 +17,13 @@ function label(minutes) {
 }
 function buildViewModel(state,now=Date.now()) {
   const vm={status:state.status,terminal:state.terminalName||'No terminal selected',windows:[],headline:null};
+  const offered=state.status==='unavailable' && state.setupTarget
+    ? ['claude','codex','antigravity'].includes(state.setupTarget.provider)
+      ? state.setupTarget.provider
+      : state.setupTarget.provider===null?'generic':null
+    : null;
   if(state.status!=='ready')return {...vm,
-    setupProvider:state.status==='unavailable' && ['claude','antigravity'].includes(state.setupTarget?.provider)?state.setupTarget.provider:null,
+    setupProvider:offered,
     title:({'no-terminal':'Select a terminal',loading:'Finding the active account',unavailable:'No account reading yet',ambiguous:'More than one session',unsupported:'Usage unavailable on this host'})[state.status]||'No account reading yet',
     message:({
       'no-terminal':'Your account card follows the terminal you select.',
@@ -73,7 +78,8 @@ function windowHtml(w) {
 }
 function renderContent(vm,assets={}) {
   const follow=`<div class="terminal-context"><span class="eyebrow">Following terminal</span><span class="terminal-name" title="${escape(vm.terminal)}">${escape(vm.terminal)}</span></div>`;
-  const connect=vm.setupProvider?`<div class="card-actions"><button class="connect-provider" type="button" data-action="connect">Connect ${vm.setupProvider==='claude'?'Claude':'Antigravity'}</button></div>`:'';
+  const setupLabel={claude:'Claude',codex:'Codex',antigravity:'Antigravity',generic:'Provider'}[vm.setupProvider];
+  const connect=setupLabel?`<div class="card-actions"><button class="connect-provider" type="button" data-action="connect">Connect ${setupLabel}</button></div>`:'';
   if(vm.status!=='ready')return `${follow}<article class="account-card empty-card" aria-label="Account Usage"><span class="eyebrow">Account Usage</span><h2>${escape(vm.title)}</h2><p>${escape(vm.message)}</p>${connect}${vm.reason?`<details class="report-details"><summary>Details</summary><p>${escape(vm.reason)}</p></details>`:''}</article><p class="coverage-note">Claude, Codex and Antigravity · other tools not yet supported</p>`;
   const logo=assets[vm.providerKey];
   const mark=logo?`<span class="provider-mark"><img src="${escape(logo)}" alt="" aria-hidden="true"></span>`:'';

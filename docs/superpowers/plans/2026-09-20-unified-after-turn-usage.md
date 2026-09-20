@@ -68,7 +68,7 @@ runs_in: task:align-all-providers-on-zero-token-after
 - Consumes: `detectProvider(terminalPid)` and `setup.listConnections()`.
 - Produces: a detected `{provider, cliPath, executable, process}` for Codex as well as Claude/Antigravity; `state.setupTarget` as either an exact target or `{provider:null}`; `buildViewModel(...).setupProvider` where `null` means no action, `generic` means `Connect Provider`, and a provider name means a specific action.
 
-- [ ] **Step 1: Write failing provider, extension, and panel tests**
+- [x] **Step 1: Write failing provider, extension, and panel tests**
 
 ```js
 test('a foreground native Codex process is detected through its stable CLI lookup', async () => {
@@ -92,13 +92,13 @@ test('unavailable cards render specific and generic setup labels only when offer
 });
 ```
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 Run: `node --test test/provider.test.cjs test/extension.test.cjs test/panel.test.cjs`
 
 Expected: failures show Codex is not detected, generic setup is absent, and the panel cannot render Codex or generic labels.
 
-- [ ] **Step 3: Implement the minimal connection behavior**
+- [x] **Step 3: Implement the minimal connection behavior**
 
 ```js
 // provider.cjs: include the native `codex` lookup alongside `claude` and `agy`.
@@ -119,13 +119,13 @@ result.setupTarget = target && !connected.has(target.provider)
 
 The picker contains Codex, Claude Code, and Antigravity, excludes connected providers, rechecks the selected terminal before the write, and retains the existing profile/executable confirmation.
 
-- [ ] **Step 4: Run the focused tests and verify GREEN**
+- [x] **Step 4: Run the focused tests and verify GREEN**
 
 Run: `node --test test/provider.test.cjs test/extension.test.cjs test/panel.test.cjs`
 
 Expected: all focused tests pass with no warnings.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/provider.cjs src/extension.cjs src/panel.cjs test/provider.test.cjs test/extension.test.cjs test/panel.test.cjs
@@ -343,4 +343,4 @@ git commit -m "release: prepare Account Usage 0.3.3"
 
 ## Progress
 
-- Plan written from the approved 20 September design; implementation not started.
+- Checkpoint 1 implemented: Codex detection plus safe generic/provider-specific setup actions; RED confirmed 4 failures, GREEN `36/36` via `node --test test/provider.test.cjs test/extension.test.cjs test/panel.test.cjs`.

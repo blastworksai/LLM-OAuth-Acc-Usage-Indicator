@@ -41,7 +41,7 @@ function createProviderDetector({platform=process.platform,uid=process.getuid?.(
    if(typeof home==='string' && path.isAbsolute(home))directories.push(path.join(home,'.local','bin'));
    const known=new Map();
    for(const directory of new Set(directories.map(directory=>path.resolve(directory)))) {
-    for(const [provider,command] of [['claude','claude'],['antigravity','agy']]) {
+    for(const [provider,command] of [['claude','claude'],['codex','codex'],['antigravity','agy']]) {
      const cliPath=path.join(directory,command),executable=await resolveNative(cliPath);
      if(typeof executable!=='string' || !path.isAbsolute(executable))continue;
      if(!known.has(executable))known.set(executable,{provider,cliPath});

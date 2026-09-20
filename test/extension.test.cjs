@@ -5,13 +5,13 @@ const fs=require('node:fs');
 const path=require('node:path');
 const vm=require('node:vm');
 
-function harness({discover,connect,disconnect,recover='Recover connection',confirm='Connect',pickPath='/example/profile',savedTrust=[],terminal,detect=async()=>null,connections=[]}={}) {
+function harness({discover,connect,disconnect,recover='Recover connection',confirm='Connect',pickPath='/example/profile',pickProvider='claude',savedTrust=[],terminal,detect=async()=>null,connections=[]}={}) {
   const commands=new Map(),connected=[],errors=[],warnings=[],confirmations=[],storage=new Map([['trustedDirectories',savedTrust]]);
-  let provider,receive,picks=0;
+  let provider,receive,picks=0,lastPickItems=[];
   const disposable=()=>({dispose(){}});
   const vscode={Uri:{file:value=>({fsPath:value}),joinPath:(_base,...parts)=>({fsPath:parts.join('/')})},workspace:{getConfiguration:()=>({get:()=>[]}),onDidChangeConfiguration:disposable},
     window:{activeTerminal:terminal,registerWebviewViewProvider:(_id,value)=>{provider=value;return disposable();},onDidChangeActiveTerminal:disposable,onDidCloseTerminal:disposable,
-      showQuickPick:async()=>{picks++;return {provider:'claude'};},showOpenDialog:async()=>pickPath?[{fsPath:pickPath}]:undefined,
+      showQuickPick:async items=>{picks++;lastPickItems=items;return items.find(item=>item.provider===pickProvider);},showOpenDialog:async()=>pickPath?[{fsPath:pickPath}]:undefined,
       showInformationMessage:async(message,options,...actions)=>{if(options?.modal){confirmations.push({message,options,actions});return confirm;}},
       showWarningMessage:async(message,action)=>{warnings.push(message);return action?.modal?recover:action;},
       showErrorMessage:async message=>{errors.push(message);}},
@@ -34,7 +34,7 @@ function harness({discover,connect,disconnect,recover='Recover connection',confi
       onDidReceiveMessage:callback=>{receive=callback;return disposable();}},onDidChangeVisibility:disposable,onDidDispose:disposable});
     return async message=>{receive(message);await new Promise(setImmediate);};
   };
-  return {commands,connected,errors,warnings,confirmations,storage,openCard,api,vscode,get picks(){return picks;}};
+  return {commands,connected,errors,warnings,confirmations,storage,openCard,api,vscode,get picks(){return picks;},get lastPickItems(){return lastPickItems;}};
 }
 const problem=code=>Object.assign(new Error('Choose the required local resource.'),{code,safeToDisplay:true});
 
@@ -104,10 +104,10 @@ test('a previously approved exact directory is passed to later setup operations'
   assert.deepEqual(JSON.parse(JSON.stringify(h.connected[0].trustedDirectories)),savedTrust);
 });
 
-const target=provider=>({provider,cliPath:`/example/native/${provider==='claude'?'claude':'agy'}`,process:{pid:20,uid:1000,start_ticks:'20',boot_id:'boot'}});
+const target=provider=>({provider,cliPath:`/example/native/${{claude:'claude',codex:'codex',antigravity:'agy'}[provider]}`,process:{pid:20,uid:1000,start_ticks:'20',boot_id:'boot'}});
 const terminal=()=>({name:'Example terminal',processId:Promise.resolve(10)});
 test('card connects the detected provider without a picker and retains permission confirmation',async()=>{
- for(const provider of ['claude','antigravity']) {
+ for(const provider of ['claude','codex','antigravity']) {
   const h=harness({terminal:terminal(),detect:async()=>target(provider)}),send=h.openCard();
   await h.api.refresh();
   await send({type:'unexpected',command:'llmAccountUsage.connect'});
@@ -118,6 +118,7 @@ test('card connects the detected provider without a picker and retains permissio
   assert.equal(h.connected[0].provider,provider);
   assert.equal(h.connected[0].cliPath,target(provider).cliPath);
   assert.equal(h.picks,0);
+  assert.match(h.confirmations[0].message,new RegExp(provider==='claude'?'Claude Code':provider==='codex'?'Codex':'Antigravity'));
  }
   const cancelled=harness({confirm:'Cancel',terminal:terminal(),detect:async()=>target('claude')});
   await cancelled.api.refresh();
@@ -125,14 +126,30 @@ test('card connects the detected provider without a picker and retains permissio
   assert.equal(cancelled.connected.length,0);
 });
 
-test('plain terminals, unsupported CLIs and connected sessions offer no setup target',async()=>{
- for(const input of [{terminal:terminal()},{},
-  {terminal:terminal(),detect:async()=>target('claude'),connections:[{provider:'claude',reportDir:'/example/reports'}]}]) {
-  const h=harness(input);await h.api.refresh();
-  assert.equal(h.api.getState().setupTarget,undefined);
-  await h.openCard()({type:'connect'});
-  assert.equal(h.connected.length,0);assert.equal(h.picks,0);
- }
+test('an unknown unavailable session offers only unconnected providers through the generic picker',async()=>{
+ const h=harness({terminal:terminal(),pickProvider:'codex',connections:[{provider:'claude',reportDir:'/example/claude'}]});
+ const send=h.openCard();
+ await h.api.refresh();
+ assert.deepEqual(JSON.parse(JSON.stringify(h.api.getState().setupTarget)),{provider:null});
+ await send({type:'connect'});
+ assert.equal(h.connected.length,1);
+ assert.equal(h.connected[0].provider,'codex');
+ assert.deepEqual(JSON.parse(JSON.stringify(h.lastPickItems.map(item=>item.provider))),['codex','antigravity']);
+});
+
+test('unknown sessions stop offering setup when all providers are connected',async()=>{
+ const connections=['claude','codex','antigravity'].map(provider=>({provider,reportDir:`/example/${provider}`}));
+ const h=harness({terminal:terminal(),connections});await h.api.refresh();
+ assert.equal(h.api.getState().setupTarget,undefined);
+ await h.openCard()({type:'connect'});
+ assert.equal(h.connected.length,0);assert.equal(h.picks,0);
+});
+
+test('a detected connected provider waits for a fresh report without setup',async()=>{
+ const h=harness({terminal:terminal(),detect:async()=>target('claude'),connections:[{provider:'claude',reportDir:'/example/reports'}]});
+ await h.api.refresh();
+ assert.equal(h.api.getState().setupTarget,undefined);
+ assert.match(h.api.getState().reason,/connected.*fresh/i);
 });
 
 test('stale card actions and a terminal change during confirmation cannot connect a different session',async()=>{
@@ -147,4 +164,10 @@ test('stale card actions and a terminal change during confirmation cannot connec
  }});
  await active.api.refresh();await active.openCard()({type:'connect'});
  assert.equal(active.connected.length,0);
+ let generic;
+ generic=harness({terminal:terminal(),pickProvider:'codex',discover:async()=>{
+  generic.vscode.window.activeTerminal=terminal();return {profilePath:'/example/profile'};
+ }});
+ await generic.api.refresh();await generic.openCard()({type:'connect'});
+ assert.equal(generic.connected.length,0);
 });

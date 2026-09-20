@@ -46,13 +46,15 @@ function activate(context) {
     if(result.status==='unavailable' && rejected)result.reason='No matching readable report. A report directory is missing, unreadable or unsafe.';
     if(result.status==='unavailable') {
       const target=await detectProvider(pid);
-      if(target && !connections.some(connection=>connection.provider===target.provider))result.setupTarget=target;
+      const connected=new Set(connections.map(connection=>connection.provider));
+      if(target && !connected.has(target.provider))result.setupTarget=target;
       else if(target)result.reason='This provider is connected. Waiting for a fresh statusline reading from this session.';
+      else if(connected.size<3)result.setupTarget={provider:null};
     }
     return result;
   },render);
   const refresh=(quiet=false)=>controller.select(vscode.window.activeTerminal,{quiet});
-  const providerName=provider=>provider==='claude'?'Claude Code':'Antigravity';
+  const providerName=provider=>({claude:'Claude Code',codex:'Codex',antigravity:'Antigravity'})[provider]||'Provider';
   const showSetupError=error=>vscode.window.showErrorMessage(error?.safeToDisplay===true
     ? error.message : 'Provider setup could not finish. Check that the profile is readable and owned by your user.');
   const withRecovery=async(operation,options)=>{
@@ -76,14 +78,20 @@ function activate(context) {
     if(fromCard && !offered)return;
     const pid=selected?await selected.processId:null;
     const detected=pid?await detectProvider(pid):null;
-    if(fromCard && (selected!==vscode.window.activeTerminal || !sameTarget(offered,detected))) {await refresh();return;}
-    const picked=detected || await vscode.window.showQuickPick([
+    if(fromCard && (selected!==vscode.window.activeTerminal ||
+      (offered.provider!==null && !sameTarget(offered,detected)))) {await refresh();return;}
+    await setupReady;
+    const connections=await setup.listConnections(setupOptions).catch(()=>[]);
+    const connected=new Set(connections.map(connection=>connection.provider));
+    const choices=[
+      {label:'Codex',provider:'codex'},
       {label:'Claude Code',provider:'claude'},
       {label:'Antigravity',provider:'antigravity'}
-    ],{title:'Connect an account usage provider',placeHolder:'Codex is detected automatically.'});
+    ].filter(choice=>!connected.has(choice.provider));
+    const picked=detected && !connected.has(detected.provider) ? detected : await vscode.window.showQuickPick(
+      choices,{title:'Connect an account usage provider',placeHolder:'Choose the CLI running in this terminal.'});
     if(!picked)return;
     try {
-      await setupReady;
       let profilePath,cliPath=detected?.cliPath;
       while(true) {
         const options={...setupOptions,provider:picked.provider,...(profilePath?{profilePath}:{}),...(cliPath?{cliPath}:{})};
@@ -118,7 +126,9 @@ function activate(context) {
           profilePath=selected[0].fsPath;continue;
         }
         if(action!==connectAction)return;
-        if(detected && (selected!==vscode.window.activeTerminal || !sameTarget(detected,await detectProvider(pid)))) {
+        const currentPid=selected?await selected.processId:null;
+        if(selected!==vscode.window.activeTerminal || currentPid!==pid ||
+          (detected && !sameTarget(detected,await detectProvider(pid)))) {
           await vscode.window.showInformationMessage('The selected terminal changed. Select its session and connect again.');
           await refresh();return;
         }

@@ -9,7 +9,7 @@ const proc=(pid,ppid,changes={})=>({pid,ppid,uid:1000,start_ticks:String(pid),bo
 const identity={pid:20,uid:1000,start_ticks:'20',boot_id:'boot'};
 function fixture(changes={}) {
  const processes=[proc(10,1),proc(20,10)];
- const paths=new Map([['/opt/tools/claude','/opt/releases/claude/2.0.0'],['/opt/tools/agy','/opt/releases/agy/1.0.0']]);
+ const paths=new Map([['/opt/tools/claude','/opt/releases/claude/2.0.0'],['/opt/tools/codex','/opt/releases/codex/1.0.0'],['/opt/tools/agy','/opt/releases/agy/1.0.0']]);
  const dependencies={platform:'linux',uid:1000,env:{PATH:'/opt/tools'},home:'/home/example',
   processIds:async function*(){for(const p of processes)yield p.pid;},
   getProcess:async pid=>processes.find(p=>p.pid===pid)||null,
@@ -18,16 +18,16 @@ function fixture(changes={}) {
  return {detect:createProviderDetector(dependencies),processes,paths};
 }
 
-test('a foreground native Claude or AGY is detected through its stable CLI lookup',async()=>{
- for(const [provider,command,version] of [['claude','claude','2.0.0'],['antigravity','agy','1.0.0']]) {
+test('a foreground native Claude, Codex or AGY is detected through its stable CLI lookup',async()=>{
+ for(const [provider,command,version] of [['claude','claude','2.0.0'],['codex','codex','1.0.0'],['antigravity','agy','1.0.0']]) {
   const f=fixture({getExecutable:async pid=>pid===20?`/opt/releases/${command}/${version}`:'/usr/bin/bash'});
   assert.deepEqual(await f.detect(10),{provider,cliPath:`/opt/tools/${command}`,process:identity});
  }
 });
-test('shells, Codex, unknown binaries and unsupported hosts produce no setup suggestion',async()=>{
+test('shells, unknown binaries and unsupported hosts produce no setup suggestion',async()=>{
  for(const changes of [
   {platform:'win32'}, {platform:'darwin'}, {getProcess:async()=>null},
-  {getExecutable:async()=>'/usr/bin/bash'}, {getExecutable:async()=>'/opt/native/codex'},
+  {getExecutable:async()=>'/usr/bin/bash'}, {getExecutable:async()=>'/opt/native/unknown-codex'},
   {getExecutable:async()=>'/unknown/claude'}, {getExecutable:async()=>'/unknown/agy'},
   {getExecutable:async()=>'/usr/bin/node'}, {getExecutable:async()=>'/opt/releases/claude/2.0.0 (deleted)'}
  ]) assert.equal(await fixture(changes).detect(10),null);

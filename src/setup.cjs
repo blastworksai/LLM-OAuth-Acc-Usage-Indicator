@@ -9,7 +9,7 @@ const {randomUUID, createHash} = require('node:crypto');
 const {isDeepStrictEqual} = require('node:util');
 const {promisify} = require('node:util');
 const {execFile} = require('node:child_process');
-const PROVIDERS = ['claude', 'antigravity'];
+const PROVIDERS = ['claude', 'codex', 'antigravity'];
 const MARKER = 'llm-account-usage-managed-v1';
 const MAX_SETTINGS = 1024 * 1024;
 const own = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
@@ -21,7 +21,7 @@ function failure(code, message) { const error = new Error(message); error.code =
 function recoverable(code, message, recoveryAction) {
   return Object.assign(failure(code, message), {recoverable:true, recoveryAction});
 }
-const managed = line => typeof line?.command === 'string' && line.command.includes(MARKER);
+const managedStatusLine = line => typeof line?.command === 'string' && line.command.includes(MARKER);
 function installedCommand(launcherPath, originalStatusLine) {
   // Let the provider's existing shell interpret the exact user-owned source.
   // The launcher only duplicates raw stdin; it never selects an interpreter
@@ -30,6 +30,11 @@ function installedCommand(launcherPath, originalStatusLine) {
     ? `${quote(launcherPath)} | (\n${originalStatusLine.command}\n)\n# ${MARKER}`
     : `${quote(launcherPath)} # ${MARKER}`;
 }
+function installedCodexHook(launcherPath) {
+  return {matcher:'.*', hooks:[{type:'command', statusMessage:'Account Usage', command:`${quote(launcherPath)} # ${MARKER}`}]};
+}
+const managedCodexHook = entry => Array.isArray(entry?.hooks) && entry.hooks.some(hook =>
+  typeof hook?.command === 'string' && hook.command.includes(MARKER));
 
 function createSetup(dependencies = {}) {
   const io = dependencies.fs || fs;
@@ -40,7 +45,7 @@ function createSetup(dependencies = {}) {
     if(result.platform !== 'linux' || !Number.isSafeInteger(result.uid))
       throw failure('UNSUPPORTED_PLATFORM', 'Provider setup supports Linux terminal hosts, including Remote-SSH to Linux.');
     if(result.provider !== undefined && !PROVIDERS.includes(result.provider))
-      throw failure('UNSUPPORTED_PROVIDER', 'Choose Claude Code or Antigravity CLI. Codex needs no provider setup.');
+      throw failure('UNSUPPORTED_PROVIDER', 'Choose Claude Code, Codex, or Antigravity CLI.');
     return result;
   }
   function absolute(value, code = 'UNSAFE_PATH') {
@@ -146,7 +151,7 @@ function createSetup(dependencies = {}) {
   }
   async function findCli(o) {
     if(o.cliPath) return {cliPath:await nativeExecutable(o.cliPath, o), cliLookupPath:absolute(o.cliPath)};
-    const command = o.provider === 'claude' ? 'claude' : 'agy';
+    const command = o.provider === 'claude' ? 'claude' : o.provider === 'codex' ? 'codex' : 'agy';
     for(const directory of String(o.env.PATH || '').split(path.delimiter)) {
       if(!path.isAbsolute(directory)) continue;
       const candidate = path.join(directory, command);
@@ -158,11 +163,13 @@ function createSetup(dependencies = {}) {
     if(o.profilePath) return absolute(o.profilePath, 'PROFILE_REQUIRED');
     const suspicious = Object.keys(o.env).some(key => o.env[key] &&
       (o.provider === 'claude' ? /^CLAUDE_.*(?:PROFILE|CONFIG|HOME)/.test(key) && key !== 'CLAUDE_CONFIG_DIR'
-        : /^(?:AGY|ANTIGRAVITY|GEMINI)_.*(?:PROFILE|CONFIG|HOME|DIR)/.test(key)));
+        : o.provider === 'codex' ? /^CODEX_.*(?:PROFILE|CONFIG|HOME|DIR)/.test(key) && key !== 'CODEX_HOME'
+          : /^(?:AGY|ANTIGRAVITY|GEMINI)_.*(?:PROFILE|CONFIG|HOME|DIR)/.test(key)));
     if(suspicious || o.profileOverrideDetected)
       throw failure('PROFILE_REQUIRED', 'A provider profile override is present. Select its exact settings directory explicitly.');
     if(o.provider === 'claude' && o.env.CLAUDE_CONFIG_DIR) return absolute(o.env.CLAUDE_CONFIG_DIR, 'PROFILE_REQUIRED');
-    return path.join(absolute(o.homeDir), o.provider === 'claude' ? '.claude' : '.gemini/antigravity-cli');
+    if(o.provider === 'codex' && o.env.CODEX_HOME) return absolute(o.env.CODEX_HOME, 'PROFILE_REQUIRED');
+    return path.join(absolute(o.homeDir), o.provider === 'claude' ? '.claude' : o.provider === 'codex' ? '.codex' : '.gemini/antigravity-cli');
   }
   function checkStatusLine(config) {
     if(!own(config, 'statusLine')) return;
@@ -171,16 +178,25 @@ function createSetup(dependencies = {}) {
       throw failure('UNSUPPORTED_STATUSLINE', 'The existing status line is not a supported command. Setup left it unchanged.');
     if(line.enabled === false) throw failure('UNSUPPORTED_STATUSLINE', 'The existing status line is disabled. Enable it in the provider before connecting.');
   }
+  function checkCodexHooks(config) {
+    if(own(config, 'hooks') && (!object(config.hooks) || Object.values(config.hooks).some(value => !Array.isArray(value))))
+      throw failure('UNSUPPORTED_HOOKS', 'The existing Codex hooks file has an unsupported shape. Setup left it unchanged.');
+  }
+  function codexHookState(config, installedHook) {
+    checkCodexHooks(config);
+    const events = object(config.hooks) ? Object.values(config.hooks) : [], entries = events.flat(), stop=config.hooks?.Stop||[];
+    return {exact:stop.filter(entry => isDeepStrictEqual(entry, installedHook)), managed:entries.filter(managedCodexHook)};
+  }
   async function inspect(o, {validateStatusLine = true} = {}) {
     if(!o.provider) throw failure('UNSUPPORTED_PROVIDER', 'Choose a provider.');
     const profilePath = profile(o);
     await safeDirectories(profilePath, o);
-    const settingsPath = path.join(profilePath, 'settings.json');
+    const settingsPath = path.join(profilePath, o.provider === 'codex' ? 'hooks.json' : 'settings.json');
     const bytes = await readSafe(settingsPath, o);
     const config = parse(bytes);
-    if(validateStatusLine) checkStatusLine(config);
+    if(o.provider === 'codex') checkCodexHooks(config);else if(validateStatusLine) checkStatusLine(config);
     return {provider:o.provider, profilePath, settingsPath, ...await findCli(o),
-      hasExistingStatusLine:own(config, 'statusLine'), bytes, config};
+      hasExistingStatusLine:o.provider !== 'codex' && own(config, 'statusLine'), hasExistingHooks:o.provider === 'codex' && own(config, 'hooks'), bytes, config};
   }
   async function discoverProvider(input) {
     const o = options(input);
@@ -205,15 +221,21 @@ function createSetup(dependencies = {}) {
     const bytes = await readSafe(loc.receiptPath, o, {privateFile:true});
     if(bytes === null) return null;
     const data = parse(bytes);
-    if(data.version !== 1 || data.provider !== o.provider || data.uid !== o.uid ||
-      !['connected', 'disconnected'].includes(data.status) || !object(data.installedStatusLine) ||
-      (data.hadStatusLine && (!object(data.originalStatusLine) || typeof data.originalStatusLine.command !== 'string')) ||
-      data.installedStatusLine.command !== installedCommand(loc.launcherPath, data.hadStatusLine ? data.originalStatusLine : null) ||
-      typeof data.hadStatusLine !== 'boolean' || typeof data.cliPath !== 'string' || typeof data.cliLookupPath !== 'string' ||
-      typeof data.ownerStoragePath !== 'string' ||
-      typeof data.backupName !== 'string' || !/^settings\.before-[\w-]+\.json$/.test(data.backupName))
+    const kind = data.kind || (data.provider === 'codex' ? null : 'statusline');
+    const common = data.version === 1 && data.provider === o.provider && data.uid === o.uid &&
+      ['connected', 'disconnected'].includes(data.status) && typeof data.cliPath === 'string' &&
+      typeof data.cliLookupPath === 'string' && typeof data.ownerStoragePath === 'string';
+    const statusline = kind === 'statusline' && object(data.installedStatusLine) &&
+      (data.hadStatusLine ? object(data.originalStatusLine) && typeof data.originalStatusLine.command === 'string' : true) &&
+      data.installedStatusLine.command === installedCommand(loc.launcherPath, data.hadStatusLine ? data.originalStatusLine : null) &&
+      typeof data.hadStatusLine === 'boolean' && typeof data.backupName === 'string' && /^settings\.before-[\w-]+\.json$/.test(data.backupName);
+    const codex = kind === 'codex-hook' && isDeepStrictEqual(data.installedHook, installedCodexHook(loc.launcherPath)) &&
+      typeof data.hadHooks === 'boolean' && typeof data.hadStop === 'boolean' && typeof data.backupName === 'string' &&
+      /^hooks\.before-[\w-]+\.json$/.test(data.backupName);
+    if(!common || (!statusline && !codex))
       throw failure('INVALID_RECEIPT', 'The saved connection cannot be verified. Provider settings were left unchanged.');
     absolute(data.settingsPath);
+    data.kind = kind;
     return data;
   }
   async function processIdentity(pid) {
@@ -303,7 +325,16 @@ function createSetup(dependencies = {}) {
   async function retireMissingHook(o, loc, data) {
     if(data?.status !== 'connected') return data;
     const config = await stat(data.settingsPath) ? parse(await readSafe(data.settingsPath, o)) : {};
-    if(managed(config.statusLine)) {
+    if(data.kind === 'codex-hook') {
+      const state = codexHookState(config, data.installedHook);
+      if(state.exact.length === 1 && state.managed.length === 1) return data;
+      if(state.managed.length) throw failure('SETTINGS_CHANGED', 'The installed Account Usage Codex hook was edited. Review it before reconnecting or disconnecting.');
+      const original = parse(await readSafe(path.join(loc.root, data.backupName), o, {privateFile:true}));
+      if(!isDeepStrictEqual(config, original))
+        throw failure('SETTINGS_CHANGED', 'The installed Account Usage Codex hook was replaced. Review it before reconnecting or disconnecting.');
+      data.status = 'disconnected';
+      await put(loc.receiptPath, json(data), o, 0o600);
+    } else if(managedStatusLine(config.statusLine)) {
       if(!isDeepStrictEqual(config.statusLine, data.installedStatusLine))
         throw failure('SETTINGS_CHANGED', 'The installed Account Usage status line was edited. Review it before reconnecting or disconnecting.');
     } else {
@@ -333,19 +364,26 @@ function createSetup(dependencies = {}) {
   async function writeRuntime(o, loc, data) {
     const nodePath = await nativeExecutable(o.nodePath, o, 'UNSUPPORTED_RUNTIME');
     const cliPath = await nativeExecutable(data.cliLookupPath, o);
-    for(const command of ['/bin/sh', '/usr/bin/cat', '/usr/bin/tee', '/usr/bin/mktemp', '/usr/bin/mkfifo', '/usr/bin/timeout', '/usr/bin/rm', '/usr/bin/rmdir'])
+    const commands = o.provider === 'codex' ? ['/bin/sh', '/usr/bin/timeout'] :
+      ['/bin/sh', '/usr/bin/cat', '/usr/bin/tee', '/usr/bin/mktemp', '/usr/bin/mkfifo', '/usr/bin/timeout', '/usr/bin/rm', '/usr/bin/rmdir'];
+    for(const command of commands)
       await nativeExecutable(command, o, 'UNSUPPORTED_RUNTIME');
-    const {stdout} = await executeFile('/usr/bin/tee', ['--version'], {timeout:2000, maxBuffer:4096, encoding:'utf8'});
-    if(!/(?:GNU|uutils) coreutils/.test(stdout)) throw failure('UNSUPPORTED_RUNTIME', 'Provider setup requires GNU-compatible coreutils on this Linux host.');
+    if(o.provider !== 'codex') {
+      const {stdout} = await executeFile('/usr/bin/tee', ['--version'], {timeout:2000, maxBuffer:4096, encoding:'utf8'});
+      if(!/(?:GNU|uutils) coreutils/.test(stdout)) throw failure('UNSUPPORTED_RUNTIME', 'Provider setup requires GNU-compatible coreutils on this Linux host.');
+    }
     const sourcePath = absolute(o.collectorPath);
     const source = await io.readFile(sourcePath);
     if(source.length > 1024 * 1024) throw failure('UNSAFE_PATH', 'The bundled collector is too large.');
-    const args = [nodePath, loc.collectorPath, `${o.provider}-statusline`, '--cli-executable', cliPath,
+    const args = [nodePath, loc.collectorPath, o.provider === 'codex' ? 'codex-hook' : `${o.provider}-statusline`, '--cli-executable', cliPath,
       '--cli-lookup-path', data.cliLookupPath,
-      '--report-dir', loc.reportDir, o.provider === 'claude' ? '--claude-auth-status' : '--agy-full-usage'];
+      '--report-dir', loc.reportDir];
+    if(o.provider !== 'codex') args.push(o.provider === 'claude' ? '--claude-auth-status' : '--agy-full-usage');
     const collector = 'ELECTRON_RUN_AS_NODE=1 /usr/bin/timeout --kill-after=1s 12s ' + args.map(quote).join(' ');
     let script = `#!/bin/sh\n# ${MARKER}\n`;
-    if(data.hadStatusLine) {
+    if(o.provider === 'codex') {
+      script += `if [ -x ${quote(nodePath)} ] && [ -r ${quote(loc.collectorPath)} ]; then ${collector} >/dev/null 2>/dev/null; fi\nexit 0\n`;
+    } else if(data.hadStatusLine) {
       // The shell supervisor owns the original stream independently of Node.
       // A FIFO contains bytes only in kernel memory. GNU tee keeps forwarding
       // them when a failed collector closes its branch. Wait keeps the provider
@@ -375,30 +413,47 @@ function createSetup(dependencies = {}) {
       if(data?.status === 'connected') {
         if(data.settingsPath !== found.settingsPath) throw failure('PROFILE_CONFLICT', 'Disconnect the existing provider profile before selecting another.');
         await claimConnection(o, loc, data);
-        if(!isDeepStrictEqual(found.config.statusLine, data.installedStatusLine))
+        if(data.kind === 'codex-hook') {
+          const state = codexHookState(found.config, data.installedHook);
+          if(state.exact.length !== 1 || state.managed.length !== 1)
+            throw failure('SETTINGS_CHANGED', 'The installed Codex hook was edited. Review it before reconnecting or disconnecting.');
+        } else if(!isDeepStrictEqual(found.config.statusLine, data.installedStatusLine))
           throw failure('SETTINGS_CHANGED', 'The installed status line was edited. Review it before reconnecting or disconnecting.');
         await writeRuntime(o, loc, data);
         return publicConnection(data, loc);
       }
-      checkStatusLine(found.config);
-      if(managed(found.config.statusLine))
-        throw failure('ALREADY_CONNECTED', 'This provider already has an Account Usage hook. Restore or disconnect its original installation first.');
+      if(o.provider === 'codex') {
+        if(codexHookState(found.config, installedCodexHook(loc.launcherPath)).managed.length)
+          throw failure('ALREADY_CONNECTED', 'Codex already has an Account Usage hook. Restore or disconnect its original installation first.');
+      } else {
+        checkStatusLine(found.config);
+        if(managedStatusLine(found.config.statusLine))
+          throw failure('ALREADY_CONNECTED', 'This provider already has an Account Usage hook. Restore or disconnect its original installation first.');
+      }
       await safeDirectories(o.storagePath, o, {create:true});
-      const installedStatusLine = found.hasExistingStatusLine ? {...found.config.statusLine} : {type:'command'};
-      installedStatusLine.command = installedCommand(loc.launcherPath, found.hasExistingStatusLine ? found.config.statusLine : null);
-      if(o.provider === 'antigravity' && !found.hasExistingStatusLine)
-        Object.assign(installedStatusLine, {enabled:true, stack_with_default:true});
-      data = {version:1, status:'connected', provider:o.provider, uid:o.uid, settingsPath:found.settingsPath,
-        ownerStoragePath:absolute(o.storagePath),
-        cliPath:found.cliPath, cliLookupPath:found.cliLookupPath, installedStatusLine, hadStatusLine:found.hasExistingStatusLine,
-        originalStatusLine:found.hasExistingStatusLine ? found.config.statusLine : null,
-        settingsExisted:found.bytes !== null, backupName:`settings.before-${randomUUID()}.json`};
+      let next;
+      const common = {version:1, status:'connected', provider:o.provider, uid:o.uid, settingsPath:found.settingsPath,
+        ownerStoragePath:absolute(o.storagePath), cliPath:found.cliPath, cliLookupPath:found.cliLookupPath,
+        settingsExisted:found.bytes !== null};
+      if(o.provider === 'codex') {
+        const installedHook = installedCodexHook(loc.launcherPath), hadHooks=own(found.config,'hooks'),
+          hooks=hadHooks?{...found.config.hooks}:{}, hadStop=own(hooks,'Stop');
+        hooks.Stop=[...(hadStop?hooks.Stop:[]),installedHook];next={...found.config,hooks};
+        data={...common,kind:'codex-hook',installedHook,hadHooks,hadStop,backupName:`hooks.before-${randomUUID()}.json`};
+      } else {
+        const installedStatusLine = found.hasExistingStatusLine ? {...found.config.statusLine} : {type:'command'};
+        installedStatusLine.command = installedCommand(loc.launcherPath, found.hasExistingStatusLine ? found.config.statusLine : null);
+        if(o.provider === 'antigravity' && !found.hasExistingStatusLine)Object.assign(installedStatusLine, {enabled:true, stack_with_default:true});
+        data={...common,kind:'statusline',installedStatusLine,hadStatusLine:found.hasExistingStatusLine,
+          originalStatusLine:found.hasExistingStatusLine ? found.config.statusLine : null,backupName:`settings.before-${randomUUID()}.json`};
+        next={...found.config,statusLine:installedStatusLine};
+      }
       await put(path.join(loc.root, data.backupName), found.bytes || json({}), o, 0o600);
       await writeRuntime(o, loc, data);
       // Save recovery information before touching provider settings. If a crash
       // occurs, disconnect checks the installed value before restoring one key.
       await put(loc.receiptPath, json(data), o, 0o600);
-      try { await replace(found.settingsPath, json({...found.config, statusLine:installedStatusLine}), found.bytes, o); }
+      try { await replace(found.settingsPath, json(next), found.bytes, o); }
       catch(error) {
         data.status = 'disconnected';
         await put(loc.receiptPath, json(data), o, 0o600);
@@ -417,10 +472,20 @@ function createSetup(dependencies = {}) {
       await claimConnection(o, current, data);
       const bytes = await readSafe(data.settingsPath, o);
       const config = parse(bytes);
-      if(!isDeepStrictEqual(config.statusLine, data.installedStatusLine))
-        throw failure('SETTINGS_CHANGED', 'The installed status line was edited or removed. Disconnect left the settings unchanged.');
-      if(data.hadStatusLine) config.statusLine = data.originalStatusLine;
-      else delete config.statusLine;
+      if(data.kind === 'codex-hook') {
+        const state=codexHookState(config,data.installedHook);
+        if(state.exact.length !== 1 || state.managed.length !== 1)
+          throw failure('SETTINGS_CHANGED', 'The installed Codex hook was edited or removed. Disconnect left the hooks unchanged.');
+        const hooks={...config.hooks},stop=[...hooks.Stop],index=stop.findIndex(entry=>isDeepStrictEqual(entry,data.installedHook));
+        stop.splice(index,1);
+        if(stop.length || data.hadStop)hooks.Stop=stop;else delete hooks.Stop;
+        if(Object.keys(hooks).length || data.hadHooks)config.hooks=hooks;else delete config.hooks;
+      } else {
+        if(!isDeepStrictEqual(config.statusLine, data.installedStatusLine))
+          throw failure('SETTINGS_CHANGED', 'The installed status line was edited or removed. Disconnect left the settings unchanged.');
+        if(data.hadStatusLine) config.statusLine = data.originalStatusLine;
+        else delete config.statusLine;
+      }
       await replace(data.settingsPath, json(config), bytes, o);
       data.status = 'disconnected';
       await put(current.receiptPath, json(data), o, 0o600);
@@ -439,7 +504,10 @@ function createSetup(dependencies = {}) {
         if(data?.status !== 'connected' || data.ownerStoragePath !== absolute(o.storagePath)) continue;
         await safeDirectories(loc.reportDir, o, {privateLeaf:true});
         const config = parse(await readSafe(data.settingsPath, o));
-        if(isDeepStrictEqual(config.statusLine, data.installedStatusLine)) results.push(publicConnection(data, loc));
+        if(data.kind === 'codex-hook') {
+          const state=codexHookState(config,data.installedHook);
+          if(state.exact.length===1 && state.managed.length===1)results.push(publicConnection(data,loc));
+        } else if(isDeepStrictEqual(config.statusLine, data.installedStatusLine)) results.push(publicConnection(data, loc));
       } catch { /* A damaged provider receipt cannot suppress another provider. */ }
     }
     return results;
@@ -452,7 +520,14 @@ function createSetup(dependencies = {}) {
       try {
         await locked(o, async current => {
           const data = await receipt(o, current);
-          if(data?.status === 'connected' && data.ownerStoragePath === absolute(o.storagePath)) { await writeRuntime(o, current, data); refreshed.push(provider); }
+          if(data?.status === 'connected' && data.ownerStoragePath === absolute(o.storagePath)) {
+            if(data.kind === 'codex-hook') {
+              const config=parse(await readSafe(data.settingsPath,o)),state=codexHookState(config,data.installedHook);
+              if(state.exact.length!==1 || state.managed.length!==1)
+                throw failure('SETTINGS_CHANGED','The installed Codex hook was edited. Runtime was not refreshed.');
+            }
+            await writeRuntime(o, current, data); refreshed.push(provider);
+          }
         });
       } catch(error) { if(error.code !== 'SETUP_BUSY') warnings.push(`${provider}: saved collector runtime could not be refreshed; reconnect after reviewing setup.`); }
     }

@@ -10,9 +10,9 @@ const {createSetup} = require('../src/setup.cjs');
 async function fixture(t, provider = 'claude') {
   const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), 'account-usage-setup-'));
   t.after(() => fs.rm(homeDir, {recursive:true, force:true}));
-  const profilePath = path.join(homeDir, provider === 'claude' ? '.claude' : '.gemini/antigravity-cli');
+  const profilePath = path.join(homeDir, provider === 'claude' ? '.claude' : provider === 'codex' ? '.codex' : '.gemini/antigravity-cli');
   await fs.mkdir(profilePath, {recursive:true, mode:0o700});
-  const settingsPath = path.join(profilePath, 'settings.json');
+  const settingsPath = path.join(profilePath, provider === 'codex' ? 'hooks.json' : 'settings.json');
   const collectorPath = path.join(homeDir, 'collector.cjs');
   await fs.writeFile(collectorPath, `const fs=require('node:fs');const cp=require('node:child_process');const args=process.argv.slice(2);const i=args.indexOf('--original-argv-json');const input=fs.readFileSync(0);if(i>=0){const [file,...argv]=JSON.parse(args[i+1]);const r=cp.spawnSync(file,argv,{input,encoding:null,env:process.env});if(r.stdout)process.stdout.write(r.stdout);if(r.stderr)process.stderr.write(r.stderr);process.exitCode=r.status??1;}else process.stdout.write(JSON.stringify({args,node:process.execPath,electron:process.env.ELECTRON_RUN_AS_NODE}));`, {mode:0o600});
   // Test sandboxes may remap system-owned files to the overflow UID.
@@ -370,6 +370,46 @@ test('Antigravity uses its own config and native idle usage collector', async t 
   assert.equal(run.args[0], 'antigravity-statusline');
   assert.ok(run.args.includes('--agy-full-usage'));
   await assert.rejects(f.setup.discoverProvider({...f.options, env:{GEMINI_CLI_HOME:'/unknown'}}), {code:'PROFILE_REQUIRED'});
+});
+
+test('Codex connect appends one managed Stop hook and preserves unrelated hooks', async t => {
+  const f = await fixture(t, 'codex'),invocation=path.join(f.homeDir,'codex-invocation.json');
+  await fs.writeFile(f.collectorPath,`const fs=require('node:fs');fs.writeFileSync(${JSON.stringify(invocation)},JSON.stringify({args:process.argv.slice(2),input:fs.readFileSync(0,'utf8'),electron:process.env.ELECTRON_RUN_AS_NODE}));process.stdout.write('PRIVATE');process.stderr.write('PRIVATE');`,{mode:0o600});
+  const sessionStart = [{matcher:'.*', hooks:[{type:'command',command:'printf session'}]}];
+  const originalStop = [{matcher:'first',hooks:[{type:'command',command:'printf first'}]}, {matcher:'second',hooks:[{type:'command',command:'printf second'}]}];
+  await writeJson(f.settingsPath, {theme:'dark', hooks:{SessionStart:sessionStart, Stop:originalStop}});
+  const first = await f.setup.connectProvider(f.options), second = await f.setup.connectProvider(f.options);
+  assert.equal(first.backupPath, second.backupPath);
+  const config = await readJson(f.settingsPath);
+  assert.equal(config.theme, 'dark');assert.deepEqual(config.hooks.SessionStart, sessionStart);assert.deepEqual(config.hooks.Stop.slice(0,2), originalStop);
+  const managed = config.hooks.Stop.filter(entry => entry.hooks?.some(hook => hook.command?.includes('llm-account-usage-managed-v1')));
+  assert.equal(managed.length, 1);assert.equal(managed[0].matcher, '.*');assert.equal(managed[0].hooks[0].type, 'command');
+  assert.deepEqual((await f.setup.listConnections(f.options)).map(value=>value.provider), ['codex']);
+  const input=JSON.stringify({hook_event_name:'Stop',session_id:'s'}),run=execFileSync('/bin/sh',['-c',managed[0].hooks[0].command],{input,encoding:'utf8'});
+  assert.equal(run,'');const called=await readJson(invocation);assert.equal(called.args[0],'codex-hook');assert.ok(called.args.includes('--report-dir'));assert.equal(called.args.includes('--claude-auth-status'),false);assert.equal(called.args.includes('--agy-full-usage'),false);assert.equal(called.input,input);assert.equal(called.electron,'1');
+});
+
+test('Codex disconnect removes only its exact managed Stop hook', async t => {
+  const f = await fixture(t, 'codex'),original={matcher:'original',hooks:[{type:'command',command:'printf original'}]};
+  await writeJson(f.settingsPath, {hooks:{Stop:[original]},theme:'before'});
+  await f.setup.connectProvider(f.options);
+  const config = await readJson(f.settingsPath),later={matcher:'later',hooks:[{type:'command',command:'printf later'}]};
+  config.hooks.Stop.push(later);config.theme='later';await writeJson(f.settingsPath, config);
+  const disconnected=await f.setup.disconnectProvider(f.options);assert.equal(disconnected.connected,false);
+  const restored=await readJson(f.settingsPath);assert.deepEqual(restored,{hooks:{Stop:[original,later]},theme:'later'});
+  assert.deepEqual(await f.setup.listConnections(f.options),[]);
+});
+
+test('edited or replaced managed Codex hooks fail closed with recovery intact', async t => {
+  const f = await fixture(t, 'codex'),installed=await f.setup.connectProvider(f.options);
+  const backup=await fs.readFile(installed.backupPath),runtime=await fs.readFile(path.join(path.dirname(installed.launcherPath),'passive.cjs'));
+  const config=await readJson(f.settingsPath),managed=config.hooks.Stop.find(entry=>entry.hooks?.some(hook=>hook.command?.includes('llm-account-usage-managed-v1')));
+  managed.hooks[0].command='printf replacement # llm-account-usage-managed-v1';await writeJson(f.settingsPath,config);
+  const changed=await fs.readFile(f.settingsPath);await fs.writeFile(f.collectorPath,'process.stdout.write("changed");',{mode:0o600});
+  const refreshed=await f.setup.refreshRuntime(f.options);assert.equal(refreshed.refreshed.includes('codex'),false);assert.equal(refreshed.warnings.length,1);
+  assert.deepEqual(await fs.readFile(path.join(path.dirname(installed.launcherPath),'passive.cjs')),runtime);
+  await assert.rejects(f.setup.connectProvider(f.options),{code:'SETTINGS_CHANGED'});await assert.rejects(f.setup.disconnectProvider(f.options),{code:'SETTINGS_CHANGED'});
+  assert.deepEqual(await fs.readFile(f.settingsPath),changed);assert.deepEqual(await fs.readFile(installed.backupPath),backup);
 });
 
 test('unsafe config, symlink directories and unrecognized statuslines are refused', async t => {

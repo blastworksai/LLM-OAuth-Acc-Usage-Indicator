@@ -2,7 +2,7 @@
   "name": "llm-oauth-acc-usage-indicator",
   "displayName": "Account Usage",
   "description": "Account quota cards and reset times, following your active terminal.",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "publisher": "blastworksai",
   "license": "MIT",
   "engines": {

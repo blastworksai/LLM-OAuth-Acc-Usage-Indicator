@@ -14,7 +14,7 @@ Account emails are hidden in these screenshots.
 
 1. Install [Account Usage from the VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=BlastworksAI.llm-oauth-acc-usage-indicator). For Remote-SSH, install it on the Linux SSH host.
 2. Run **Account Usage: Open Card** and select your AI terminal.
-3. Codex is detected automatically. For Claude Code or Antigravity, click **Connect Provider** on the card once for the profile you use.
+3. Codex is detected automatically. For an unconnected Claude Code or Antigravity terminal, click **Connect Claude** or **Connect Antigravity** on the card. The provider is selected automatically; check the profile and approve the connection.
 
 For manual installation, download the `.vsix` from [GitHub Releases](https://github.com/blastworksai/LLM-OAuth-Acc-Usage-Indicator/releases), then run **Extensions: Install from VSIX…** in VS Code.
 
@@ -45,7 +45,9 @@ Refreshing the card sends no model prompt. Codex reads the selected process's lo
 
 ## Setup and removal
 
-**Connect Provider** on the card shows the selected profile before it changes its statusline setting. An existing statusline is preserved. If your directories are deliberately shared with a Linux group, setup lists them and offers **Trust and connect**; approve only when you trust everyone who can write there. It does not change their permissions. Runtime files and sanitized reports stay in owner-controlled local storage, separate from editor installation files. Run **Account Usage: Disconnect Provider** to restore the connection before uninstalling; removing an extension cannot guarantee that provider settings are restored automatically.
+The connection button appears only for a detected Claude or Antigravity terminal that needs setup. It disappears after connection and is absent from populated cards, plain shells and unsupported CLI sessions. **Account Usage: Connect Provider** remains available in the Command Palette for manual setup when automatic detection is unavailable.
+
+Setup shows the selected profile before it changes its statusline setting. An existing statusline is preserved. If your directories are deliberately shared with a Linux group, setup lists them and offers **Trust and connect**; approve only when you trust everyone who can write there. It does not change their permissions. Runtime files and sanitized reports stay in owner-controlled local storage, separate from editor installation files. Run **Account Usage: Disconnect Provider** to restore the connection before uninstalling; removing an extension cannot guarantee that provider settings are restored automatically.
 
 See [setup and troubleshooting](docs/SETUP.md) and [privacy](docs/PRIVACY.md). When reporting an issue, remove emails, account identifiers, terminal names, paths and session IDs from screenshots and diagnostics.
 

@@ -12,7 +12,9 @@ No statusline setting is needed. Select a native Codex session authenticated thr
 
 ## Claude Code and Antigravity
 
-Click **Connect Provider** on the card, choose the provider and check the profile shown. The same action remains available as **Account Usage: Connect Provider** in the Command Palette. Connect the profile your terminal actually uses. Claude's `CLAUDE_CONFIG_DIR` is honored. Other detected overrides require an explicit profile selection; a profile selected only through terminal-specific flags must also be selected explicitly. If the native CLI is outside the editor's PATH, setup offers an executable picker.
+Select the CLI terminal and click **Connect Claude** or **Connect Antigravity** on its card. The provider is detected from the selected terminal's native foreground process, so there is no provider picker. Check the profile shown and approve the connection. The button disappears after connection, including while the first reading is pending. Plain shells, unsupported CLIs and populated cards do not show it.
+
+If automatic detection is unavailable, use **Account Usage: Connect Provider** in the Command Palette. This offers a provider picker only when the selected terminal cannot identify the provider. Connect the profile your terminal actually uses. Claude's `CLAUDE_CONFIG_DIR` is honored. Other detected overrides require an explicit profile selection; a profile selected only through terminal-specific flags must also be selected explicitly. If the native CLI is outside the editor's PATH, manual setup offers an executable picker.
 
 The connection changes only the user profile's `statusLine` setting and preserves an existing command using its shell semantics. A project-level or command-line setting can override that user setting; check the CLI's effective settings if no reports arrive. Unsafe files and conflicting edits stop setup with a message. The CLI must support the native statusline data used by this extension. Antigravity's full quota reader uses its built-in `/usage` command; after connecting, `/usage` followed by closing the native panel can provide a fresh idle reading without a model turn.
 

@@ -4,6 +4,7 @@ const path=require('node:path');
 const os=require('node:os');
 const {readFeeds,matchReports,buildRows,SelectionController}=require('./core.cjs');
 const {collectTerminal}=require('./collect.cjs');
+const {detectProvider}=require('./provider.cjs');
 const {buildViewModel,renderContent,renderDocument}=require('./panel.cjs');
 const setup=require('./setup.cjs');
 
@@ -43,6 +44,11 @@ function activate(context) {
     const {reports,rejected}=await readFeeds(dirs);
     const result=await matchReports(pid,reports);
     if(result.status==='unavailable' && rejected)result.reason='No matching readable report. A report directory is missing, unreadable or unsafe.';
+    if(result.status==='unavailable') {
+      const target=await detectProvider(pid);
+      if(target && !connections.some(connection=>connection.provider===target.provider))result.setupTarget=target;
+      else if(target)result.reason='This provider is connected. Waiting for a fresh statusline reading from this session.';
+    }
     return result;
   },render);
   const refresh=(quiet=false)=>controller.select(vscode.window.activeTerminal,{quiet});
@@ -59,18 +65,26 @@ function activate(context) {
       return operation({...options,confirmTakeover:true});
     }
   };
-  const connect=async()=>{
+  const sameTarget=(a,b)=>a && b && a.provider===b.provider && a.cliPath===b.cliPath &&
+    ['pid','uid','start_ticks','boot_id'].every(key=>a.process[key]===b.process[key]);
+  const connect=async(fromCard=false)=>{
     if(process.platform!=='linux') {
       await vscode.window.showInformationMessage('Provider connections currently support Linux terminal hosts.');return;
     }
-    const picked=await vscode.window.showQuickPick([
+    const selected=vscode.window.activeTerminal;
+    const offered=fromCard?controller.state.setupTarget:null;
+    if(fromCard && !offered)return;
+    const pid=selected?await selected.processId:null;
+    const detected=pid?await detectProvider(pid):null;
+    if(fromCard && (selected!==vscode.window.activeTerminal || !sameTarget(offered,detected))) {await refresh();return;}
+    const picked=detected || await vscode.window.showQuickPick([
       {label:'Claude Code',provider:'claude'},
       {label:'Antigravity',provider:'antigravity'}
     ],{title:'Connect an account usage provider',placeHolder:'Codex is detected automatically.'});
     if(!picked)return;
     try {
       await setupReady;
-      let profilePath,cliPath;
+      let profilePath,cliPath=detected?.cliPath;
       while(true) {
         const options={...setupOptions,provider:picked.provider,...(profilePath?{profilePath}:{}),...(cliPath?{cliPath}:{})};
         let found;
@@ -104,6 +118,10 @@ function activate(context) {
           profilePath=selected[0].fsPath;continue;
         }
         if(action!==connectAction)return;
+        if(detected && (selected!==vscode.window.activeTerminal || !sameTarget(detected,await detectProvider(pid)))) {
+          await vscode.window.showInformationMessage('The selected terminal changed. Select its session and connect again.');
+          await refresh();return;
+        }
         const approved=new Map((Array.isArray(setupOptions.trustedDirectories)?setupOptions.trustedDirectories:[]).map(item=>[item.path,item]));
         for(const item of shared)approved.set(item.path,item);
         options.trustedDirectories=[...approved.values()];
@@ -137,7 +155,7 @@ function activate(context) {
     context.subscriptions.push(
       resolved.webview.onDidReceiveMessage(message=>{
         if(message?.type==='ready'){lastContent='';render();}
-        else if(message?.type==='connect')void connect();
+        else if(message?.type==='connect')void connect(true);
       }),
       resolved.onDidChangeVisibility(()=>{if(resolved.visible)void refresh();}),
       resolved.onDidDispose(()=>{if(view===resolved)view=undefined;})
@@ -153,7 +171,7 @@ function activate(context) {
       const {warnings}=await setupReady;
       if(warnings.length)await vscode.window.showWarningMessage('A saved provider connection needs attention. Run Account Usage: Connect Provider.');
     }),
-    vscode.commands.registerCommand('llmAccountUsage.connect',connect),
+    vscode.commands.registerCommand('llmAccountUsage.connect',()=>connect()),
     vscode.commands.registerCommand('llmAccountUsage.disconnect',disconnect),
     vscode.commands.registerCommand('llmAccountUsage.refresh',()=>refresh()),
     vscode.window.onDidChangeActiveTerminal(()=>refresh()),

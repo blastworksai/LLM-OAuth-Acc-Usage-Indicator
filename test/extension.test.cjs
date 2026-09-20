@@ -5,35 +5,36 @@ const fs=require('node:fs');
 const path=require('node:path');
 const vm=require('node:vm');
 
-function harness({discover,connect,disconnect,recover='Recover connection',confirm='Connect',pickPath='/example/profile',savedTrust=[]}={}) {
+function harness({discover,connect,disconnect,recover='Recover connection',confirm='Connect',pickPath='/example/profile',savedTrust=[],terminal,detect=async()=>null,connections=[]}={}) {
   const commands=new Map(),connected=[],errors=[],warnings=[],confirmations=[],storage=new Map([['trustedDirectories',savedTrust]]);
-  let provider,receive;
+  let provider,receive,picks=0;
   const disposable=()=>({dispose(){}});
   const vscode={Uri:{file:value=>({fsPath:value}),joinPath:(_base,...parts)=>({fsPath:parts.join('/')})},workspace:{getConfiguration:()=>({get:()=>[]}),onDidChangeConfiguration:disposable},
-    window:{registerWebviewViewProvider:(_id,value)=>{provider=value;return disposable();},onDidChangeActiveTerminal:disposable,onDidCloseTerminal:disposable,
-      showQuickPick:async()=>({provider:'claude'}),showOpenDialog:async()=>pickPath?[{fsPath:pickPath}]:undefined,
+    window:{activeTerminal:terminal,registerWebviewViewProvider:(_id,value)=>{provider=value;return disposable();},onDidChangeActiveTerminal:disposable,onDidCloseTerminal:disposable,
+      showQuickPick:async()=>{picks++;return {provider:'claude'};},showOpenDialog:async()=>pickPath?[{fsPath:pickPath}]:undefined,
       showInformationMessage:async(message,options,...actions)=>{if(options?.modal){confirmations.push({message,options,actions});return confirm;}},
       showWarningMessage:async(message,action)=>{warnings.push(message);return action?.modal?recover:action;},
       showErrorMessage:async message=>{errors.push(message);}},
     commands:{registerCommand:(name,callback)=>{commands.set(name,callback);return disposable();},executeCommand:async()=>{}}};
-  const setup={refreshRuntime:async()=>({warnings:[]}),listConnections:async()=>[],discoverProvider:discover||
+  const setup={refreshRuntime:async()=>({warnings:[]}),listConnections:async()=>connections,discoverProvider:discover||
     (async()=>({profilePath:'/example/profile',hasExistingStatusLine:true})),
     connectProvider:async options=>{connected.push(options);return connect?.(options);},
     disconnectProvider:async options=>{connected.push(options);return disconnect?.(options);}};
-  const core={SelectionController:class{constructor(){this.state={status:'no-terminal'};}select(){return Promise.resolve();}dispose(){}},buildRows:()=>[]};
+  const core={SelectionController:require('../src/core.cjs').SelectionController,buildRows:()=>[],
+    readFeeds:async()=>({reports:[],rejected:0}),matchReports:async()=>({status:'unavailable'})};
   const exports={};
   const sandbox={module:{exports},exports,process:{platform:'linux',execPath:'/example/editor-node'},setInterval:()=>1,clearInterval(){},
-    require:name=>name==='vscode'?vscode:name==='./setup.cjs'?setup:name==='./core.cjs'?core:name==='./collect.cjs'?{}:
+    require:name=>name==='vscode'?vscode:name==='./setup.cjs'?setup:name==='./core.cjs'?core:name==='./collect.cjs'?{collectTerminal:async()=>null}:name==='./provider.cjs'?{detectProvider:detect}:
       name==='./panel.cjs'?{buildViewModel:()=>({}),renderContent:()=>'',renderDocument:()=>''}:require(name)};
   vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../src/extension.cjs'),'utf8'),sandbox);
-  sandbox.module.exports.activate({globalStorageUri:{fsPath:'/example/editor-storage'},extensionPath:'/example/extension',subscriptions:[],
+  const api=sandbox.module.exports.activate({globalStorageUri:{fsPath:'/example/editor-storage'},extensionPath:'/example/extension',subscriptions:[],
     globalState:{get:(key,fallback)=>storage.get(key)??fallback,update:async(key,value)=>{storage.set(key,value);}}});
   const openCard=()=>{
     provider.resolveWebviewView({webview:{asWebviewUri:uri=>uri.fsPath,postMessage:async()=>{},
       onDidReceiveMessage:callback=>{receive=callback;return disposable();}},onDidChangeVisibility:disposable,onDidDispose:disposable});
     return async message=>{receive(message);await new Promise(setImmediate);};
   };
-  return {commands,connected,errors,warnings,confirmations,storage,openCard};
+  return {commands,connected,errors,warnings,confirmations,storage,openCard,api,vscode,get picks(){return picks;}};
 }
 const problem=code=>Object.assign(new Error('Choose the required local resource.'),{code,safeToDisplay:true});
 
@@ -103,14 +104,47 @@ test('a previously approved exact directory is passed to later setup operations'
   assert.deepEqual(JSON.parse(JSON.stringify(h.connected[0].trustedDirectories)),savedTrust);
 });
 
-test('card connect action uses the provider confirmation and ignores unrelated webview messages',async()=>{
-  const h=harness(),send=h.openCard();
+const target=provider=>({provider,cliPath:`/example/native/${provider==='claude'?'claude':'agy'}`,process:{pid:20,uid:1000,start_ticks:'20',boot_id:'boot'}});
+const terminal=()=>({name:'Example terminal',processId:Promise.resolve(10)});
+test('card connects the detected provider without a picker and retains permission confirmation',async()=>{
+ for(const provider of ['claude','antigravity']) {
+  const h=harness({terminal:terminal(),detect:async()=>target(provider)}),send=h.openCard();
+  await h.api.refresh();
   await send({type:'unexpected',command:'llmAccountUsage.connect'});
   assert.equal(h.connected.length,0);
   await send({type:'connect'});
   assert.equal(h.connected.length,1);
   assert.equal(h.confirmations.length,1);
-  const cancelled=harness({confirm:'Cancel'});
+  assert.equal(h.connected[0].provider,provider);
+  assert.equal(h.connected[0].cliPath,target(provider).cliPath);
+  assert.equal(h.picks,0);
+ }
+  const cancelled=harness({confirm:'Cancel',terminal:terminal(),detect:async()=>target('claude')});
+  await cancelled.api.refresh();
   await cancelled.openCard()({type:'connect'});
   assert.equal(cancelled.connected.length,0);
+});
+
+test('plain terminals, unsupported CLIs and connected sessions offer no setup target',async()=>{
+ for(const input of [{terminal:terminal()},{},
+  {terminal:terminal(),detect:async()=>target('claude'),connections:[{provider:'claude',reportDir:'/example/reports'}]}]) {
+  const h=harness(input);await h.api.refresh();
+  assert.equal(h.api.getState().setupTarget,undefined);
+  await h.openCard()({type:'connect'});
+  assert.equal(h.connected.length,0);assert.equal(h.picks,0);
+ }
+});
+
+test('stale card actions and a terminal change during confirmation cannot connect a different session',async()=>{
+ let detected=target('claude');
+ const h=harness({terminal:terminal(),detect:async()=>detected});
+ await h.api.refresh();detected=target('antigravity');
+ await h.openCard()({type:'connect'});
+ assert.equal(h.connected.length,0);assert.equal(h.confirmations.length,0);
+ let active;
+ active=harness({terminal:terminal(),detect:async()=>target('claude'),discover:async()=>{
+  active.vscode.window.activeTerminal=terminal();return {profilePath:'/example/profile'};
+ }});
+ await active.api.refresh();await active.openCard()({type:'connect'});
+ assert.equal(active.connected.length,0);
 });

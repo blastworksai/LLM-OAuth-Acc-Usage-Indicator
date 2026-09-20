@@ -5,9 +5,9 @@ const fs=require('node:fs');
 const path=require('node:path');
 const vm=require('node:vm');
 
-function harness({discover,connect,disconnect,recover='Recover connection',confirm='Connect',pickPath='/example/profile',pickProvider='claude',savedTrust=[],terminal,detect=async()=>null,connections=[]}={}) {
+function harness({discover,connect,disconnect,recover='Recover connection',confirm='Connect',pickPath='/example/profile',pickProvider='claude',savedTrust=[],terminal,detect=async()=>null,connections=[],reports=[],match,collect}={}) {
   const commands=new Map(),connected=[],errors=[],warnings=[],confirmations=[],storage=new Map([['trustedDirectories',savedTrust]]);
-  let provider,receive,picks=0,lastPickItems=[];
+  let provider,receive,picks=0,lastPickItems=[],collectionCalls=0,feedDirectories=[];
   const disposable=()=>({dispose(){}});
   const vscode={Uri:{file:value=>({fsPath:value}),joinPath:(_base,...parts)=>({fsPath:parts.join('/')})},workspace:{getConfiguration:()=>({get:()=>[]}),onDidChangeConfiguration:disposable},
     window:{activeTerminal:terminal,registerWebviewViewProvider:(_id,value)=>{provider=value;return disposable();},onDidChangeActiveTerminal:disposable,onDidCloseTerminal:disposable,
@@ -21,10 +21,10 @@ function harness({discover,connect,disconnect,recover='Recover connection',confi
     connectProvider:async options=>{connected.push(options);return connect?.(options);},
     disconnectProvider:async options=>{connected.push(options);return disconnect?.(options);}};
   const core={SelectionController:require('../src/core.cjs').SelectionController,buildRows:()=>[],
-    readFeeds:async()=>({reports:[],rejected:0}),matchReports:async()=>({status:'unavailable'})};
+    readFeeds:async directories=>{feedDirectories=directories;return {reports,rejected:0};},matchReports:match|| (async()=>({status:'unavailable'}))};
   const exports={};
   const sandbox={module:{exports},exports,process:{platform:'linux',execPath:'/example/editor-node'},setInterval:()=>1,clearInterval(){},
-    require:name=>name==='vscode'?vscode:name==='./setup.cjs'?setup:name==='./core.cjs'?core:name==='./collect.cjs'?{collectTerminal:async()=>null}:name==='./provider.cjs'?{detectProvider:detect}:
+    require:name=>name==='vscode'?vscode:name==='./setup.cjs'?setup:name==='./core.cjs'?core:name==='./collect.cjs'?{collectTerminal:async pid=>{collectionCalls++;return collect?.(pid)??null;}}:name==='./provider.cjs'?{detectProvider:detect}:
       name==='./panel.cjs'?{buildViewModel:()=>({}),renderContent:()=>'',renderDocument:()=>''}:require(name)};
   vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../src/extension.cjs'),'utf8'),sandbox);
   const api=sandbox.module.exports.activate({globalStorageUri:{fsPath:'/example/editor-storage'},extensionPath:'/example/extension',subscriptions:[],
@@ -34,7 +34,7 @@ function harness({discover,connect,disconnect,recover='Recover connection',confi
       onDidReceiveMessage:callback=>{receive=callback;return disposable();}},onDidChangeVisibility:disposable,onDidDispose:disposable});
     return async message=>{receive(message);await new Promise(setImmediate);};
   };
-  return {commands,connected,errors,warnings,confirmations,storage,openCard,api,vscode,get picks(){return picks;},get lastPickItems(){return lastPickItems;}};
+  return {commands,connected,errors,warnings,confirmations,storage,openCard,api,vscode,get picks(){return picks;},get lastPickItems(){return lastPickItems;},get collectionCalls(){return collectionCalls;},get feedDirectories(){return feedDirectories;}};
 }
 const problem=code=>Object.assign(new Error('Choose the required local resource.'),{code,safeToDisplay:true});
 
@@ -150,6 +150,20 @@ test('a detected connected provider waits for a fresh report without setup',asyn
  await h.api.refresh();
  assert.equal(h.api.getState().setupTarget,undefined);
  assert.match(h.api.getState().reason,/connected.*fresh/i);
+});
+
+test('Codex selection reads its connected report and never invokes direct collection',async()=>{
+ const report={provider:'codex',session_id:'codex-session'};
+ const h=harness({terminal:terminal(),connections:[{provider:'codex',reportDir:'/example/codex'}],reports:[report],
+  collect:async()=>{throw new Error('direct collection must not run');},match:async(_pid,available)=>available.length?{status:'ready',report:available[0]}:{status:'unavailable'}});
+ await h.api.refresh();assert.equal(h.collectionCalls,0);assert.deepEqual(JSON.parse(JSON.stringify(h.feedDirectories)),['/example/codex']);assert.equal(h.api.getState().status,'ready');assert.equal(h.api.getState().report.session_id,'codex-session');
+});
+
+test('each connected provider without a fresh report is pending without a setup action',async()=>{
+ for(const provider of ['codex','claude','antigravity']) {
+  const h=harness({terminal:terminal(),detect:async()=>target(provider),connections:[{provider,reportDir:`/example/${provider}`}],collect:async()=>{throw new Error('direct collection must not run');}});
+  await h.api.refresh();assert.equal(h.collectionCalls,0,provider);assert.equal(h.api.getState().setupTarget,undefined,provider);assert.match(h.api.getState().reason,/connected.*fresh turn/i,provider);
+ }
 });
 
 test('stale card actions and a terminal change during confirmation cannot connect a different session',async()=>{

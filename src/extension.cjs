@@ -3,13 +3,12 @@ const vscode=require('vscode');
 const path=require('node:path');
 const os=require('node:os');
 const {readFeeds,matchReports,buildRows,SelectionController}=require('./core.cjs');
-const {collectTerminal}=require('./collect.cjs');
 const {detectProvider}=require('./provider.cjs');
 const {buildViewModel,renderContent,renderDocument}=require('./panel.cjs');
 const setup=require('./setup.cjs');
 
 function activate(context) {
-  let view, assets={}, lastContent='', collectionTail=Promise.resolve();
+  let view, assets={}, lastContent='';
   const setupOptions={storagePath:context.globalStorageUri.fsPath,nodePath:process.execPath,
     collectorPath:path.join(context.extensionPath,'collectors','passive.cjs'),
     trustedDirectories:context.globalState.get('trustedDirectories',[])};
@@ -29,14 +28,6 @@ function activate(context) {
     if(process.platform!=='linux')return {status:'unsupported',reason:'Account matching currently supports Linux terminal hosts. Local Windows and macOS terminals are not yet supported.'};
     const pid=await terminal.processId;
     if(!pid)return {status:'unavailable',reason:'The terminal does not expose a process on this host.'};
-    // Serialize passive readers; obsolete terminal selections never launch a
-    // subprocess. SelectionController also discards late completed results.
-    const pending=collectionTail.then(()=>vscode.window.activeTerminal===terminal
-      ? collectTerminal(pid)
-      : null);
-    collectionTail=pending.catch(()=>{});
-    const collected=await pending;
-    if(collected)return collected;
     await setupReady;
     const connections=await setup.listConnections(setupOptions).catch(()=>[]);
     const dirs=[...connections.map(connection=>connection.reportDir),
@@ -48,7 +39,7 @@ function activate(context) {
       const target=await detectProvider(pid);
       const connected=new Set(connections.map(connection=>connection.provider));
       if(target && !connected.has(target.provider))result.setupTarget=target;
-      else if(target)result.reason='This provider is connected. Waiting for a fresh statusline reading from this session.';
+      else if(target)result.reason='This provider is connected. Waiting for this session to finish a fresh turn.';
       else if(connected.size<3)result.setupTarget={provider:null};
     }
     return result;
@@ -115,9 +106,12 @@ function activate(context) {
         const trustDetail=shared.length?'\n\nThese directories are writable by a shared Linux group:\n'+
           shared.map(item=>`${item.path} (group ${item.gid})`).join('\n')+
           '\n\nContinue only if you trust everyone who can write there. This approval is saved on this host. Directory permissions stay unchanged.':'';
+        const setupDetail=picked.provider==='codex'
+          ? (found.hasExistingHooks?'Your existing Codex hooks will be preserved. This adds one Stop hook for account usage.':'This adds one Codex Stop hook for account usage.')
+          : (found.hasExistingStatusLine?'Your existing statusline will be preserved.':'This adds a statusline reader for account usage.');
         const action=await vscode.window.showInformationMessage(
           `Connect ${providerName(picked.provider)}?`,
-          {modal:true,detail:`Profile: ${found.profilePath}\n${found.hasExistingStatusLine?'Your existing statusline will be preserved.':'This adds a statusline reader for account usage.'}${trustDetail}`},
+          {modal:true,detail:`Profile: ${found.profilePath}\n${setupDetail}${trustDetail}`},
           connectAction,'Choose another profile');
         if(action==='Choose another profile') {
           const selected=await vscode.window.showOpenDialog({title:'Choose the CLI profile directory',
@@ -138,7 +132,7 @@ function activate(context) {
         if(await withRecovery(setup.connectProvider,options)===false)return;
         await context.globalState.update('trustedDirectories',options.trustedDirectories);
         setupOptions.trustedDirectories=options.trustedDirectories;
-        await vscode.window.showInformationMessage(`${providerName(picked.provider)} connected. Select its terminal and let the CLI publish a fresh statusline reading.`);
+        await vscode.window.showInformationMessage(`${providerName(picked.provider)} connected. Select its terminal and finish a fresh turn to publish account usage.`);
         await refresh();return;
       }
     } catch(error) {await showSetupError(error);}
@@ -147,9 +141,10 @@ function activate(context) {
     try {
       await setupReady;
       const picked=await vscode.window.showQuickPick([
+        {label:'Codex',provider:'codex'},
         {label:'Claude Code',provider:'claude'},
         {label:'Antigravity',provider:'antigravity'}
-      ],{title:'Disconnect account usage',placeHolder:'Restores the original statusline if this connection still owns the setting.'});
+      ],{title:'Disconnect account usage',placeHolder:'Removes Account Usage while preserving the provider configuration it does not own.'});
       if(!picked)return;
       if(await withRecovery(setup.disconnectProvider,{...setupOptions,provider:picked.provider})===false)return;
       await refresh();

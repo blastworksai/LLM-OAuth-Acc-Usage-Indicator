@@ -2,7 +2,7 @@
 
 ## Status
 
-Approved in conversation on 20 September 2026. Implementation is not yet approved.
+Approved in conversation on 20 September 2026. Implemented for version 0.3.3; final installed-package acceptance remains the release gate.
 
 ## Outcome
 
@@ -87,8 +87,8 @@ For the ordinary case, the extension and CLI run as the same OS user and setup w
 ## Migration
 
 - Existing valid Claude Code and Antigravity connections are retained and upgraded in place.
-- Codex moves from extension-host collection to the after-turn connector only after installed-package parity is proven.
-- During development, both Codex paths may exist behind test-only composition. The shipped runtime has one authoritative report path so duplicate observations cannot become an ambiguity.
+- Codex has moved from extension-host collection to the after-turn connector. The extension's selection path reads reports for all three providers and no longer invokes direct Codex collection.
+- The shipped runtime has one authoritative report path, so duplicate observations cannot become an ambiguity.
 - Existing reports remain readable until they go stale or their publisher exits. No historical login is reconstructed.
 - The public support matrix continues to state only platforms and transports that have passed real installation and runtime acceptance. This change does not silently broaden OS claims.
 

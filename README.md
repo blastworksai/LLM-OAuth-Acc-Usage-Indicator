@@ -12,10 +12,11 @@ Account emails are hidden in these screenshots.
 
 ## Install
 
-1. Download the `.vsix` from [GitHub Releases](https://github.com/blastworksai/LLM-OAuth-Acc-Usage-Indicator/releases).
-2. In VS Code, run **Extensions: Install from VSIX…** and choose the download. For Remote-SSH, install it on the Linux SSH host.
-3. Run **Account Usage: Open Card** and select your AI terminal.
-4. Codex is detected automatically. For Claude Code or Antigravity, run **Account Usage: Connect Provider** once for the profile you use.
+1. Install [Account Usage from the VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=BlastworksAI.llm-oauth-acc-usage-indicator). For Remote-SSH, install it on the Linux SSH host.
+2. Run **Account Usage: Open Card** and select your AI terminal.
+3. Codex is detected automatically. For Claude Code or Antigravity, run **Account Usage: Connect Provider** once for the profile you use.
+
+For manual installation, download the `.vsix` from [GitHub Releases](https://github.com/blastworksai/LLM-OAuth-Acc-Usage-Indicator/releases), then run **Extensions: Install from VSIX…** in VS Code.
 
 Use an existing CLI login. The extension does not ask for passwords, API keys or tokens. It uses VS Code's own Node runtime; there is no separate Python or Node installation step.
 

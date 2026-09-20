@@ -1,0 +1,13 @@
+**
+!package.json
+!README.md
+!LICENSE
+!THIRD-PARTY-NOTICES.md
+!src/*.cjs
+!collectors/*.cjs
+!media/account-usage.css
+!media/account-usage.js
+!media/usage.svg
+!media/provider-claude.png
+!media/provider-openai.png
+!media/provider-antigravity.png

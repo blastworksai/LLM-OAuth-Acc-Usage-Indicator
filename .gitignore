@@ -1,0 +1,17 @@
+node_modules/
+artifacts/
+coverage/
+*.vsix
+.env*
+*.pem
+*.key
+*credentials*
+client_secret*.json
+*token*.json
+.mcp.json
+*.mcp.json
+.mcp.local.json
+.planning/
+STATE.md
+CLAUDE.md
+AGENTS.md

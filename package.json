@@ -1,0 +1,108 @@
+{
+  "name": "llm-oauth-acc-usage-indicator",
+  "displayName": "Account Usage",
+  "description": "Account quota cards and reset times, following your active terminal.",
+  "version": "0.3.0",
+  "publisher": "blastworksai",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.106.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "main": "./src/extension.cjs",
+  "activationEvents": [],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false
+    }
+  },
+  "contributes": {
+    "viewsContainers": {
+      "secondarySidebar": [
+        {
+          "id": "llmAccountUsage",
+          "title": "Account Usage",
+          "icon": "media/usage.svg"
+        }
+      ]
+    },
+    "views": {
+      "llmAccountUsage": [
+        {
+          "id": "llmAccountUsage.usage",
+          "name": "Account Usage",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "llmAccountUsage.refresh",
+        "title": "Account Usage: Refresh local reports",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "llmAccountUsage.open",
+        "title": "Account Usage: Open Card"
+      },
+      {
+        "command": "llmAccountUsage.connect",
+        "title": "Account Usage: Connect Provider"
+      },
+      {
+        "command": "llmAccountUsage.disconnect",
+        "title": "Account Usage: Disconnect Provider"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "llmAccountUsage.refresh",
+          "when": "view == llmAccountUsage.usage",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Account Usage",
+      "properties": {
+        "llmAccountUsage.feedDirectories": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "scope": "machine",
+          "description": "Additional owner-controlled report directories on the Linux terminal host. Normally managed by Connect Provider."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "test": "node --test test/*.test.cjs",
+    "package": "node scripts/package.cjs"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "3.6.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/blastworksai/LLM-OAuth-Acc-Usage-Indicator.git"
+  },
+  "bugs": {
+    "url": "https://github.com/blastworksai/LLM-OAuth-Acc-Usage-Indicator/issues"
+  },
+  "homepage": "https://github.com/blastworksai/LLM-OAuth-Acc-Usage-Indicator#readme",
+  "keywords": [
+    "quota",
+    "usage",
+    "claude",
+    "codex",
+    "antigravity"
+  ]
+}

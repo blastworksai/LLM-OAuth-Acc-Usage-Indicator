@@ -1,0 +1,159 @@
+'use strict';
+const vscode=require('vscode');
+const path=require('node:path');
+const os=require('node:os');
+const {readFeeds,matchReports,buildRows,SelectionController}=require('./core.cjs');
+const {collectTerminal}=require('./collect.cjs');
+const {buildViewModel,renderContent,renderDocument}=require('./panel.cjs');
+const setup=require('./setup.cjs');
+
+function activate(context) {
+  let view, assets={}, lastContent='', collectionTail=Promise.resolve();
+  const setupOptions={storagePath:context.globalStorageUri.fsPath,nodePath:process.execPath,
+    collectorPath:path.join(context.extensionPath,'collectors','passive.cjs')};
+  const setupReady=process.platform==='linux'
+    ? setup.refreshRuntime(setupOptions).catch(()=>({warnings:['Saved provider connections need attention. Run Account Usage: Connect Provider.']}))
+    : Promise.resolve({warnings:[]});
+  const getViewModel=()=>buildViewModel(controller.state);
+  const getHtml=()=>renderContent(getViewModel(),assets);
+  const render=()=> {
+    if(!view)return;
+    const html=getHtml();
+    if(html===lastContent)return;
+    lastContent=html;
+    void view.webview.postMessage({type:'render',html});
+  };
+  const controller=new SelectionController(async terminal=> {
+    if(process.platform!=='linux')return {status:'unsupported',reason:'Account matching currently supports Linux terminal hosts. Local Windows and macOS terminals are not yet supported.'};
+    const pid=await terminal.processId;
+    if(!pid)return {status:'unavailable',reason:'The terminal does not expose a process on this host.'};
+    // Serialize passive readers; obsolete terminal selections never launch a
+    // subprocess. SelectionController also discards late completed results.
+    const pending=collectionTail.then(()=>vscode.window.activeTerminal===terminal
+      ? collectTerminal(pid)
+      : null);
+    collectionTail=pending.catch(()=>{});
+    const collected=await pending;
+    if(collected)return collected;
+    await setupReady;
+    const connections=await setup.listConnections(setupOptions).catch(()=>[]);
+    const dirs=[...connections.map(connection=>connection.reportDir),
+      ...vscode.workspace.getConfiguration('llmAccountUsage').get('feedDirectories',[])];
+    const {reports,rejected}=await readFeeds(dirs);
+    const result=await matchReports(pid,reports);
+    if(result.status==='unavailable' && rejected)result.reason='No matching readable report. A report directory is missing, unreadable or unsafe.';
+    return result;
+  },render);
+  const refresh=(quiet=false)=>controller.select(vscode.window.activeTerminal,{quiet});
+  const providerName=provider=>provider==='claude'?'Claude Code':'Antigravity';
+  const showSetupError=error=>vscode.window.showErrorMessage(error?.safeToDisplay===true
+    ? error.message : 'Provider setup could not finish. Check that the profile is readable and owned by your user.');
+  const withRecovery=async(operation,options)=>{
+    try {return await operation(options);}
+    catch(error) {
+      if(error?.safeToDisplay!==true || error.code!=='TAKEOVER_REQUIRED')throw error;
+      const action=await vscode.window.showWarningMessage('Recover this provider connection?',
+        {modal:true,detail:'Its previous editor storage no longer exists. This window can take over the saved connection and its original backup.'},'Recover connection');
+      if(action!=='Recover connection')return false;
+      return operation({...options,confirmTakeover:true});
+    }
+  };
+  const connect=async()=>{
+    if(process.platform!=='linux') {
+      await vscode.window.showInformationMessage('Provider connections currently support Linux terminal hosts.');return;
+    }
+    const picked=await vscode.window.showQuickPick([
+      {label:'Claude Code',provider:'claude'},
+      {label:'Antigravity',provider:'antigravity'}
+    ],{title:'Connect an account usage provider',placeHolder:'Codex is detected automatically.'});
+    if(!picked)return;
+    try {
+      await setupReady;
+      let profilePath,cliPath;
+      while(true) {
+        const options={...setupOptions,provider:picked.provider,...(profilePath?{profilePath}:{}),...(cliPath?{cliPath}:{})};
+        let found;
+        try {found=await setup.discoverProvider(options);}
+        catch(error) {
+          const profileMissing=error?.safeToDisplay===true && error.code==='PROFILE_REQUIRED';
+          const executableMissing=error?.safeToDisplay===true && error.code==='CLI_NOT_FOUND';
+          if(!profileMissing && !executableMissing)throw error;
+          const action=profileMissing?'Choose profile':'Choose executable';
+          if(await vscode.window.showWarningMessage(error.message,action)!==action)return;
+          const selected=await vscode.window.showOpenDialog({title:action,
+            canSelectFiles:executableMissing,canSelectFolders:profileMissing,canSelectMany:false,
+            defaultUri:vscode.Uri.file(os.homedir())});
+          if(!selected?.[0])return;
+          if(profileMissing)profilePath=selected[0].fsPath;else cliPath=selected[0].fsPath;
+          continue;
+        }
+        const action=await vscode.window.showInformationMessage(
+          `Connect ${providerName(picked.provider)}?`,
+          {modal:true,detail:`Profile: ${found.profilePath}\n${found.hasExistingStatusLine?'Your existing statusline will be preserved.':'This adds a statusline reader for account usage.'}`},
+          'Connect','Choose another profile');
+        if(action==='Choose another profile') {
+          const selected=await vscode.window.showOpenDialog({title:'Choose the CLI profile directory',
+            canSelectFiles:false,canSelectFolders:true,canSelectMany:false,defaultUri:vscode.Uri.file(os.homedir())});
+          if(!selected?.[0])return;
+          profilePath=selected[0].fsPath;continue;
+        }
+        if(action!=='Connect')return;
+        if(await withRecovery(setup.connectProvider,options)===false)return;
+        await vscode.window.showInformationMessage(`${providerName(picked.provider)} connected. Select its terminal and let the CLI publish a fresh statusline reading.`);
+        await refresh();return;
+      }
+    } catch(error) {await showSetupError(error);}
+  };
+  const disconnect=async()=>{
+    try {
+      await setupReady;
+      const picked=await vscode.window.showQuickPick([
+        {label:'Claude Code',provider:'claude'},
+        {label:'Antigravity',provider:'antigravity'}
+      ],{title:'Disconnect account usage',placeHolder:'Restores the original statusline if this connection still owns the setting.'});
+      if(!picked)return;
+      if(await withRecovery(setup.disconnectProvider,{...setupOptions,provider:picked.provider})===false)return;
+      await refresh();
+      await vscode.window.showInformationMessage(`${providerName(picked.provider)} disconnected.`);
+    } catch(error) {await showSetupError(error);}
+  };
+  const provider={resolveWebviewView(resolved) {
+    view=resolved;
+    const media=vscode.Uri.joinPath(context.extensionUri,'media');
+    const uri=name=>resolved.webview.asWebviewUri(vscode.Uri.joinPath(media,name)).toString();
+    resolved.webview.options={enableScripts:true,enableCommandUris:false,enableForms:false,localResourceRoots:[media]};
+    assets={claude:uri('provider-claude.png'),codex:uri('provider-openai.png'),antigravity:uri('provider-antigravity.png')};
+    context.subscriptions.push(
+      resolved.webview.onDidReceiveMessage(message=>{if(message?.type==='ready'){lastContent='';render();}}),
+      resolved.onDidChangeVisibility(()=>{if(resolved.visible)void refresh();}),
+      resolved.onDidDispose(()=>{if(view===resolved)view=undefined;})
+    );
+    lastContent=getHtml();
+    resolved.webview.html=renderDocument({css:uri('account-usage.css'),script:uri('account-usage.js'),cspSource:resolved.webview.cspSource},lastContent);
+    void refresh();
+  }};
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider('llmAccountUsage.usage',provider),
+    vscode.commands.registerCommand('llmAccountUsage.open',async()=>{
+      await vscode.commands.executeCommand('llmAccountUsage.usage.focus');
+      const {warnings}=await setupReady;
+      if(warnings.length)await vscode.window.showWarningMessage('A saved provider connection needs attention. Run Account Usage: Connect Provider.');
+    }),
+    vscode.commands.registerCommand('llmAccountUsage.connect',connect),
+    vscode.commands.registerCommand('llmAccountUsage.disconnect',disconnect),
+    vscode.commands.registerCommand('llmAccountUsage.refresh',()=>refresh()),
+    vscode.window.onDidChangeActiveTerminal(()=>refresh()),
+    vscode.window.onDidCloseTerminal(()=>refresh()),
+    vscode.workspace.onDidChangeConfiguration(e=>{if(e.affectsConfiguration('llmAccountUsage'))void refresh();})
+  );
+  // Read bounded local session data only while visible. Never poll a vendor or a login.
+  let polling=false;
+  const timer=setInterval(async()=> {
+    if(!view?.visible || polling)return;
+    polling=true;try{await refresh(true);}finally{polling=false;}
+  },2000);
+  context.subscriptions.push({dispose(){clearInterval(timer);controller.dispose();}});
+  void refresh();
+  return {getState:()=>controller.state,getRows:()=>buildRows(controller.state),getViewModel,getHtml,refresh:()=>refresh()};
+}
+module.exports={activate};

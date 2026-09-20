@@ -244,6 +244,56 @@ test('native timeout kills and reaps only its own child',async()=>{
  assert.ok(Date.now()-started<2000);assert.throws(()=>process.kill(childPid,0),{code:'ESRCH'});assert.doesNotThrow(()=>process.kill(process.pid,0));
 });
 async function native(f,code) {await fs.writeFile(f.exe,`#!${process.execPath}\n${code}\n`);await fs.chmod(f.exe,0o700);}
+async function codexServer(f,{account={account:{type:'chatgpt',email:'member@example.test',planType:'pro'},requiresOpenaiAuth:true},rateLimits={rateLimitsByLimitId:{codex:{limitId:'codex',planType:'pro',primary:{usedPercent:24,windowDurationMins:300,resetsAt:1790421918},secondary:{usedPercent:48,windowDurationMins:10080,resetsAt:1791026718}},credits:{limitId:'credits',planType:'pro',primary:{usedPercent:7.5,windowDurationMins:1440,resetsAt:1790508318}}}},accountError=null,rateLimitsError=null,afterInitialize=''}={}) {
+ const log=path.join(f.base,'app-server-requests.jsonl');
+ const response=(id,result,error)=>error?{id,error}:{id,result};
+ await native(f,`
+const fs=require('node:fs');
+if(JSON.stringify(process.argv.slice(2))!==JSON.stringify(['app-server']))process.exit(9);
+const log=${JSON.stringify(log)},responses={2:${JSON.stringify(response(2,account,accountError))},3:${JSON.stringify(response(3,rateLimits,rateLimitsError))}};
+let buffered='';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data',chunk=>{buffered+=chunk;for(let end;(end=buffered.indexOf('\\n'))>=0;){const line=buffered.slice(0,end);buffered=buffered.slice(end+1);if(!line)continue;const message=JSON.parse(line);fs.appendFileSync(log,JSON.stringify({message,env:process.env})+'\\n');if(message.id===1){process.stdout.write(JSON.stringify({id:1,result:{userAgent:'fake'}})+'\\n');${afterInitialize}}else if(responses[message.id])process.stdout.write(JSON.stringify(responses[message.id])+'\\n');}});
+`);
+ return log;
+}
+const codexArgs=f=>({mode:'codex-hook',cliExecutable:f.exe,reportDir:f.reports});
+const codexHook=()=>Buffer.from(JSON.stringify({hook_event_name:'Stop',session_id:'codex-session',transcript_path:'/PRIVATE/transcript.jsonl',prompt:'PRIVATE prompt',last_assistant_message:'PRIVATE answer'}));
+test('Codex Stop reads account and all rate-limit buckets without a model turn',async t=>{
+ const f=await fixture(t),log=await codexServer(f),home=path.join(f.base,'home'),codexHome=path.join(f.base,'profile');
+ await fs.mkdir(home);await fs.mkdir(codexHome);
+ const report=await p.runCollection(codexArgs(f),codexHook(),stamp,{...f.options,env:{HOME:home,CODEX_HOME:codexHome,OPENAI_API_KEY:'PRIVATE'},now:()=>stamp});
+ assert.equal(report.account.email,'member@example.test');assert.equal(report.plan_type,'pro');assert.equal(report.account.usage_event_at,stamp);assert.equal(report.account.observed_at,stamp);
+ assert.equal(report.source.source_event_at,stamp);assert.equal(report.source.provider_observed_at,stamp);
+ assert.deepEqual(report.windows.map(window=>[window.pool_id,window.window_id,window.duration_minutes,window.used_percent]),[['codex','primary',300,24],['codex','secondary',10080,48],['credits','primary',1440,7.5]]);
+ assert.doesNotMatch(JSON.stringify(report),/PRIVATE|transcript|prompt|answer/);
+ const requests=(await fs.readFile(log,'utf8')).trim().split('\n').map(JSON.parse),messages=requests.map(row=>row.message);
+ assert.deepEqual(messages.find(message=>message.id===2),{id:2,method:'account/read',params:{refreshToken:false}});
+ assert.deepEqual(messages.find(message=>message.id===3),{id:3,method:'account/rateLimits/read',params:{}});
+ assert.equal(messages.some(message=>message.method==='turn/start'),false);
+ assert.deepEqual(requests[0].env,{HOME:home,CODEX_HOME:codexHome,PATH:'/usr/local/bin:/usr/bin:/bin',LANG:'C.UTF-8',LC_ALL:'C.UTF-8'});
+ const feed=await require('../src/core.cjs').readFeeds([f.reports]);assert.equal(feed.rejected,0);assert.equal(feed.reports.length,1);assert.equal(feed.reports[0].account.email,'member@example.test');
+});
+test('Codex Stop publishes partial reports instead of stale account or quota data',async t=>{
+ const f=await fixture(t),options={...f.options,env:{HOME:path.join(f.base,'home')},now:()=>stamp};
+ await fs.mkdir(options.env.HOME);
+ await codexServer(f,{rateLimitsError:{code:-32000,message:'PRIVATE quota failure'}});
+ const accountOnly=await p.runCollection(codexArgs(f),codexHook(),stamp,options);
+ assert.equal(accountOnly.account.email,'member@example.test');assert.deepEqual(accountOnly.windows,[]);assert.match(accountOnly.coverage,/rate-limit metadata unavailable/);assert.doesNotMatch(JSON.stringify(accountOnly),/PRIVATE/);
+ await codexServer(f,{accountError:{code:-32000,message:'PRIVATE account failure'}});
+ const quotaOnly=await p.runCollection(codexArgs(f),codexHook(),'2026-09-19T12:01:00Z',{...options,now:()=> '2026-09-19T12:01:00Z'});
+ assert.equal(quotaOnly.account,undefined);assert.equal(quotaOnly.windows.length,3);assert.equal(quotaOnly.plan_type,'pro');assert.match(quotaOnly.coverage,/account metadata unavailable/);assert.doesNotMatch(JSON.stringify(quotaOnly),/PRIVATE/);
+ await codexServer(f,{accountError:{code:-32000,message:'PRIVATE account failure'},rateLimitsError:{code:-32000,message:'PRIVATE quota failure'}});
+ const absent=await p.runCollection(codexArgs(f),codexHook(),'2026-09-19T12:02:00Z',{...options,now:()=> '2026-09-19T12:02:00Z'});
+ assert.equal(absent.account,undefined);assert.equal(absent.plan_type,undefined);assert.deepEqual(absent.windows,[]);assert.match(absent.coverage,/account metadata unavailable/);assert.match(absent.coverage,/rate-limit metadata unavailable/);assert.doesNotMatch(JSON.stringify(absent),/PRIVATE/);
+});
+test('Codex Stop process replacement prevents publication',async t=>{
+ const f=await fixture(t),stat=path.join(f.proc,'10/stat'),body=(await fs.readFile(stat,'utf8')).replace('900','999');
+ await fs.mkdir(path.join(f.base,'home'));
+ await codexServer(f,{afterInitialize:`fs.writeFileSync(${JSON.stringify(stat)},${JSON.stringify(body)});`});
+ await assert.rejects(p.runCollection(codexArgs(f),codexHook(),stamp,{...f.options,env:{HOME:path.join(f.base,'home')}}),/process-changed/);
+ assert.deepEqual((await fs.readdir(f.reports)).filter(name=>name.endsWith('.json')),[]);
+});
 const agyArgs=f=>({mode:'antigravity-statusline',cliExecutable:f.exe,reportDir:f.reports,agyFullUsage:true});
 test('AGY idle full usage publishes both pools with statusline account metadata',async t=>{
  const f=await fixture(t);await native(f,`if(JSON.stringify(process.argv.slice(2))!==JSON.stringify(['--print','/usage']))process.exit(9);process.stdout.write(${JSON.stringify(tsv())});`);
@@ -339,6 +389,7 @@ test('CLI original statusline preserves bytes, stdout and exit on malformed or o
 test('CLI observation failures do not block native work or expose private paths',async t=>{
  const f=await fixture(t);const result=await cli(['claude-statusline','--cli-executable',f.exe,'--report-dir',f.reports],Buffer.from('{}'));
  assert.equal(result.code,0);assert.equal(result.stdout.length,0);assert.match(result.stderr,/usage-collector:/);assert.ok(!result.stderr.includes(f.base));
+ const hook=await cli(['codex-hook','--cli-executable',f.exe,'--report-dir',f.reports],codexHook());assert.equal(hook.code,0);assert.equal(hook.stdout.length,0);assert.doesNotMatch(hook.stderr,/PRIVATE|transcript|prompt|answer/);
  const direct=await cli(['codex-read','--cli-executable',f.exe,'--pid','2147483647'],Buffer.alloc(0));assert.equal(direct.code,1);assert.equal(direct.stdout.length,0);assert.equal(direct.stderr,'usage-collector: process-unavailable\n');
 });
 

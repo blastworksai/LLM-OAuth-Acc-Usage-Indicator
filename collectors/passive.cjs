@@ -8,7 +8,7 @@ const path=require('node:path');
 const os=require('node:os');
 const {createHash,randomBytes}=require('node:crypto');
 const {spawn}=require('node:child_process');
-const MAX_REPORT=32768,MAX_INPUT=1048576,MAX_HEAD=524288,MAX_TAIL=262144,MAX_FDS=512,MAX_TRANSCRIPTS=32;
+const MAX_REPORT=32768,MAX_NATIVE_STDERR=8192,MAX_INPUT=1048576,MAX_HEAD=524288,MAX_TAIL=262144,MAX_FDS=512,MAX_TRANSCRIPTS=32;
 const MAX_PRUNE_ENTRIES=1024,MAX_PUBLISHED_ENTRIES=120;
 const COVERAGE='Only windows supplied by this session. Other account limits may be unavailable.';
 const CODEX_PLANS=new Set(['free','go','plus','pro','prolite','team','self_serve_business_prolite','self_serve_business_usage_based','business','ent26','enterprise_cbp_automation','enterprise_cbp_usage_based','enterprise','edu','edu_plus','edu_pro']);
@@ -209,6 +209,87 @@ async function claudeAuthMetadata(identity,executable,capturedAt,options={}) {
   const metadata={};if(CLAUDE_PLANS.has(data.subscriptionType))metadata.plan_type=data.subscriptionType;
   if(validEmail(data.email))metadata.account={email:data.email,source:'claude-auth-status',usage_event_at:capturedAt,observed_at:(options.now||utcNow)()};return metadata;
  } catch{return {};}
+}
+const safeAbsolutePath=value=>typeof value==='string' && value.length>0 && value.length<=4096 &&
+ !/[\x00-\x1f\x7f]/.test(value) && path.isAbsolute(value) && path.normalize(value)===value;
+function codexProfileEnvironment(source=process.env) {
+ if(!object(source) || !safeAbsolutePath(source.HOME) || (source.CODEX_HOME!==undefined && !safeAbsolutePath(source.CODEX_HOME)))fail('unsafe-codex-profile');
+ const env={HOME:source.HOME};if(source.CODEX_HOME)env.CODEX_HOME=source.CODEX_HOME;
+ Object.assign(env,{PATH:'/usr/local/bin:/usr/bin:/bin',LANG:'C.UTF-8',LC_ALL:'C.UTF-8'});return env;
+}
+// Codex app-server speaks newline-delimited JSON. This observation is deliberately
+// narrower than a general client: initialize once, issue two read-only account
+// requests, retain only their structured results, and stop our child.
+function codexAppServerObservation(identity,profile,options={}) {
+ return new Promise(resolve=>{
+  let child,settled=false,invalid=false,initialized=false,stdoutBytes=0,stderrBytes=0,pending=Buffer.alloc(0),forceTimer;
+  const replies={account:null,rateLimits:null},received=new Set();
+  const finish=()=>{if(settled)return;settled=true;clearTimeout(timer);clearTimeout(forceTimer);resolve(invalid?{account:null,rateLimits:null}:replies);};
+  const stop=bad=>{invalid=invalid||bad;try{child?.stdin?.destroy();child?.kill('SIGKILL');}catch{};if(!child)finish();};
+  const send=message=>{try{child.stdin.write(JSON.stringify(message)+'\n');}catch{stop(true);}};
+  const complete=()=>{
+   if(received.size!==2)return;
+   try{child.stdin.end();}catch{}
+   forceTimer=setTimeout(()=>{try{child?.kill('SIGKILL');}catch{};},100);
+  };
+  const message=line=>{
+   let value;try{value=JSON.parse(decode(line));}catch{stop(true);return;}
+   if(!object(value)){stop(true);return;}
+   if(!initialized && value.id===1) {
+    if(value.error || !object(value.result)){stop(true);return;}
+    initialized=true;send({method:'initialized'});send({id:2,method:'account/read',params:{refreshToken:false}});send({id:3,method:'account/rateLimits/read',params:{}});return;
+   }
+   if(!initialized || ![2,3].includes(value.id) || received.has(value.id))return;
+   received.add(value.id);
+   if(!value.error && object(value.result))replies[value.id===2?'account':'rateLimits']=value.result;
+   complete();
+  };
+  const timer=setTimeout(()=>stop(false),Math.min(Number.isFinite(options.timeoutMs)?Math.max(1,options.timeoutMs):6000,6000));
+  try {
+   child=(options.spawnProcess||spawn)(path.join(options.proc||'/proc',String(identity.pid),'exe'),['app-server'],{
+    env:profile,cwd:profile.HOME,stdio:['pipe','pipe','pipe'],shell:false,windowsHide:true
+   });
+   child.on('error',()=>stop(true));child.on('close',finish);child.stdin.on('error',()=>stop(true));child.stdout.on('error',()=>stop(true));child.stderr.on('error',()=>stop(true));
+   child.stderr.on('data',chunk=>{stderrBytes+=Buffer.byteLength(chunk);if(stderrBytes>MAX_NATIVE_STDERR)stop(true);});
+   child.stdout.on('data',chunk=>{
+    if(settled)return;stdoutBytes+=Buffer.byteLength(chunk);if(stdoutBytes>MAX_REPORT){stop(true);return;}
+    pending=Buffer.concat([pending,Buffer.from(chunk)]);let end;
+    while(!settled && (end=pending.indexOf(10))>=0){const line=pending.subarray(0,end);pending=pending.subarray(end+1);if(line.length)message(line);}
+   });
+   send({id:1,method:'initialize',params:{clientInfo:{name:'account_usage',title:'Account Usage',version:'1'}}});
+  } catch {stop(true);}
+ });
+}
+function codexWindow(pool,name,value) {
+ let duration=number(value.windowDurationMins,1,525600);if(!Number.isSafeInteger(duration))duration=null;
+ return {pool_id:pool,window_id:name,duration_minutes:duration,used_percent:number(value.usedPercent),resets_at:epochTime(value.resetsAt)};
+}
+async function codexNativeReport(data,identity,executable,capturedAt,options={}) {
+ if(!object(data) || data.hook_event_name!=='Stop')fail('unsupported-hook-event');
+ const report=baseReport('codex',data.session_id,identity,capturedAt,data.model),profile=codexProfileEnvironment(options.env||process.env);
+ report.source.source_event_at=capturedAt;
+ if(!same(identity,await checkedProcess(identity.pid,executable,options)))fail('process-changed');
+ const observation=await codexAppServerObservation(identity,profile,options);
+ if(!same(identity,await checkedProcess(identity.pid,executable,options)))fail('process-changed');
+ report.source.provider_observed_at=timestamp((options.now||utcNow)())||capturedAt;
+ const account=observation.account?.account,accountPlan=object(account)&&CODEX_PLANS.has(account.planType)?account.planType:null;
+ const accountIdentityAvailable=object(account) && account.type==='chatgpt' && validEmail(account.email);
+ const plans=new Set(),buckets=[];
+ if(object(observation.rateLimits?.rateLimitsByLimitId) && Object.keys(observation.rateLimits.rateLimitsByLimitId).length) {
+  const entries=Object.entries(observation.rateLimits.rateLimitsByLimitId);
+  if(entries.length<=32)for(const [key,value] of entries)if(object(value) && smallString(key,128) && value.limitId===key)buckets.push(value);
+ } else if(object(observation.rateLimits?.rateLimits))buckets.push(observation.rateLimits.rateLimits);
+ for(const bucket of buckets) {
+  const pool=smallString(bucket.limitId,128);if(!pool)continue;
+  if(CODEX_PLANS.has(bucket.planType))plans.add(bucket.planType);
+  for(const name of ['primary','secondary'])if(object(bucket[name]))report.windows.push(codexWindow(pool,name,bucket[name]));
+ }
+ if(accountPlan)report.plan_type=accountPlan;else if(plans.size===1)report.plan_type=plans.values().next().value;
+ const accountAvailable=accountIdentityAvailable && report.plan_type!==undefined;
+ if(accountAvailable)report.account={email:account.email,source:'codex-account-read',usage_event_at:capturedAt,observed_at:report.source.provider_observed_at};
+ if(!accountAvailable)report.coverage+=' Native account metadata unavailable.';
+ if(!report.windows.length)report.coverage+=' Native rate-limit metadata unavailable.';
+ return report;
 }
 async function codexFromStream(source,session,identity,capturedAt,model=null) {
  const meta=await readMeta(source);if(meta.id!==session || meta.source!=='cli')fail('transcript-session-or-root-mismatch');
@@ -451,12 +532,8 @@ async function runCollection(args,raw,capturedAt=utcNow(),options={}) {
     if(query.value){Object.assign(report,query.value);report.source.kind='antigravity-native-usage';}
     else report.coverage+=query.busy?' Full native usage query already in progress. GPT/Claude pool may be missing.':' Full native usage read failed. GPT/Claude pool may be missing.';
    }
-  } else {
-   if(!object(data) || !new Set(['SessionStart','UserPromptSubmit','PreToolUse','PostToolUse','Stop','Interrupt','PreCompact','PostCompact','SessionEnd']).has(data.hook_event_name))fail('unsupported-hook-event');
-   if(typeof data.transcript_path!=='string')fail('missing-transcript-path');
-   report=await codexReport(data.transcript_path,data.session_id,identity,capturedAt,data.model);
-   if(data.hook_event_name==='SessionEnd'){report.windows=[];report.coverage='Session ended.';}
-  }
+  } else if(args.mode==='codex-hook')report=await codexNativeReport(data,identity,args.cliExecutable,capturedAt,options);
+  else fail('invalid-mode');
   if(!same(identity,await checkedProcess(identity.pid,args.cliExecutable,options)))fail('process-changed');
  }
  if(args.mode==='codex-read'){reportBytes(report);return report;}
@@ -523,5 +600,5 @@ async function main(argv=process.argv.slice(2)) {
  } catch {process.stderr.write('usage-collector: collection-unavailable\n');return ['codex-fd','codex-read'].includes(args.mode)?1:0;}
  finally{await saved?.close();if(tempDir)await fs.rmdir(tempDir).catch(()=>{});}
 }
-module.exports={CollectorError,processRecord,checkedProcess,findCliAncestor,openDirectory,openTranscript,readMeta,latestQuota,baseReport,claudeReport,antigravityReport,parseAntigravityUsage,boundedNative,antigravityNativeUsage,claudeAuthMetadata,codexFromStream,codexReport,codexFdReport,publishReport,runCollection,parseArgs,timestamp,number,validEmail,main};
+module.exports={CollectorError,processRecord,checkedProcess,findCliAncestor,openDirectory,openTranscript,readMeta,latestQuota,baseReport,claudeReport,antigravityReport,parseAntigravityUsage,boundedNative,antigravityNativeUsage,claudeAuthMetadata,codexProfileEnvironment,codexAppServerObservation,codexNativeReport,codexFromStream,codexReport,codexFdReport,publishReport,runCollection,parseArgs,timestamp,number,validEmail,main};
 if(require.main===module)main().then(code=>{process.exitCode=code;}).catch(()=>{process.stderr.write('usage-collector: collection-unavailable\n');process.exitCode=1;});

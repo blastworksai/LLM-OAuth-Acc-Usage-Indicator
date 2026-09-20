@@ -285,6 +285,19 @@ test('PID reuse during native query invalidates publication, including passive f
 });
 const claudeArgs=f=>({mode:'claude-statusline',cliExecutable:f.exe,reportDir:f.reports,claudeAuthStatus:true});
 const claudeRaw=()=>Buffer.from(JSON.stringify({session_id:'c',model:{id:'claude-example'},rate_limits:{five_hour:{used_percentage:41,resets_at:1790421918}}}));
+test('private setgid report directories support native identity collection and card reads',async t=>{
+ const f=await fixture(t);
+ await fs.chmod(f.reports,0o2700);
+ await native(f,`process.stdout.write(JSON.stringify({loggedIn:true,authMethod:'claude.ai',email:'member@example.test',subscriptionType:'max'}));`);
+ const report=await p.runCollection(claudeArgs(f),claudeRaw(),stamp,f.options);
+ assert.equal(report.account?.email,'member@example.test');
+ const feed=await require('../src/core.cjs').readFeeds([f.reports]);
+ assert.equal(feed.rejected,0);assert.equal(feed.reports.length,1);
+ assert.equal(feed.reports[0].windows[0].used_percent,41);
+ await fs.chmod(f.reports,0o2770);
+ await assert.rejects(p.publishReport(f.reports,report),/unsafe-report-directory/);
+ assert.equal((await require('../src/core.cjs').readFeeds([f.reports])).reports.length,0);
+});
 test('Claude metadata is opt-in, native-managed, bounded and independently allowlisted',async t=>{
  const f=await fixture(t),auth={loggedIn:true,authMethod:'claude.ai',email:'member@example.test',subscriptionType:'max',private:'PRIVATE'};
  await native(f,`if(JSON.stringify(process.argv.slice(2))!==JSON.stringify(['auth','status']))process.exit(9);process.stdout.write(${JSON.stringify(JSON.stringify(auth))});`);

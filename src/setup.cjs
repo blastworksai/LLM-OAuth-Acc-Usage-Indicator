@@ -53,7 +53,7 @@ function createSetup(dependencies = {}) {
   }
   // Inspect every path component. System-owned ancestors are acceptable; an
   // owner-owned sticky directory (e.g. /tmp) is not acceptable as our data root.
-  async function safeDirectories(directory, o, {create = false, privateLeaf = false, ownerLeaf = true} = {}) {
+  async function safeDirectories(directory, o, {create = false, privateLeaf = false, ownerLeaf = true, allowMissing = false} = {}) {
     const target = absolute(directory);
     let current = path.parse(target).root;
     for(const segment of target.slice(current.length).split('/').filter(Boolean)) {
@@ -63,15 +63,24 @@ function createSetup(dependencies = {}) {
         try { await io.mkdir(current, {mode:0o700}); } catch(error) { if(error.code !== 'EEXIST') throw error; }
         entry = await stat(current);
       }
+      if(!entry && allowMissing) break;
       if(!entry) throw failure('PROFILE_REQUIRED', 'The selected profile directory does not exist. Sign in with the provider separately first.');
       const leaf = current === target;
       const trustedSticky = !leaf && entry.uid === o.systemUid && (entry.mode & 0o1000);
       if(entry.isSymbolicLink() || !entry.isDirectory() ||
         (entry.uid !== o.uid && entry.uid !== o.systemUid) ||
         (leaf && ownerLeaf && entry.uid !== o.uid) ||
-        ((entry.mode & 0o022) && !trustedSticky) ||
+        ((entry.mode & 0o002) && !trustedSticky) ||
         (leaf && privateLeaf && (entry.mode & 0o077)))
         throw failure('UNSAFE_PATH', `Setup refused an unsafe directory owner, link, or permission mode: ${current}`);
+      if((entry.mode & 0o020) && !trustedSticky) {
+        const approved = Array.isArray(o.trustedDirectories) && o.trustedDirectories.some(item =>
+          item?.path === current && item.uid === entry.uid && item.gid === entry.gid);
+        if(!approved) {
+          if(o.sharedDirectoryReview) o.sharedDirectoryReview.set(current, {path:current, uid:entry.uid, gid:entry.gid});
+          else throw failure('DIRECTORY_TRUST_REQUIRED', `A directory is writable by a shared group. Connect Provider again to review and trust it: ${current}`);
+        }
+      }
     }
     return target;
   }
@@ -174,8 +183,15 @@ function createSetup(dependencies = {}) {
       hasExistingStatusLine:own(config, 'statusLine'), bytes, config};
   }
   async function discoverProvider(input) {
-    const {bytes, config, ...preview} = await inspect(options(input));
-    return preview;
+    const o = options(input);
+    // Discovery only reads. Collect exact directories for the connection's
+    // confirmation; permission to use them is never inferred from membership.
+    o.sharedDirectoryReview = new Map();
+    const {bytes, config, ...preview} = await inspect(o);
+    await safeDirectories(o.storagePath, o, {allowMissing:true});
+    await safeDirectories(locations(o).root, o, {allowMissing:true});
+    await nativeExecutable(o.nodePath, o, 'UNSUPPORTED_RUNTIME');
+    return {...preview, sharedDirectories:[...o.sharedDirectoryReview.values()]};
   }
   function locations(o, provider = o.provider) {
     absolute(o.storagePath);
@@ -222,7 +238,7 @@ function createSetup(dependencies = {}) {
     try {
       directory = await io.open(`${anchor}/.setup-lock`, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
       const info = await directory.stat();
-      if(info.uid !== o.uid || (info.mode & 0o7777) !== 0o700) throw invalidLock(loc);
+      if(info.uid !== o.uid || (info.mode & 0o5777) !== 0o700) throw invalidLock(loc);
       const pinned = `/proc/self/fd/${directory.fd}`, entries = [];
       const iterator = await io.opendir(pinned);
       for await(const entry of iterator) { entries.push(entry.name); if(entries.length > 1) break; }

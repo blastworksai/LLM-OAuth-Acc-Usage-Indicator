@@ -99,3 +99,14 @@ test('all non-ready states remove quota card percentages and data',()=>{
   const html=renderContent(buildViewModel({...state(),status},now));assert.doesNotMatch(html,/role="progressbar"|42%|17%/);
  }
 });
+test('provider setup is directly reachable by a native button in empty and populated cards',()=>{
+ for(const status of ['ready','loading','unavailable','ambiguous','unsupported','no-terminal']) {
+  const html=renderContent(buildViewModel({...state(),status},now));
+  const buttons=[...html.matchAll(/<button\b([^>]*)>([^<]*)<\/button>/g)];
+  assert.equal(buttons.length,1,`${status} must offer one provider connection action`);
+  assert.match(buttons[0][1],/type="button"/);
+  assert.match(buttons[0][1],/data-action="connect"/);
+  assert.equal(buttons[0][2],'Connect Provider');
+  assert.doesNotMatch(buttons[0][1],/disabled|tabindex="-1"/);
+ }
+});

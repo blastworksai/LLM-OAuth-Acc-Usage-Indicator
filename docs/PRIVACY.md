@@ -22,6 +22,8 @@ Provider connections keep a backup, connection receipt, stable collector runtime
 
 The backup is a copy of the **full provider settings file**, which may include secrets or sensitive configuration you put there. Backups are readable only by your operating-system user and remain after disconnection for recovery. Treat them as private credentials and do not attach them to issues.
 
+When you explicitly approve shared Linux directories during connection, their paths and numeric owner/group IDs are saved in the extension host's local editor state. This approval is not synchronized through VS Code Settings Sync. People with write access to those directories must be trusted; the extension does not make a shared home private. World-writable paths, writable settings files and changed ownership remain refused.
+
 Run **Account Usage: Disconnect Provider** before uninstalling to restore provider settings. Backups and reports may remain locally for recovery; they can be removed after checking the disconnect result. Do not publish this storage folder in a bug report.
 
 The card itself displays personal data. Review screenshots before sharing them, including expanded report details and terminal names.

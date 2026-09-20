@@ -12,13 +12,15 @@ No statusline setting is needed. Select a native Codex session authenticated thr
 
 ## Claude Code and Antigravity
 
-Run **Account Usage: Connect Provider**, choose the provider and check the profile shown. Connect the profile your terminal actually uses. Claude's `CLAUDE_CONFIG_DIR` is honored. Other detected overrides require an explicit profile selection; a profile selected only through terminal-specific flags must also be selected explicitly. If the native CLI is outside the editor's PATH, the command offers an executable picker.
+Click **Connect Provider** on the card, choose the provider and check the profile shown. The same action remains available as **Account Usage: Connect Provider** in the Command Palette. Connect the profile your terminal actually uses. Claude's `CLAUDE_CONFIG_DIR` is honored. Other detected overrides require an explicit profile selection; a profile selected only through terminal-specific flags must also be selected explicitly. If the native CLI is outside the editor's PATH, setup offers an executable picker.
 
 The connection changes only the user profile's `statusLine` setting and preserves an existing command using its shell semantics. A project-level or command-line setting can override that user setting; check the CLI's effective settings if no reports arrive. Unsafe files and conflicting edits stop setup with a message. The CLI must support the native statusline data used by this extension. Antigravity's full quota reader uses its built-in `/usage` command; after connecting, `/usage` followed by closing the native panel can provide a fresh idle reading without a model turn.
 
 One profile per provider can be connected for each Linux user. A second editor installation must disconnect the existing connection before taking ownership; setup does not nest multiple Account Usage hooks. GNU-compatible `tee`, `timeout` and standard shell utilities must be available. If prerequisites are unavailable, provider settings stay unchanged.
 
-The profile and its settings must belong to your user and must not be writable by other users or groups. Setup reports unsafe permissions instead of changing them. If the original editor storage has been removed, Connect or Disconnect offers to recover its saved connection after your confirmation. Interrupted setup is recovered without replacing a statusline you subsequently changed.
+The profile and its settings must belong to your user. Settings files and executables must not be writable by other users or groups. For directories intentionally writable by a shared Linux group, setup lists each directory and group ID and offers **Trust and connect**. Choose it only if you trust everyone who can write there. Approval is saved in this extension host's local editor state for those exact paths, owners and groups. Changing an owner or group requires another review. World-writable directories and symlinks remain refused; setup never changes existing directory permissions. Private report directories can inherit the Linux setgid bit without granting group write access.
+
+If the original editor storage has been removed, Connect or Disconnect offers to recover its saved connection after your confirmation. Interrupted setup is recovered without replacing a statusline you subsequently changed.
 
 ## No account reading yet
 

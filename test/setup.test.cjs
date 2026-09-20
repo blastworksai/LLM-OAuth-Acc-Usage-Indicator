@@ -46,6 +46,47 @@ test('fresh connect installs stable private runtime and preserves unrelated conf
   assert.deepEqual((await f.setup.listConnections(f.options)).map(v => v.reportDir), [result.reportDir]);
 });
 
+test('shared home and profile require reviewed trust, then connect without changing permissions', async t => {
+  const f = await fixture(t);
+  await writeJson(f.settingsPath, {theme:'keep'});
+  await fs.chmod(f.homeDir, 0o2770);
+  await fs.chmod(f.profilePath, 0o2775);
+  const before = await fs.readFile(f.settingsPath);
+  const preview = await f.setup.discoverProvider(f.options);
+  assert.deepEqual(preview.sharedDirectories.map(item => item.path), [f.homeDir, f.profilePath]);
+  assert.deepEqual(await fs.readFile(f.settingsPath), before);
+  await assert.rejects(fs.stat(f.options.storagePath), {code:'ENOENT'});
+  await assert.rejects(f.setup.connectProvider(f.options), {code:'DIRECTORY_TRUST_REQUIRED'});
+  const options = {...f.options, trustedDirectories:preview.sharedDirectories};
+  const result = await f.setup.connectProvider(options);
+  assert.equal(result.connected, true);
+  assert.deepEqual((await f.setup.listConnections(options)).map(value => value.provider), ['claude']);
+  assert.deepEqual((await f.setup.refreshRuntime(options)).warnings, []);
+  assert.equal((await fs.stat(f.homeDir)).mode & 0o7777, 0o2770);
+  assert.equal((await fs.stat(f.profilePath)).mode & 0o7777, 0o2775);
+  await f.setup.disconnectProvider(options);
+  assert.deepEqual(await readJson(f.settingsPath), {theme:'keep'});
+});
+
+test('shared directory trust cannot approve a different group, world writes, links or writable settings', async t => {
+  const f = await fixture(t);
+  await writeJson(f.settingsPath, {});
+  await fs.chmod(f.homeDir, 0o2770);
+  const preview = await f.setup.discoverProvider(f.options);
+  const wrongGroup = preview.sharedDirectories.map(item => ({...item, gid:item.gid + 1}));
+  await assert.rejects(f.setup.connectProvider({...f.options, trustedDirectories:wrongGroup}), {code:'DIRECTORY_TRUST_REQUIRED'});
+  const options = {...f.options, trustedDirectories:preview.sharedDirectories};
+  await fs.chmod(f.homeDir, 0o777);
+  await assert.rejects(f.setup.discoverProvider(options), {code:'UNSAFE_PATH'});
+  await fs.chmod(f.homeDir, 0o2770);
+  await fs.chmod(f.settingsPath, 0o660);
+  await assert.rejects(f.setup.connectProvider(options), {code:'UNSAFE_PATH'});
+  await fs.chmod(f.settingsPath, 0o600);
+  const link = path.join(f.homeDir, 'linked');
+  await fs.symlink(f.profilePath, link);
+  await assert.rejects(f.setup.connectProvider({...options, profilePath:link}), {code:'UNSAFE_PATH'});
+});
+
 test('repeated connect preserves original backup and statusline stdin, shell syntax and stdout', async t => {
   const f = await fixture(t);
   const original = {type:'command', command:'prefix=kept; printf "%s:" "$prefix"; cat', padding:2};

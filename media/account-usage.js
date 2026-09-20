@@ -25,16 +25,21 @@ restoreDetails(vscode.getState()?.detailsOpen);
 document.addEventListener('toggle',event=> {
   if(event.target.id==='report-details')vscode.setState({detailsOpen:event.target.open});
 },true);
+document.addEventListener('click',event=> {
+  if(event.target?.closest?.('button[data-action="connect"]'))vscode.postMessage({type:'connect'});
+});
 window.addEventListener('message',event=> {
   if(event.data?.type!=='render' || typeof event.data.html!=='string' || event.data.html===html)return;
   const open=document.getElementById('report-details')?.open;
   const summaryFocused=document.activeElement?.matches('#report-details > summary');
+  const connectFocused=document.activeElement?.matches('button[data-action="connect"]');
   const position=window.scrollY;
   // Only escaped, allowlisted presentation markup arrives from the extension.
   html=event.data.html;container.innerHTML=html;
   localizeTimes();
   restoreDetails(open ?? vscode.getState()?.detailsOpen);
   if(summaryFocused)document.querySelector('#report-details > summary')?.focus({preventScroll:true});
+  if(connectFocused)container.querySelector('button[data-action="connect"]')?.focus({preventScroll:true});
   window.scrollTo(0,position);
 });
 vscode.postMessage({type:'ready'});

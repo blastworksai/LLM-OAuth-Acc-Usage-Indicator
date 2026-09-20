@@ -259,7 +259,7 @@ async function reclaimDeadLock(anchor,lock) {
  let directory,file;
  try {
   directory=await fs.open(`${anchor}/${lock}`,C.O_RDONLY|C.O_DIRECTORY|C.O_NOFOLLOW);
-  const info=await directory.stat();if(info.uid!==process.getuid() || (info.mode&0o7777)!==0o700)fail('unsafe-report-lock');
+  const info=await directory.stat();if(info.uid!==process.getuid() || (info.mode&0o5777)!==0o700)fail('unsafe-report-lock');
   const pinned=`/proc/self/fd/${directory.fd}`,entries=[];const iterator=await fs.opendir(pinned);
   for await(const entry of iterator) {entries.push(entry.name);if(entries.length>1)fail('unsafe-report-lock');}
   // An empty lock is already being released; acquisition can retry atomically.
@@ -383,7 +383,7 @@ async function publishReport(directory,report,options={}) {
  const data=reportBytes(report),filename=reportFilename(report);
  const parent=await openDirectory(directory);let release,temporary,output,oldFile;
  try {
-  const info=await parent.stat();if(info.uid!==process.getuid() || ((info.mode&0o7777)&~0o750))fail('unsafe-report-directory');
+  const info=await parent.stat();if(info.uid!==process.getuid() || ((info.mode&0o7777)&~0o2750))fail('unsafe-report-directory');
   const anchor=`/proc/self/fd/${parent.fd}`;release=await acquireLock(anchor);
   try{oldFile=await fs.open(`${anchor}/${filename}`,C.O_RDONLY|C.O_NOFOLLOW|C.O_NONBLOCK);}catch(error){if(error.code!=='ENOENT')fail('unsafe-existing-report');}
   if(oldFile) {
@@ -411,11 +411,11 @@ async function guardedNativeQuery(directory,provider,identity,query) {
  let parent,locks,release;
  try {
   parent=await openDirectory(directory);const parentInfo=await parent.stat();
-  if(parentInfo.uid!==process.getuid() || ((parentInfo.mode&0o7777)&~0o750))fail('unsafe-report-directory');
+  if(parentInfo.uid!==process.getuid() || ((parentInfo.mode&0o7777)&~0o2750))fail('unsafe-report-directory');
   const location=`/proc/self/fd/${parent.fd}/.native-queries`;
   try{await fs.mkdir(location,{mode:0o700});}catch(error){if(error.code!=='EEXIST')throw error;}
   locks=await fs.open(location,C.O_RDONLY|C.O_DIRECTORY|C.O_NOFOLLOW);
-  const info=await locks.stat();if(info.uid!==process.getuid() || (info.mode&0o7777)!==0o700)fail('unsafe-native-query-directory');
+  const info=await locks.stat();if(info.uid!==process.getuid() || (info.mode&0o5777)!==0o700)fail('unsafe-native-query-directory');
   const key=createHash('sha256').update(JSON.stringify([provider,identity.pid,identity.uid,identity.start_ticks,identity.boot_id])).digest('hex').slice(0,32);
   release=await acquireLock(`/proc/self/fd/${locks.fd}`,{lock:`query-${key}`,attempts:2,pauseMs:0,busyCode:'native-query-busy'});
   return {busy:false,value:await query()};

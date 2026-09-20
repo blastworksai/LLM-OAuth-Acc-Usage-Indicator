@@ -10,7 +10,8 @@ const setup=require('./setup.cjs');
 function activate(context) {
   let view, assets={}, lastContent='', collectionTail=Promise.resolve();
   const setupOptions={storagePath:context.globalStorageUri.fsPath,nodePath:process.execPath,
-    collectorPath:path.join(context.extensionPath,'collectors','passive.cjs')};
+    collectorPath:path.join(context.extensionPath,'collectors','passive.cjs'),
+    trustedDirectories:context.globalState.get('trustedDirectories',[])};
   const setupReady=process.platform==='linux'
     ? setup.refreshRuntime(setupOptions).catch(()=>({warnings:['Saved provider connections need attention. Run Account Usage: Connect Provider.']}))
     : Promise.resolve({warnings:[]});
@@ -87,18 +88,28 @@ function activate(context) {
           if(profileMissing)profilePath=selected[0].fsPath;else cliPath=selected[0].fsPath;
           continue;
         }
+        const shared=found.sharedDirectories||[];
+        const connectAction=shared.length?'Trust and connect':'Connect';
+        const trustDetail=shared.length?'\n\nThese directories are writable by a shared Linux group:\n'+
+          shared.map(item=>`${item.path} (group ${item.gid})`).join('\n')+
+          '\n\nContinue only if you trust everyone who can write there. This approval is saved on this host. Directory permissions stay unchanged.':'';
         const action=await vscode.window.showInformationMessage(
           `Connect ${providerName(picked.provider)}?`,
-          {modal:true,detail:`Profile: ${found.profilePath}\n${found.hasExistingStatusLine?'Your existing statusline will be preserved.':'This adds a statusline reader for account usage.'}`},
-          'Connect','Choose another profile');
+          {modal:true,detail:`Profile: ${found.profilePath}\n${found.hasExistingStatusLine?'Your existing statusline will be preserved.':'This adds a statusline reader for account usage.'}${trustDetail}`},
+          connectAction,'Choose another profile');
         if(action==='Choose another profile') {
           const selected=await vscode.window.showOpenDialog({title:'Choose the CLI profile directory',
             canSelectFiles:false,canSelectFolders:true,canSelectMany:false,defaultUri:vscode.Uri.file(os.homedir())});
           if(!selected?.[0])return;
           profilePath=selected[0].fsPath;continue;
         }
-        if(action!=='Connect')return;
+        if(action!==connectAction)return;
+        const approved=new Map((Array.isArray(setupOptions.trustedDirectories)?setupOptions.trustedDirectories:[]).map(item=>[item.path,item]));
+        for(const item of shared)approved.set(item.path,item);
+        options.trustedDirectories=[...approved.values()];
         if(await withRecovery(setup.connectProvider,options)===false)return;
+        await context.globalState.update('trustedDirectories',options.trustedDirectories);
+        setupOptions.trustedDirectories=options.trustedDirectories;
         await vscode.window.showInformationMessage(`${providerName(picked.provider)} connected. Select its terminal and let the CLI publish a fresh statusline reading.`);
         await refresh();return;
       }
@@ -124,7 +135,10 @@ function activate(context) {
     resolved.webview.options={enableScripts:true,enableCommandUris:false,enableForms:false,localResourceRoots:[media]};
     assets={claude:uri('provider-claude.png'),codex:uri('provider-openai.png'),antigravity:uri('provider-antigravity.png')};
     context.subscriptions.push(
-      resolved.webview.onDidReceiveMessage(message=>{if(message?.type==='ready'){lastContent='';render();}}),
+      resolved.webview.onDidReceiveMessage(message=>{
+        if(message?.type==='ready'){lastContent='';render();}
+        else if(message?.type==='connect')void connect();
+      }),
       resolved.onDidChangeVisibility(()=>{if(resolved.visible)void refresh();}),
       resolved.onDidDispose(()=>{if(view===resolved)view=undefined;})
     );

@@ -5,13 +5,14 @@ const fs=require('node:fs');
 const path=require('node:path');
 const vm=require('node:vm');
 
-function harness({discover,connect,disconnect,recover='Recover connection',confirm='Connect',pickPath='/example/profile'}={}) {
-  const commands=new Map(),connected=[],errors=[],warnings=[];
+function harness({discover,connect,disconnect,recover='Recover connection',confirm='Connect',pickPath='/example/profile',savedTrust=[]}={}) {
+  const commands=new Map(),connected=[],errors=[],warnings=[],confirmations=[],storage=new Map([['trustedDirectories',savedTrust]]);
+  let provider,receive;
   const disposable=()=>({dispose(){}});
-  const vscode={Uri:{file:value=>({fsPath:value})},workspace:{getConfiguration:()=>({get:()=>[]}),onDidChangeConfiguration:disposable},
-    window:{registerWebviewViewProvider:disposable,onDidChangeActiveTerminal:disposable,onDidCloseTerminal:disposable,
+  const vscode={Uri:{file:value=>({fsPath:value}),joinPath:(_base,...parts)=>({fsPath:parts.join('/')})},workspace:{getConfiguration:()=>({get:()=>[]}),onDidChangeConfiguration:disposable},
+    window:{registerWebviewViewProvider:(_id,value)=>{provider=value;return disposable();},onDidChangeActiveTerminal:disposable,onDidCloseTerminal:disposable,
       showQuickPick:async()=>({provider:'claude'}),showOpenDialog:async()=>pickPath?[{fsPath:pickPath}]:undefined,
-      showInformationMessage:async(_message,options)=>options?.modal?confirm:undefined,
+      showInformationMessage:async(message,options,...actions)=>{if(options?.modal){confirmations.push({message,options,actions});return confirm;}},
       showWarningMessage:async(message,action)=>{warnings.push(message);return action?.modal?recover:action;},
       showErrorMessage:async message=>{errors.push(message);}},
     commands:{registerCommand:(name,callback)=>{commands.set(name,callback);return disposable();},executeCommand:async()=>{}}};
@@ -25,8 +26,14 @@ function harness({discover,connect,disconnect,recover='Recover connection',confi
     require:name=>name==='vscode'?vscode:name==='./setup.cjs'?setup:name==='./core.cjs'?core:name==='./collect.cjs'?{}:
       name==='./panel.cjs'?{buildViewModel:()=>({}),renderContent:()=>'',renderDocument:()=>''}:require(name)};
   vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../src/extension.cjs'),'utf8'),sandbox);
-  sandbox.module.exports.activate({globalStorageUri:{fsPath:'/example/editor-storage'},extensionPath:'/example/extension',subscriptions:[]});
-  return {commands,connected,errors,warnings};
+  sandbox.module.exports.activate({globalStorageUri:{fsPath:'/example/editor-storage'},extensionPath:'/example/extension',subscriptions:[],
+    globalState:{get:(key,fallback)=>storage.get(key)??fallback,update:async(key,value)=>{storage.set(key,value);}}});
+  const openCard=()=>{
+    provider.resolveWebviewView({webview:{asWebviewUri:uri=>uri.fsPath,postMessage:async()=>{},
+      onDidReceiveMessage:callback=>{receive=callback;return disposable();}},onDidChangeVisibility:disposable,onDidDispose:disposable});
+    return async message=>{receive(message);await new Promise(setImmediate);};
+  };
+  return {commands,connected,errors,warnings,confirmations,storage,openCard};
 }
 const problem=code=>Object.assign(new Error('Choose the required local resource.'),{code,safeToDisplay:true});
 
@@ -69,4 +76,41 @@ test('missing editor ownership is recovered only after explicit confirmation for
     if(consent)assert.equal(h.connected[1].confirmTakeover,true);
     assert.equal(h.errors.length,0);
   }
+});
+
+test('shared-directory trust requires the explicit connection choice and is retained only after success',async()=>{
+  const sharedDirectories=[{path:'/example/home',uid:1000,gid:1000},{path:'/example/home/.claude',uid:1000,gid:1000}];
+  for(const confirm of ['Cancel','Connect','Trust and connect']) {
+    const h=harness({confirm,discover:async()=>({profilePath:'/example/home/.claude',sharedDirectories})});
+    await h.commands.get('llmAccountUsage.connect')();
+    assert.match(h.confirmations[0].options.detail,/\/example\/home/);
+    assert.match(h.confirmations[0].options.detail,/group 1000/);
+    assert.equal(h.confirmations[0].actions[0],'Trust and connect');
+    assert.equal(h.connected.length,confirm==='Trust and connect'?1:0);
+    assert.deepEqual(JSON.parse(JSON.stringify(h.storage.get('trustedDirectories'))),confirm==='Trust and connect'?sharedDirectories:[]);
+    if(h.connected.length)assert.deepEqual(JSON.parse(JSON.stringify(h.connected[0].trustedDirectories)),sharedDirectories);
+  }
+  const h=harness({confirm:'Trust and connect',discover:async()=>({profilePath:'/example/home/.claude',sharedDirectories}),
+    connect:async()=>{throw problem('SETTINGS_CHANGED');}});
+  await h.commands.get('llmAccountUsage.connect')();
+  assert.deepEqual(h.storage.get('trustedDirectories'),[]);
+});
+
+test('a previously approved exact directory is passed to later setup operations',async()=>{
+  const savedTrust=[{path:'/example/home',uid:1000,gid:1000}];
+  const h=harness({savedTrust});
+  await h.commands.get('llmAccountUsage.connect')();
+  assert.deepEqual(JSON.parse(JSON.stringify(h.connected[0].trustedDirectories)),savedTrust);
+});
+
+test('card connect action uses the provider confirmation and ignores unrelated webview messages',async()=>{
+  const h=harness(),send=h.openCard();
+  await send({type:'unexpected',command:'llmAccountUsage.connect'});
+  assert.equal(h.connected.length,0);
+  await send({type:'connect'});
+  assert.equal(h.connected.length,1);
+  assert.equal(h.confirmations.length,1);
+  const cancelled=harness({confirm:'Cancel'});
+  await cancelled.openCard()({type:'connect'});
+  assert.equal(cancelled.connected.length,0);
 });

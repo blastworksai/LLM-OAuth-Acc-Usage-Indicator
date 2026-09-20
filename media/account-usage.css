@@ -72,6 +72,11 @@ body {
 .account-facts { margin: 0; border-top: 1px solid var(--card-border); padding-top: 16px; display: grid; grid-template-columns: max-content minmax(0,1fr); gap: 6px 14px; align-items: baseline; }
 .account-facts dt { font-size: 11px; letter-spacing: .06em; white-space: nowrap; }
 .account-facts dd { margin: 0; min-width: 0; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card-actions { border-top: 1px solid var(--card-border); padding-top: 16px; }
+.connect-provider { display: inline-flex; align-items: center; justify-content: center; min-height: 32px; max-width: 100%; padding: 6px 12px; border: 1px solid var(--muted); border-radius: 6px; background: var(--track); color: var(--card-text); font: inherit; font-weight: 600; cursor: pointer; }
+.connect-provider:hover { border-color: var(--amber); }
+.connect-provider:focus-visible { outline: 2px solid var(--vscode-focusBorder, var(--amber)); outline-offset: 3px; }
+.empty-card .card-actions { border-top: 0; padding-top: 0; }
 .card-caption { margin: 12px 4px 16px; font-size: 11px; line-height: 1.5; color: var(--vscode-descriptionForeground, var(--muted)); }
 .card-caption p { margin: 0; }
 .stale-notice { color: var(--warning); margin-bottom: 4px !important; }

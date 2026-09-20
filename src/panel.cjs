@@ -72,7 +72,8 @@ function windowHtml(w) {
 }
 function renderContent(vm,assets={}) {
   const follow=`<div class="terminal-context"><span class="eyebrow">Following terminal</span><span class="terminal-name" title="${escape(vm.terminal)}">${escape(vm.terminal)}</span></div>`;
-  if(vm.status!=='ready')return `${follow}<article class="account-card empty-card" aria-label="Account Usage"><span class="eyebrow">Account Usage</span><h2>${escape(vm.title)}</h2><p>${escape(vm.message)}</p>${vm.reason?`<details class="report-details"><summary>Details</summary><p>${escape(vm.reason)}</p></details>`:''}</article><p class="coverage-note">Claude, Codex and Antigravity · other tools not yet supported</p>`;
+  const connect='<div class="card-actions"><button class="connect-provider" type="button" data-action="connect">Connect Provider</button></div>';
+  if(vm.status!=='ready')return `${follow}<article class="account-card empty-card" aria-label="Account Usage"><span class="eyebrow">Account Usage</span><h2>${escape(vm.title)}</h2><p>${escape(vm.message)}</p>${connect}${vm.reason?`<details class="report-details"><summary>Details</summary><p>${escape(vm.reason)}</p></details>`:''}</article><p class="coverage-note">Claude, Codex and Antigravity · other tools not yet supported</p>`;
   const logo=assets[vm.providerKey];
   const mark=logo?`<span class="provider-mark"><img src="${escape(logo)}" alt="" aria-hidden="true"></span>`:'';
   const pools=[...new Set(vm.windows.map(w=>w.pool))];
@@ -83,6 +84,7 @@ function renderContent(vm,assets={}) {
     ${vm.headline?`<p class="usage-headline" title="${escape(vm.headline)}">${escape(vm.compactHeadline)}</p>`:''}
     <div class="usage-windows">${usage}</div>
     <dl class="account-facts">${fact('Subscription type',vm.plan||'Not reported')}${timeFact(vm.reportLabel,vm.reported)}</dl>
+    ${connect}
   </article>
   <div class="card-caption">${vm.stale?'<p class="stale-notice">Last reported values · awaiting an update</p>':''}<p id="timezone-label">All times local to this computer</p><p>Only reported account limits shown</p>${vm.missingPools.map(note=>`<p class="stale-notice">${escape(note)}</p>`).join('')}</div>
   <details id="report-details" class="report-details"><summary>Report details</summary><p>The terminal selects the source of this account quota reading. Usage may include other sessions; readings must not be added together. ${vm.accountIdentified?'The email comes from the current CLI login when this usage update was observed.':'Account identity is unavailable for this usage update.'}</p><dl>${fact('Session',vm.session)}${fact('Local user',vm.uid)}${timeFact('Captured',vm.captured)}${vm.accountIdentified?timeFact('Account checked',vm.accountObserved):''}${timeFact('Provider time',vm.providerObserved)}${fact('Reported pools',pools.join(', ')||'None')}</dl><p>${vm.plan?escape(planSource):'Subscription type has not been reported.'} Subscription end dates, login expiry and quota resets are separate facts.</p>${vm.nativeAgyUsage?'<p>Quota windows come from AGY’s built-in /usage command.</p>':''}<p>${escape(vm.coverage)}</p></details>`;

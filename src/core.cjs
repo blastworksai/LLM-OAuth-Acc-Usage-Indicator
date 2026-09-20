@@ -121,10 +121,10 @@ async function readFeeds(directories) {
     let directory;
     try {
       const info=await fs.lstat(dir);
-      if(!info.isDirectory() || ((info.mode & 0o7777) & ~0o750) || await fs.realpath(dir)!==dir) {rejected++;continue;}
+      if(!info.isDirectory() || ((info.mode & 0o7777) & ~0o2750) || await fs.realpath(dir)!==dir) {rejected++;continue;}
       directory=await fs.open(dir,constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
       const pinned=await directory.stat();
-      if(pinned.ino!==info.ino || pinned.dev!==info.dev || pinned.uid!==info.uid || ((pinned.mode & 0o7777) & ~0o750) || await fs.realpath(dir)!==dir){rejected++;continue;}
+      if(pinned.ino!==info.ino || pinned.dev!==info.dev || pinned.uid!==info.uid || ((pinned.mode & 0o7777) & ~0o2750) || await fs.realpath(dir)!==dir){rejected++;continue;}
       // A Linux descriptor anchor pins the checked directory even if its path
       // is replaced. O_NOFOLLOW below then protects the final report component.
       const anchor=`/proc/self/fd/${directory.fd}`;

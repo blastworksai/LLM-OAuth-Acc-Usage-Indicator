@@ -14,7 +14,7 @@ Account emails are hidden in these screenshots.
 
 1. Install [Account Usage from the VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=BlastworksAI.llm-oauth-acc-usage-indicator). For Remote-SSH, install it on the Linux SSH host.
 2. Run **Account Usage: Open Card** and select your AI terminal.
-3. Codex is detected automatically. For Claude Code or Antigravity, run **Account Usage: Connect Provider** once for the profile you use.
+3. Codex is detected automatically. For Claude Code or Antigravity, click **Connect Provider** on the card once for the profile you use.
 
 For manual installation, download the `.vsix` from [GitHub Releases](https://github.com/blastworksai/LLM-OAuth-Acc-Usage-Indicator/releases), then run **Extensions: Install from VSIX…** in VS Code.
 
@@ -45,7 +45,7 @@ Refreshing the card sends no model prompt. Codex reads the selected process's lo
 
 ## Setup and removal
 
-**Connect Provider** shows the selected profile before it changes its statusline setting. An existing statusline is preserved. Runtime files and sanitized reports stay in owner-controlled local storage, separate from editor installation files. Run **Account Usage: Disconnect Provider** to restore the connection before uninstalling; removing an extension cannot guarantee that provider settings are restored automatically.
+**Connect Provider** on the card shows the selected profile before it changes its statusline setting. An existing statusline is preserved. If your directories are deliberately shared with a Linux group, setup lists them and offers **Trust and connect**; approve only when you trust everyone who can write there. It does not change their permissions. Runtime files and sanitized reports stay in owner-controlled local storage, separate from editor installation files. Run **Account Usage: Disconnect Provider** to restore the connection before uninstalling; removing an extension cannot guarantee that provider settings are restored automatically.
 
 See [setup and troubleshooting](docs/SETUP.md) and [privacy](docs/PRIVACY.md). When reporting an issue, remove emails, account identifiers, terminal names, paths and session IDs from screenshots and diagnostics.
 

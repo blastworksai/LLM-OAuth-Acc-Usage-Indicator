@@ -141,18 +141,19 @@ function createSetup(dependencies = {}) {
     const loc={root:path.join(directory,'.connection-control'),connectionId};
     await safeDirectories(loc.root,o,{create:true,privateLeaf:true});
     if((await stat(loc.root)).uid!==o.uid)throw failure('UNSAFE_REPORT_DIRECTORY','The feed claim must be owned by this user.');
-    return locked(o,loc,async()=>{
+    return locked(o,loc,async(_loc,controlHandle)=>{
       const file=path.join(loc.root,'claim.json'),bytes=await readSafe(file,o,{privateFile:true,limit:512});
       if(bytes!==null) {
         const saved=parse(bytes);
         if(Object.keys(saved).length!==1||saved.connectionId!==connectionId)
           throw failure('FEED_ALREADY_CLAIMED','This report feed is reserved for a different profile. Choose a separate feed directory.');
       }
-      await require('./connection-feed.cjs').checkConnectionFeed(directory,connectionId,{fs:io});
+      const feed=require('./connection-feed.cjs');
+      if(bytes===null)await feed.checkConnectionFeed(directory,connectionId,{fs:io});
       // Keep the exact ID even after an interrupted hook/descriptor write.
       // Only that connection can recover; another profile cannot inherit it.
       if(bytes===null)await put(file,json({connectionId}),o,0o600);
-      return operation();
+      return feed.withClaimedFeedPublication(directory,connectionId,{fs:io,uid:o.uid,controlHandle},operation);
     });
   }
   async function readSafe(file, o, {privateFile = false, limit = MAX_SETTINGS} = {}) {
@@ -486,7 +487,7 @@ function createSetup(dependencies = {}) {
         await reclaimDeadLock(anchor, loc, o, self);
       }
       if(!acquired) throw failure('SETUP_BUSY', 'Another setup is in progress. Retry after it finishes.');
-      return await action(loc);
+      return await action(loc,root);
     } finally {
       try {
         if(acquired) {

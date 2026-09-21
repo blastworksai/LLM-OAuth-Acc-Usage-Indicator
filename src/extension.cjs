@@ -96,7 +96,7 @@ function activate(context) {
     };
     const handoff=await prepareHandoff({extensionPath:context.extensionPath,provider:target.provider,target,action,
       connectionId:connection?.id,runtimeVersion,revalidate,
-      ...(action==='connect'&&connection?{profilePath:connection.profilePath,reportDir:connection.reportDir}:{})});
+      ...(connection?{reportDir:connection.reportDir,...(action==='connect'?{profilePath:connection.profilePath}:{})}:{})});
     try {
       const choice=await vscode.window.showInformationMessage(`${action==='connect'?'Connect':'Disconnect'} ${providerName(target.provider)} as UID ${target.process.uid}?`,
         {modal:true,detail:`Run this command in a separate shell already owned by UID ${target.process.uid}. That shell needs node on PATH. Keep the provider session running. Review the profile and type yes when prompted.\n\n${handoff.command}`},'Copy setup command');
@@ -119,17 +119,18 @@ function activate(context) {
       const value=result.connection;
       if(!validatePublicConnection(value)||value.provider!==target.provider||value.uid!==target.process.uid||
         value.connected!==(action==='connect')||(connection&&value.id!==connection.id)||
+        (action==='disconnect'&&value.reportDir!==connection?.reportDir)||
         (action==='connect'&&value.runtimeVersion!==runtimeVersion)||!await revalidate())throw safeError('UNVERIFIED_SETUP_RESULT','The target-user setup result could not be verified.');
       const managed=new Set(managedDirectories());
       if(action==='connect') {
         const probe=await readFeeds([value.reportDir]);
         if(probe.rejected)throw safeError('SHARED_FEED_UNREADABLE','The target-user report feed is not safely readable by this VS Code host. Configure a shared Linux group directory and connect again.');
-        const descriptors=await readConnectionFeeds([value.reportDir]);
-        if(descriptors.rejected || descriptors.connections.length!==1 ||
-          !Object.keys(value).every(key=>descriptors.connections[0][key]===value[key]))
-          throw safeError('CONNECTION_FEED_UNREADABLE','The target-user connection descriptor could not be verified.');
-        managed.add(value.reportDir);
-      } else managed.delete(connection.reportDir);
+      }
+      const descriptors=await readConnectionFeeds([value.reportDir]);
+      if(descriptors.rejected || descriptors.connections.length!==1 || !validatePublicConnection(descriptors.connections[0]) ||
+        !Object.keys(value).every(key=>descriptors.connections[0][key]===value[key]))
+        throw safeError('CONNECTION_FEED_UNREADABLE','The target-user connection descriptor could not be verified.');
+      if(action==='connect')managed.add(value.reportDir);else managed.delete(value.reportDir);
       if(cancellation.isCancellationRequested || !await revalidate())return false;
       await context.globalState.update('managedFeedDirectories',[...managed]);
       if(action==='connect')pendingCrossUser.set(value.id,{...target.process});else pendingCrossUser.delete(value.id);

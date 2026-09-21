@@ -234,13 +234,42 @@ test('an older managed runtime retains its last report and offers an explicit re
   assert.match(h.api.getHtml(),/Reconnect/);assert.equal(h.api.getViewModel().stale,true);
 });
 test('cross-user disconnect runs a target-user handoff and removes only that managed path',async()=>{
-  const connection=foreignConnection();
-  const h=harness({terminal:terminal(),detect:async()=>target('claude',30,2000),managed:[connection.reportDir,'/another'],descriptors:[connection],
-    confirm:'Copy setup command',pickConnection:connection.id,handoff:async()=>({ok:true,connection:{...connection,connected:false}})});
+  const connection=foreignConnection(),descriptors=[connection];
+  const h=harness({terminal:terminal(),detect:async()=>target('claude',30,2000),managed:[connection.reportDir,'/another'],descriptors,
+    confirm:'Copy setup command',pickConnection:connection.id,handoff:async()=>{
+      descriptors[0]={...connection,connected:false};return {ok:true,connection:descriptors[0]};
+    }});
   await h.commands.get('llmAccountUsage.disconnect')();
   assert.equal(h.connected.length,0);assert.equal(h.handoffCalls[0].action,'disconnect');
   assert.equal(h.handoffCalls[0].connectionId,connection.id);
+  assert.equal(h.handoffCalls[0].reportDir,connection.reportDir);
   assert.deepEqual([...h.storage.get('managedFeedDirectories')],['/another']);assert.equal(h.disposedHandoffs,1);
+});
+test('disconnect leaves saved paths intact when an explicit feed change makes the picker stale',async()=>{
+  const connection=foreignConnection(),newFeed=connection.reportDir+'-changed',descriptors=[connection];
+  const h=harness({terminal:terminal(),detect:async()=>target('claude',30,2000),managed:[connection.reportDir,newFeed],descriptors,
+    confirm:'Copy setup command',pickConnection:connection.id,handoff:async()=>{
+      const value={...connection,connected:false,reportDir:newFeed};descriptors.push(value);return {ok:true,connection:value};
+    }});
+  await h.commands.get('llmAccountUsage.disconnect')();
+  assert.deepEqual([...h.storage.get('managedFeedDirectories')],[connection.reportDir,newFeed]);
+  assert.equal(h.errors.length,1);assert.equal(h.handoffCalls[0].reportDir,connection.reportDir);
+});
+test('disconnect requires the current exact disconnected descriptor before deleting its saved path',async()=>{
+  for(const mutation of ['connected','missing','wrong-id','wrong-version','extra','unsafe']) {
+    const connection=foreignConnection(),descriptors=[connection];
+    const h=harness({terminal:terminal(),detect:async()=>target('claude',30,2000),managed:[connection.reportDir],descriptors,
+      descriptorRejected:mutation==='unsafe'?1:0,confirm:'Copy setup command',pickConnection:connection.id,handoff:async()=>{
+        const value={...connection,connected:false};
+        if(mutation==='missing')descriptors.length=0;
+        else if(mutation!=='connected')descriptors[0]={...value,...(mutation==='wrong-id'?{id:'v2-'+'b'.repeat(32)}:
+          mutation==='wrong-version'?{runtimeVersion:'0.0.1'}:mutation==='extra'?{account:'unexpected'}:{})};
+        return {ok:true,connection:value};
+      }});
+    await h.commands.get('llmAccountUsage.disconnect')();
+    assert.deepEqual([...h.storage.get('managedFeedDirectories')],[connection.reportDir],mutation);
+    assert.equal(h.errors.length,1,mutation);
+  }
 });
 test('a disconnected descriptor remains actionable until verified editor removal completes',async()=>{
   const connection={...foreignConnection(),connected:false};

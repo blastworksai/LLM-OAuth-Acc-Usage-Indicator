@@ -72,6 +72,15 @@ test('disconnect accepts only the named disconnected profile and verifies the se
   await publish(f.handoff,{ok:true,connection:{...f.connection,connected:false}});
   assert.equal((await f.handoff.readResult()).connection.connected,false);
 });
+test('disconnect handoff binds the returned feed to the picker-selected directory',async t=>{
+  const base=connectionIdentity({provider:'claude',uid:process.getuid(),settingsPath:'/home/target/.claude/settings.json'});
+  for(const reportDir of ['/home/target/feed','/home/target/changed-feed']) {
+    const f=await fixture(t,{action:'disconnect',connectionId:base.id,reportDir:'/home/target/feed'});
+    await publish(f.handoff,{ok:true,connection:{...f.connection,connected:false,reportDir}});
+    if(reportDir==='/home/target/feed')assert.equal((await f.handoff.readResult()).connection.reportDir,reportDir);
+    else await assert.rejects(f.handoff.readResult(),/setup result could not be verified/i);
+  }
+});
 test('a result is rejected when process revalidation fails with ENOENT',async t=>{
   const f=await fixture(t,{revalidate:async()=>{throw Object.assign(new Error('process gone'),{code:'ENOENT'});}});
   await publish(f.handoff,{ok:true,connection:f.connection});

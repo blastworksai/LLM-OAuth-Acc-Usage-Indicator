@@ -93,6 +93,74 @@ test('feed claim recovery removes only a proven dead process marker and rejects 
   const claim=path.join(control,'claim.json');await fs.chmod(claim,0o660);
   await assert.rejects(f.setup.withReportFeedClaim(feed,id,f.options,async()=>assert.fail('unsafe claim entered')));
 });
+test('exact-ID claim recovers descriptor publication interrupted between link and unlink',async t=>{
+  const {readConnectionFeeds,writeConnectionFeed}=require('../src/connection-feed.cjs');
+  for(const connected of [true,false]) {
+    const f=await fixture(t),feed=path.join(f.homeDir,'claimed');await fs.mkdir(feed,{mode:0o700});
+    const installed=await f.setup.connectProvider({...f.options,reportDir:feed});
+    const connection={};
+    for(const key of ['id','provider','uid','profilePath','settingsPath','connected','cliLookupPath','reportDir','launcherPath','backupPath'])connection[key]=installed[key];
+    connection.runtimeVersion='0.4.0';
+    let linked=false;
+    const io=new Proxy(fs,{get(target,key){
+      if(key==='link')return async(...args)=>{await fs.link(...args);if(String(args[1]).endsWith('/.connection.json'))linked=true;};
+      if(key==='unlink')return async file=>{if(linked && /\/(?:\.connection-[^/]+\.tmp|\.connection-publication\.json)$/.test(String(file)))throw new Error('interrupted after link');return fs.unlink(file);};
+      return target[key];
+    }});
+    await assert.rejects(createSetup({fs:io}).withReportFeedClaim(feed,connection.id,f.options,
+      publication=>writeConnectionFeed(feed,connection,{fs:io,publication})),/interrupted after link/);
+    assert.equal((await fs.stat(path.join(feed,'.connection.json'))).nlink,2);
+    assert.equal((await readConnectionFeeds([feed])).rejected,1,'ordinary readers must not accept a two-link descriptor');
+    await assert.rejects(f.setup.withReportFeedClaim(feed,'v2-'+'b'.repeat(32),f.options,()=>assert.fail('other profile entered')),{code:'FEED_ALREADY_CLAIMED'});
+    await f.setup.withReportFeedClaim(feed,connection.id,f.options,async publication=>{
+      assert.deepEqual((await readConnectionFeeds([feed])).connections,[connection]);
+      await writeConnectionFeed(feed,{...connection,connected},{publication});
+    });
+    assert.equal((await fs.stat(path.join(feed,'.connection.json'))).nlink,1);
+    assert.deepEqual((await readConnectionFeeds([feed])).connections,[{...connection,connected}]);
+  }
+});
+test('claim recovery never repairs arbitrary hardlinks or unsafe private publication slots',async t=>{
+  const {writeConnectionFeed}=require('../src/connection-feed.cjs');
+  for(const mutation of ['outside-link','third-link','wrong-id','extra','oversized','mode','symlink','fifo','wrong-inode','wrong-owner','unlocked-directory']) {
+    const f=await fixture(t),feed=path.join(f.homeDir,'claimed');await fs.mkdir(feed,{mode:0o700});
+    const installed=await f.setup.connectProvider({...f.options,reportDir:feed}),connection={};
+    for(const key of ['id','provider','uid','profilePath','settingsPath','connected','cliLookupPath','reportDir','launcherPath','backupPath'])connection[key]=installed[key];
+    connection.runtimeVersion='0.4.0';
+    await f.setup.withReportFeedClaim(feed,connection.id,f.options,publication=>writeConnectionFeed(feed,connection,{publication}));
+    const control=path.join(feed,'.connection-control'),slot=path.join(control,'.connection-publication.json'),descriptor=path.join(feed,'.connection.json'),outside=path.join(f.homeDir,'keep');
+    if(mutation==='outside-link')await fs.link(descriptor,outside);
+    else if(mutation==='third-link'){await fs.link(descriptor,slot);await fs.link(descriptor,outside);}
+    else if(mutation==='symlink')await fs.symlink(descriptor,slot);
+    else if(mutation==='fifo')execFileSync('/usr/bin/mkfifo',[slot]);
+    else if(mutation!=='unlocked-directory') {
+      const value={...connection,...(mutation==='wrong-id'?{id:'v2-'+'b'.repeat(32)}:mutation==='extra'?{account:'private'}:{})};
+      await fs.writeFile(slot,mutation==='oversized'?'x'.repeat(32769):JSON.stringify(value),{mode:0o640});await fs.chmod(slot,mutation==='mode'?0o660:0o640);
+      if(mutation==='wrong-inode')await fs.link(slot,outside);
+    }
+    const before=await fs.lstat(descriptor),slotBefore=await fs.lstat(slot).catch(()=>null);
+    const io=new Proxy(fs,{get(target,key){
+      if(key==='open'&&mutation==='wrong-owner')return async(...args)=>{
+        const handle=await fs.open(...args);if(String(args[0]).endsWith('/.connection-publication.json')) {
+          const stat=handle.stat.bind(handle);handle.stat=async()=>{const st=await stat();st.uid++;return st;};
+        }return handle;
+      };
+      if(key==='lstat'&&mutation==='unlocked-directory')return async file=>{
+      const st=await fs.lstat(file);if(String(file).startsWith('/proc/self/fd/')&&String(file).endsWith('/.connection-control'))st.ino++;return st;
+    };return target[key];}});
+    let entered=false;
+    await assert.rejects(createSetup({fs:io}).withReportFeedClaim(feed,connection.id,f.options,()=>{entered=true;}),mutation);
+    assert.equal(entered,false,mutation);
+    const after=await fs.lstat(descriptor);assert.equal(after.ino,before.ino,mutation);assert.equal(after.nlink,before.nlink,mutation);
+    if(slotBefore)assert.equal((await fs.lstat(slot)).ino,slotBefore.ino,mutation);
+  }
+});
+test('a feed publication capability expires when its claim lock is released',async t=>{
+  const f=await fixture(t),feed=path.join(f.homeDir,'claimed');await fs.mkdir(feed,{mode:0o700});
+  let publication;
+  await f.setup.withReportFeedClaim(feed,'v2-'+'a'.repeat(32),f.options,value=>{publication=value;});
+  await assert.rejects(publication({}),/invalid-publication-capability/);
+});
 
 async function createProfile(f,name) {
   const profilePath=path.join(f.homeDir,name);

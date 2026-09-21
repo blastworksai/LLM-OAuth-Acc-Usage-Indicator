@@ -177,3 +177,32 @@ test('disconnect retries acknowledge an already restored profile after descripto
     assert.equal(recovered.connection.id,connection.id);assert.equal(recovered.connection.connected,false);
   }
 });
+test('CLI retries initial descriptor link interruption under the same claim for connect and disconnect',async t=>{
+  for(const action of ['connect','disconnect']) {
+    const f=await realCli(t);let linked=false;
+    const io=new Proxy(f.fs,{get(target,key){
+      if(key==='link')return async(...args)=>{await f.fs.link(...args);if(String(args[1]).endsWith('/.connection.json'))linked=true;};
+      if(key==='unlink')return async file=>{if(linked&&String(file).endsWith('/.connection-publication.json'))throw new Error('stopped after link');return f.fs.unlink(file);};
+      return target[key];
+    }});
+    const setup=require('../src/setup.cjs').createSetup({fs:io,systemUid:f.systemUid});let connection,issue;
+    f.dependencies.setup=Object.fromEntries(Object.entries(setup).map(([name,method])=>[name,async(...args)=>{
+      try {const result=await method(...args);if(name==='connectProvider')connection=result;return result;}catch(error){issue=error;throw error;}
+    }]));
+    assert.equal((await run(f.args('interrupted.json'),f.dependencies)).code,1);
+    assert.ok(connection,issue?.stack);const descriptor=f.path.join(connection.reportDir,'.connection.json');
+    assert.equal((await f.fs.stat(descriptor)).nlink,2);
+    f.dependencies.setup=require('../src/setup.cjs').createSetup({systemUid:f.systemUid});
+    const args=action==='connect'?f.args('retry.json'):['disconnect','--connection-id',connection.id,'--result',f.path.join(f.home,'retry.json')];
+    const installed=await f.fs.readFile(f.settings),cancelled=args.map(value=>value===f.path.join(f.home,'retry.json')?f.path.join(f.home,'cancelled.json'):value);
+    f.dependencies.readConsent=async()=>'no';assert.equal((await run(cancelled,f.dependencies)).code,1);
+    assert.equal((await f.fs.stat(descriptor)).nlink,2,'preview/cancellation must not repair before full yes');
+    assert.deepEqual(await f.fs.readFile(f.settings),installed);
+    f.dependencies.readConsent=async()=>'yes';
+    assert.equal((await run(args,f.dependencies)).code,0,action);
+    const result=JSON.parse(await f.fs.readFile(f.path.join(f.home,'retry.json'),'utf8'));
+    assert.equal(result.connection.id,connection.id);assert.equal(result.connection.connected,action==='connect');
+    assert.equal((await f.fs.stat(descriptor)).nlink,1);
+    if(action==='disconnect')assert.deepEqual(JSON.parse(await f.fs.readFile(f.settings,'utf8')),{});
+  }
+});

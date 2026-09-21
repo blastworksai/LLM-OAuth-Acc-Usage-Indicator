@@ -88,13 +88,13 @@ async function run(argv,dependencies={}) {
     if(args.action==='disconnect')options.reportDir=preview.reportDir;
     await (dependencies.ensureReportDirectory||setup.ensureReportDirectory)(options.reportDir,{...options,
       create:args.action==='connect'&&(preview.createReportDirectory??!args['report-dir'])});
-    const connection=await (dependencies.withReportFeedClaim||setup.withReportFeedClaim)(options.reportDir,preview.id,options,async()=>{
+    const connection=await (dependencies.withReportFeedClaim||setup.withReportFeedClaim)(options.reportDir,preview.id,options,async publication=>{
       await (dependencies.checkConnectionFeed||require('./connection-feed.cjs').checkConnectionFeed)(options.reportDir,preview.id);
       const result=args.action==='connect'?await setup.connectProvider(options):await setup.disconnectProvider(options);
       const value={};
       for(const key of ['id','provider','uid','profilePath','settingsPath','connected','cliLookupPath','reportDir','launcherPath','backupPath'])value[key]=result[key];
       value.runtimeVersion=args['runtime-version']||preview.runtimeVersion||'0.0.0';
-      await (dependencies.writeConnectionFeed||require('./connection-feed.cjs').writeConnectionFeed)(value.reportDir,value);
+      await (dependencies.writeConnectionFeed||require('./connection-feed.cjs').writeConnectionFeed)(value.reportDir,value,{publication});
       return value;
     });
     await publish(args.result,{ok:true,connection});return {code:0};

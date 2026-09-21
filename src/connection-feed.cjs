@@ -46,8 +46,76 @@ async function checkConnectionFeed(directory,id,{fs:io=fs}={}) {
     return true;
   } finally {await opened.handle.close();}
 }
-async function writeConnectionFeed(directory,connection,{fs:io=fs,uid=()=>process.getuid()}={}) {
+// Called only while setup holds the exact-ID claim lock. The capability expires
+// before that lock is released. The private slot is never a public-temp scan.
+async function withClaimedFeedPublication(directory,id,{fs:io=fs,uid,controlHandle},operation) {
+  const opened=await openDirectory(directory,io);
+  let active=true;
+  const same=(a,b)=>a&&b&&a.ino===b.ino&&a.dev===b.dev;
+  const missing=error=>{if(error.code!=='ENOENT')throw error;return null;};
+  try {
+    const control={anchor:`/proc/self/fd/${controlHandle.fd}`},held=await controlHandle.stat(),current=await io.lstat(`${opened.anchor}/.connection-control`);
+    if(!same(held,current)||!held.isDirectory()||!current.isDirectory()||opened.uid!==uid||held.uid!==uid||current.uid!==uid||
+      ![0o700,0o2700].includes(held.mode&0o7777)||![0o700,0o2700].includes(current.mode&0o7777))throw new Error('unsafe-publication-control');
+    const slot=`${control.anchor}/.connection-publication.json`,destination=`${opened.anchor}/.connection.json`;
+    async function read(file,{claim=false,links=[1]}={}) {
+      const handle=await io.open(file,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK).catch(missing);
+      if(!handle)return null;
+      try {
+        const st=await handle.stat(),limit=claim?512:MAX_BYTES;
+        if(!st.isFile()||st.uid!==uid||!links.includes(st.nlink)||(st.mode&0o7777)!==(claim?0o600:0o640)||st.size>limit)
+          throw new Error('unsafe-publication-file');
+        const bytes=Buffer.alloc(limit+1),{bytesRead}=await handle.read(bytes,0,bytes.length,0);
+        if(bytesRead>limit)throw new Error('large-publication-file');
+        const value=JSON.parse(bytes.toString('utf8',0,bytesRead));
+        if(claim?(!value||Object.keys(value).length!==1||value.connectionId!==id):
+          (!validatePublicConnection(value)||value.id!==id||value.uid!==uid||value.reportDir!==directory))throw new Error('wrong-publication-identity');
+        const current=await io.lstat(file);
+        if(!same(st,current)||current.nlink!==st.nlink)throw new Error('changed-publication-file');
+        return {st,value};
+      } finally {await handle.close();}
+    }
+    async function recover() {
+      const prepared=await read(slot,{links:[1,2]});
+      if(!prepared)return;
+      const published=await read(destination,{links:[1,2]});
+      if(same(prepared.st,published?.st)) {
+        // Exactly two links, both pinned and proven to name the private staged
+        // descriptor. Any third/arbitrary link fails closed, without deletion.
+        if(prepared.st.nlink!==2||published.st.nlink!==2)throw new Error('unexpected-publication-links');
+      } else if(prepared.st.nlink!==1 || (published&&published.st.nlink!==1))throw new Error('unexpected-publication-links');
+      const current=await io.lstat(slot);
+      if(!same(current,prepared.st)||current.nlink!==prepared.st.nlink)throw new Error('changed-publication-slot');
+      await io.unlink(slot);
+      if(published)await read(destination);
+    }
+    if(!await read(`${control.anchor}/claim.json`,{claim:true}))throw new Error('missing-publication-claim');
+    await recover();
+    await checkConnectionFeed(directory,id,{fs:io});
+    return await operation(async connection=>{
+      if(!active||!validatePublicConnection(connection)||connection.id!==id||connection.uid!==uid||connection.reportDir!==directory)
+        throw new Error('invalid-publication-capability');
+      await recover();
+      await checkConnectionFeed(directory,id,{fs:io});
+      const bytes=Buffer.from(JSON.stringify(connection)+'\n');
+      if(bytes.length>MAX_BYTES)throw new Error('large-descriptor');
+      const handle=await io.open(slot,constants.O_WRONLY|constants.O_CREAT|constants.O_EXCL|constants.O_NOFOLLOW,0o640);
+      try {await handle.chmod(0o640);await handle.writeFile(bytes);await handle.sync();}finally {await handle.close();}
+      try {await io.link(slot,destination);}
+      catch(error) {
+        if(error.code!=='EEXIST')throw error;
+        await checkConnectionFeed(directory,id,{fs:io});
+        await io.rename(slot,destination);
+      }
+      // Leave this exact private recovery slot intact if publication is
+      // interrupted. The next same-ID claim verifies it before any hook edit.
+      await recover();
+    });
+  } finally {active=false;await opened.handle.close();}
+}
+async function writeConnectionFeed(directory,connection,{fs:io=fs,uid=()=>process.getuid(),publication}={}) {
   if(!validatePublicConnection(connection)||connection.reportDir!==directory)throw new Error('invalid-descriptor');
+  if(publication)return publication(connection);
   const bytes=Buffer.from(JSON.stringify(connection)+'\n');
   if(bytes.length>MAX_BYTES)throw new Error('large-descriptor');
   const opened=await openDirectory(directory,io);
@@ -72,4 +140,4 @@ async function writeConnectionFeed(directory,connection,{fs:io=fs,uid=()=>proces
     await opened.handle.close();
   }
 }
-module.exports={readConnectionFeeds,writeConnectionFeed,checkConnectionFeed};
+module.exports={readConnectionFeeds,writeConnectionFeed,checkConnectionFeed,withClaimedFeedPublication};

@@ -30,6 +30,157 @@ async function createProfile(f,name) {
   return profilePath;
 }
 
+async function seedLegacyConnection(f,{settingsPath=f.settingsPath}={}) {
+  const provider=f.options.provider;
+  const root=path.join(f.homeDir,'.local/state/llm-account-usage/providers',provider);
+  const launcherPath=path.join(root,'run.sh'),reportDir=path.join(root,'reports');
+  await fs.mkdir(reportDir,{recursive:true,mode:0o700});
+  await fs.mkdir(f.options.storagePath,{recursive:true,mode:0o700});
+  const original={theme:'legacy'};
+  const command=`'${launcherPath}' # llm-account-usage-managed-v1`;
+  const data={version:1,status:'connected',provider,uid:process.getuid(),settingsPath,
+    cliPath:await fs.realpath(f.options.cliPath),cliLookupPath:f.options.cliPath,
+    ownerStoragePath:f.options.storagePath,settingsExisted:true};
+  let installed;
+  if(provider==='codex') {
+    Object.assign(data,{kind:'codex-hook',hadHooks:false,hadStop:false,backupName:'hooks.before-legacy.json',
+      installedHook:{matcher:'.*',hooks:[{type:'command',statusMessage:'Account Usage',command}]}});
+    installed={...original,hooks:{Stop:[data.installedHook]}};
+  } else {
+    Object.assign(data,{hadStatusLine:false,originalStatusLine:null,backupName:'settings.before-legacy.json',
+      installedStatusLine:{type:'command',command}});
+    installed={...original,statusLine:data.installedStatusLine};
+  }
+  const receiptPath=path.join(root,'connection.json'),backupPath=path.join(root,data.backupName);
+  await writeJson(receiptPath,data);
+  await writeJson(backupPath,original);
+  await fs.writeFile(launcherPath,'#!/bin/sh\nexit 0\n',{mode:0o700});
+  await fs.copyFile(f.collectorPath,path.join(root,'passive.cjs'));
+  await writeJson(settingsPath,installed);
+  return {root,receiptPath,launcherPath,reportDir,backupPath,original};
+}
+
+test('a valid version-1 connection gains a stable ID without moving its installed launcher',async t=>{
+  for(const provider of ['claude','codex','antigravity']) {
+    const f=await fixture(t,provider);
+    const legacy=await seedLegacyConnection(f);
+    const before=await fs.readFile(f.settingsPath),saved=await fs.readFile(legacy.receiptPath);
+    const [listed]=await f.setup.listConnections(f.options);
+    assert.ok(listed,'the legacy connection must be discoverable');
+    assert.match(listed.id,/^v2-[a-f0-9]{32}$/);
+    assert.equal(listed.legacy,true);
+    assert.equal(listed.profilePath,f.profilePath);
+    assert.equal(listed.launcherPath,legacy.launcherPath);
+    assert.equal(listed.reportDir,legacy.reportDir);
+    assert.equal(listed.backupPath,legacy.backupPath);
+    assert.equal(before.includes(legacy.launcherPath),true);
+    assert.deepEqual(await fs.readFile(legacy.receiptPath),saved,'listing must not rewrite the receipt');
+
+    const reconnected=await f.setup.connectProvider(f.options);
+    assert.equal(reconnected.id,listed.id);
+    assert.equal(reconnected.legacy,true);
+    assert.equal(reconnected.launcherPath,legacy.launcherPath);
+    assert.deepEqual(await fs.readFile(f.settingsPath),before);
+    assert.equal((await readJson(legacy.receiptPath)).version,1);
+    assert.deepEqual((await f.setup.refreshRuntime(f.options)).refreshed,[listed.id]);
+    await f.setup.disconnectProvider({...f.options,connectionId:listed.id});
+    assert.deepEqual(await readJson(f.settingsPath),legacy.original);
+    assert.equal((await f.setup.connectProvider(f.options)).id,listed.id);
+    assert.equal((await f.setup.listConnections(f.options))[0].id,listed.id);
+  }
+});
+
+test('a legacy connection permits distinct version-2 profiles and exact default disconnect',async t=>{
+  const f=await fixture(t);
+  const legacy=await seedLegacyConnection(f);
+  const second=await f.setup.connectProvider({...f.options,profilePath:await createProfile(f,'other-claude')});
+  assert.equal(second.legacy,false);
+  assert.notEqual(second.launcherPath,legacy.launcherPath);
+  assert.equal((await f.setup.listConnections(f.options)).length,2);
+  const secondSettings=await fs.readFile(second.settingsPath);
+  await f.setup.disconnectProvider(f.options);
+  assert.deepEqual(await readJson(f.settingsPath),legacy.original);
+  assert.deepEqual(await fs.readFile(second.settingsPath),secondSettings);
+  assert.deepEqual((await f.setup.listConnections(f.options)).map(value=>value.id),[second.id]);
+});
+
+test('a corrupt Claude connection does not hide or disable another Claude profile',async t=>{
+  const f=await fixture(t);
+  const first=await f.setup.connectProvider(f.options);
+  const second=await f.setup.connectProvider({...f.options,profilePath:await createProfile(f,'other-claude')});
+  const launcher=await fs.readFile(first.launcherPath);
+  await fs.writeFile(path.join(path.dirname(first.launcherPath),'connection.json'),'{bad',{mode:0o600});
+  assert.deepEqual((await f.setup.listConnections(f.options)).map(value=>value.id),[second.id]);
+  const refreshed=await f.setup.refreshRuntime(f.options);
+  assert.deepEqual(refreshed.refreshed,[second.id]);
+  assert.equal(refreshed.warnings.length,1);
+  assert.ok(refreshed.warnings[0].includes(first.id));
+  assert.deepEqual(await fs.readFile(first.launcherPath),launcher);
+});
+
+test('disconnect and refresh touch only the addressed profile',async t=>{
+  const f=await fixture(t);
+  const first=await f.setup.connectProvider(f.options);
+  const second=await f.setup.connectProvider({...f.options,profilePath:await createProfile(f,'other-claude')});
+  const secondSettings=await fs.readFile(second.settingsPath),firstLauncher=await fs.readFile(first.launcherPath);
+  const firstRuntime=path.join(path.dirname(first.launcherPath),'passive.cjs');
+  const firstCollector=await fs.readFile(firstRuntime);
+  await f.setup.disconnectProvider({...f.options,connectionId:first.id});
+  assert.deepEqual(await fs.readFile(second.settingsPath),secondSettings);
+  assert.deepEqual((await f.setup.listConnections(f.options)).map(value=>value.id),[second.id]);
+  await fs.writeFile(f.collectorPath,'process.stdout.write("updated");',{mode:0o600});
+  assert.deepEqual((await f.setup.refreshRuntime(f.options)).refreshed,[second.id]);
+  assert.deepEqual(await fs.readFile(firstRuntime),firstCollector);
+  assert.deepEqual(await fs.readFile(first.launcherPath),firstLauncher);
+  assert.deepEqual(await fs.readFile(second.settingsPath),secondSettings);
+  assert.deepEqual(await fs.readFile(path.join(path.dirname(second.launcherPath),'passive.cjs')),await fs.readFile(f.collectorPath));
+});
+
+test('a legacy and version-2 receipt claiming one identity fail closed',async t=>{
+  const f=await fixture(t);
+  const current=await f.setup.connectProvider(f.options);
+  const legacy=await seedLegacyConnection(f,{settingsPath:current.settingsPath});
+  const files=[f.settingsPath,current.launcherPath,legacy.launcherPath,legacy.receiptPath,
+    path.join(path.dirname(current.launcherPath),'connection.json')];
+  const before=await Promise.all(files.map(file=>fs.readFile(file)));
+  await assert.rejects(f.setup.listConnections(f.options),{code:'DUPLICATE_CONNECTION'});
+  await assert.rejects(f.setup.refreshRuntime(f.options),{code:'DUPLICATE_CONNECTION'});
+  await assert.rejects(f.setup.connectProvider(f.options),{code:'DUPLICATE_CONNECTION'});
+  await assert.rejects(f.setup.disconnectProvider({...f.options,connectionId:current.id}),{code:'DUPLICATE_CONNECTION'});
+  await assert.rejects(f.setup.disconnectProvider(f.options),{code:'DUPLICATE_CONNECTION'});
+  assert.deepEqual(await Promise.all(files.map(file=>fs.readFile(file))),before);
+});
+
+test('version-1 takeover retains the legacy backup and explicit ownership confirmation',async t=>{
+  const f=await fixture(t),legacy=await seedLegacyConnection(f);
+  const before=await fs.readFile(f.settingsPath);
+  const other={...f.options,storagePath:path.join(f.homeDir,'other-editor')};
+  await assert.rejects(f.setup.connectProvider({...other,confirmTakeover:true}),{code:'ALREADY_CONNECTED'});
+  await fs.rmdir(f.options.storagePath);
+  await assert.rejects(f.setup.connectProvider(other),{code:'TAKEOVER_REQUIRED'});
+  const taken=await f.setup.connectProvider({...other,confirmTakeover:true});
+  assert.equal(taken.backupPath,legacy.backupPath);
+  assert.equal(taken.launcherPath,legacy.launcherPath);
+  assert.deepEqual(await fs.readFile(f.settingsPath),before);
+  await f.setup.disconnectProvider({...other,connectionId:taken.id});
+  assert.deepEqual(await readJson(f.settingsPath),legacy.original);
+});
+
+test('refresh warnings identify the failed provider and profile without disabling its neighbor',async t=>{
+  const f=await fixture(t),first=await f.setup.connectProvider(f.options);
+  const second=await f.setup.connectProvider({...f.options,profilePath:await createProfile(f,'other-claude')});
+  const receiptPath=path.join(path.dirname(first.launcherPath),'connection.json');
+  const saved=await readJson(receiptPath);
+  await writeJson(receiptPath,{...saved,cliLookupPath:path.join(f.homeDir,'missing-cli'),email:'private@example.test'});
+  const refreshed=await f.setup.refreshRuntime(f.options);
+  assert.deepEqual(refreshed.refreshed,[second.id]);
+  assert.equal(refreshed.warnings.length,1);
+  assert.ok(refreshed.warnings[0].includes(first.id));
+  assert.ok(refreshed.warnings[0].includes('claude'));
+  assert.ok(refreshed.warnings[0].includes(first.profilePath));
+  assert.equal(refreshed.warnings[0].includes('private@example.test'),false);
+});
+
 test('two profiles of one provider connect and disconnect independently in either order',async t=>{
   for(const reverse of [false,true]) {
     const f=await fixture(t);
@@ -113,7 +264,7 @@ test('connection capacity rejects creation while existing connections remain usa
   assert.deepEqual(await readJson(path.join(profilePath,'settings.json')),{profile:'overflow'});
   assert.equal((await f.setup.connectProvider(f.options)).id,first.id);
   assert.deepEqual((await f.setup.listConnections(f.options)).map(value=>value.id),[first.id]);
-  assert.deepEqual((await f.setup.refreshRuntime(f.options)).refreshed,['claude']);
+  assert.deepEqual((await f.setup.refreshRuntime(f.options)).refreshed,[first.id]);
   assert.equal((await f.setup.disconnectProvider({...f.options,connectionId:first.id})).connected,false);
 });
 
@@ -571,13 +722,13 @@ test('a corrupt receipt cannot suppress another valid provider connection', asyn
   const claude = await f.setup.connectProvider(f.options);
   const agyProfile = path.join(f.homeDir, '.gemini/antigravity-cli');
   await fs.mkdir(agyProfile, {recursive:true, mode:0o700});
-  await f.setup.connectProvider({...f.options, provider:'antigravity'});
+  const antigravity = await f.setup.connectProvider({...f.options, provider:'antigravity'});
   await fs.writeFile(path.join(path.dirname(claude.launcherPath), 'connection.json'), '{bad', {mode:0o600});
   const connections = await f.setup.listConnections(f.options);
   assert.deepEqual(connections.map(v => v.provider), ['antigravity']);
   const refreshed = await f.setup.refreshRuntime(f.options);
   assert.equal(refreshed.warnings.length, 1);
-  assert.deepEqual(refreshed.refreshed, ['antigravity']);
+  assert.deepEqual(refreshed.refreshed, [antigravity.id]);
 });
 
 test('settings owned by another user and shared runtime directories are refused', async t => {
@@ -679,7 +830,7 @@ test('edited or replaced managed Codex hooks fail closed with recovery intact', 
   const config=await readJson(f.settingsPath),managed=config.hooks.Stop.find(entry=>entry.hooks?.some(hook=>hook.command?.includes('llm-account-usage-managed-v1')));
   managed.hooks[0].command='printf replacement # llm-account-usage-managed-v1';await writeJson(f.settingsPath,config);
   const changed=await fs.readFile(f.settingsPath);await fs.writeFile(f.collectorPath,'process.stdout.write("changed");',{mode:0o600});
-  const refreshed=await f.setup.refreshRuntime(f.options);assert.equal(refreshed.refreshed.includes('codex'),false);assert.equal(refreshed.warnings.length,1);
+  const refreshed=await f.setup.refreshRuntime(f.options);assert.equal(refreshed.refreshed.includes(installed.id),false);assert.equal(refreshed.warnings.length,1);
   assert.deepEqual(await fs.readFile(path.join(path.dirname(installed.launcherPath),'passive.cjs')),runtime);
   await assert.rejects(f.setup.connectProvider(f.options),{code:'SETTINGS_CHANGED'});await assert.rejects(f.setup.disconnectProvider(f.options),{code:'SETTINGS_CHANGED'});
   assert.deepEqual(await fs.readFile(f.settingsPath),changed);assert.deepEqual(await fs.readFile(installed.backupPath),backup);

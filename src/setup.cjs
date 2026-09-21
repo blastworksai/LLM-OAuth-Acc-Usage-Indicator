@@ -235,8 +235,15 @@ function createSetup(dependencies = {}) {
     // The provider still invokes this hook after an editor uninstall. Its
     // launcher and original-command recovery must outlive editor-owned storage.
     const root = path.join(absolute(o.homeDir), '.local/state/llm-account-usage/connections', identity.id);
-    return {id:identity.id, root, receiptPath:path.join(root, 'connection.json'), launcherPath:path.join(root, 'run.sh'),
+    return {id:identity.id, legacy:false, ...runtimeLocations(root)};
+  }
+  function runtimeLocations(root) {
+    return {root, receiptPath:path.join(root, 'connection.json'), launcherPath:path.join(root, 'run.sh'),
       collectorPath:path.join(root, 'passive.cjs'), reportDir:path.join(root, 'reports')};
+  }
+  function legacyLocations(o, provider) {
+    const root=path.join(absolute(o.homeDir),'.local/state/llm-account-usage/providers',provider);
+    return {provider,legacy:true,...runtimeLocations(root)};
   }
   async function connectionLocations(o, {reserveSlot=false} = {}) {
     const parent=path.join(absolute(o.homeDir),'.local/state/llm-account-usage/connections');
@@ -249,6 +256,31 @@ function createSetup(dependencies = {}) {
       if(entry.isDirectory()&&/^v2-[a-f0-9]{32}$/.test(entry.name))names.push(entry.name);
     }
     return names.sort().map(id=>locations(o,{id}));
+  }
+  async function savedConnections(o) {
+    const candidates=[...await connectionLocations(o),...PROVIDERS.map(provider=>legacyLocations(o,provider))];
+    const entries=[],identities=new Set();
+    for(const loc of candidates) {
+      let data;
+      try {
+        if(!await stat(loc.root))continue;
+        await safeDirectories(loc.root,o,{privateLeaf:true});
+        data=await receipt({...o,provider:undefined},loc);
+      } catch(error) {
+        entries.push({loc,error});
+        continue;
+      }
+      if(data) {
+        // Check claims before owner/hook filtering: an ambiguous identity must
+        // never select whichever receipt happens to look active first.
+        if(identities.has(data.id))throw failure('DUPLICATE_CONNECTION',
+          'Multiple saved receipts claim the same profile connection. Review them before changing provider setup.');
+        identities.add(data.id);
+        loc.id=data.id;
+      }
+      entries.push({loc,data});
+    }
+    return entries;
   }
   function pendingProcess(value, uid) {
     if(value === undefined || value === null)return null;
@@ -265,10 +297,13 @@ function createSetup(dependencies = {}) {
     const kind = data.kind || (data.provider === 'codex' ? null : 'statusline');
     let identity;
     try { identity=connectionIdentity(data); } catch { /* Rejected below. */ }
-    const common = data.version === 2 && data.id === loc.id && identity?.id === loc.id &&
+    const version = loc.legacy ? data.version === 1 && data.provider === loc.provider &&
+      (!loc.id || identity?.id === loc.id) : data.version === 2 && data.id === loc.id && identity?.id === loc.id;
+    const profilePath=loc.legacy && identity ? path.dirname(identity.settingsPath) : data.profilePath;
+    const common = version && identity &&
       (!o.provider || data.provider === o.provider) && data.uid === o.uid &&
-      data.settingsPath === identity?.settingsPath && typeof data.profilePath === 'string' &&
-      data.settingsPath === path.join(data.profilePath, data.provider === 'codex' ? 'hooks.json' : 'settings.json') &&
+      data.settingsPath === identity.settingsPath && typeof profilePath === 'string' &&
+      data.settingsPath === path.join(profilePath, data.provider === 'codex' ? 'hooks.json' : 'settings.json') &&
       ['connected', 'disconnected'].includes(data.status) && typeof data.cliPath === 'string' &&
       typeof data.cliLookupPath === 'string' && typeof data.ownerStoragePath === 'string';
     const statusline = kind === 'statusline' && object(data.installedStatusLine) &&
@@ -281,6 +316,8 @@ function createSetup(dependencies = {}) {
     if(!common || (!statusline && !codex))
       throw failure('INVALID_RECEIPT', 'The saved connection cannot be verified. Provider settings were left unchanged.');
     absolute(data.settingsPath);
+    data.id=identity.id;
+    data.profilePath=profilePath;
     absolute(data.profilePath);
     data.pendingProcess=pendingProcess(data.pendingProcess,data.uid);
     data.kind = kind;
@@ -405,7 +442,7 @@ function createSetup(dependencies = {}) {
     await put(loc.receiptPath, json(data), o, 0o600);
   }
   function publicConnection(data, loc) {
-    return {id:data.id, provider:data.provider, uid:data.uid, profilePath:data.profilePath,
+    return {id:data.id, legacy:loc.legacy, provider:data.provider, uid:data.uid, profilePath:data.profilePath,
       pendingProcess:data.pendingProcess, connected:data.status === 'connected', settingsPath:data.settingsPath,
       cliLookupPath:data.cliLookupPath, reportDir:loc.reportDir, launcherPath:loc.launcherPath,
       backupPath:path.join(loc.root, data.backupName)};
@@ -467,7 +504,7 @@ function createSetup(dependencies = {}) {
     const o = options(input);
     const found = await inspect(o, {validateStatusLine:false});
     const pending=pendingProcess(o.pendingProcess,o.uid);
-    const loc=locations(o,found.identity);
+    const loc=(await savedConnections(o)).find(entry=>entry.loc.id===found.id)?.loc || locations(o,found.identity);
     if(!await stat(loc.root)) {
       // Reserve capacity and create its directory under one cross-process lock.
       // Keep admission state outside the bounded connection-directory scan.
@@ -504,7 +541,7 @@ function createSetup(dependencies = {}) {
       }
       await safeDirectories(o.storagePath, o, {create:true});
       let next;
-      const common = {version:2, id:found.id, profilePath:found.profilePath, pendingProcess:pending,
+      const common = {version:loc.legacy?1:2, id:found.id, profilePath:found.profilePath, pendingProcess:pending,
         status:'connected', provider:o.provider, uid:o.uid, settingsPath:found.settingsPath,
         ownerStoragePath:absolute(o.storagePath), cliPath:found.cliPath, cliLookupPath:found.cliLookupPath,
         settingsExisted:found.bytes !== null};
@@ -540,15 +577,16 @@ function createSetup(dependencies = {}) {
     let loc;
     if(o.connectionId !== undefined) {
       locations(o,{id:o.connectionId});
-      loc=(await connectionLocations(o)).find(value=>value.id===o.connectionId);
+      loc=(await savedConnections(o)).find(entry=>entry.loc.id===o.connectionId)?.loc;
       if(!loc)throw failure('INVALID_CONNECTION','The selected profile connection was not found.');
     } else {
       if(!o.provider)throw failure('UNSUPPORTED_PROVIDER','Choose a provider.');
       const selectedProfile=profile(o);
       await safeDirectories(selectedProfile,o);
       const profilePath=await io.realpath(selectedProfile);
-      loc=locations(o,connectionIdentity({provider:o.provider,uid:o.uid,
-        settingsPath:path.join(profilePath,o.provider==='codex'?'hooks.json':'settings.json')}));
+      const identity=connectionIdentity({provider:o.provider,uid:o.uid,
+        settingsPath:path.join(profilePath,o.provider==='codex'?'hooks.json':'settings.json')});
+      loc=(await savedConnections(o)).find(entry=>entry.loc.id===identity.id)?.loc || locations(o,identity);
     }
     if(!await stat(loc.root)) return {provider:o.provider, connected:false};
     return locked(o, loc, async current => {
@@ -582,11 +620,10 @@ function createSetup(dependencies = {}) {
   async function listConnections(input) {
     const base = options(input);
     const results = [];
-    for(const loc of await connectionLocations(base)) {
+    for(const {loc,data,error} of await savedConnections(base)) {
+      if(error)continue;
       const o = {...base, provider:undefined};
       try {
-        await safeDirectories(loc.root, o, {privateLeaf:true});
-        const data = await receipt(o, loc);
         if(data?.status !== 'connected' || data.ownerStoragePath !== absolute(o.storagePath)) continue;
         await nativeExecutable(data.cliLookupPath, o);
         await safeDirectories(loc.reportDir, o, {privateLeaf:true});
@@ -601,11 +638,14 @@ function createSetup(dependencies = {}) {
   }
   async function refreshRuntime(input) {
     const base = options(input), warnings = [], refreshed = [];
-    for(const loc of await connectionLocations(base)) {
+    for(const entry of await savedConnections(base)) {
+      const {loc}=entry;
       const o = {...base, provider:undefined};
+      let data=entry.data;
       try {
+        if(entry.error)throw entry.error;
         await locked(o, loc, async current => {
-          const data = await receipt(o, current);
+          data = await receipt(o, current);
           if(data?.status === 'connected' && data.ownerStoragePath === absolute(o.storagePath)) {
             o.provider=data.provider;
             if(data.kind === 'codex-hook') {
@@ -616,11 +656,16 @@ function createSetup(dependencies = {}) {
             try {
               const runtime=await writeRuntime(o, current, data);
               if(data.cliPath!==runtime.cliPath) {data.cliPath=runtime.cliPath;await put(current.receiptPath,json(data),o,0o600);}
-              refreshed.push(data.provider);
+              refreshed.push(data.id);
             } catch(error) {await disableRuntime(o,current,data);throw error;}
           }
         });
-      } catch(error) { if(error.code !== 'SETUP_BUSY') warnings.push(`${loc.id}: saved collector runtime could not be refreshed; reconnect after reviewing setup.`); }
+      } catch(error) {
+        if(error.code !== 'SETUP_BUSY') {
+          const label=data ? `${data.provider} (${data.profilePath}; ${data.id})` : `${loc.id || loc.provider} (${loc.root})`;
+          warnings.push(`${label}: saved collector runtime could not be refreshed; reconnect after reviewing setup.`);
+        }
+      }
     }
     return {refreshed, warnings};
   }

@@ -8,7 +8,11 @@ On Linux, terminal matching reads bounded process metadata: process IDs, user ID
 
 For Codex, the `Stop` hook uses the event's session identifier but does not read or store its transcript path, prompt or response. Only `HOME` and optional `CODEX_HOME` are forwarded to the short-lived native app-server child; credential and endpoint environment overrides are not forwarded. The collector does not read login files or decode saved tokens. It calls `account/read` with token refresh disabled and pairs that response with `account/rateLimits/read` from the same observation.
 
-Claude and Antigravity connections receive the provider's native statusline input. Sanitized reports contain account email when available, subscription tier, quota windows, timestamps and the process/session identifiers needed for matching. Raw conversations, hook payloads and credentials are not copied into reports. Existing user statusline commands receive their original input so their behavior can be preserved.
+Claude and Antigravity connections receive the provider's native statusline input.
+Sanitized reports still contain only provider/session/process identity, optional account email and subscription tier, quota windows and timestamps.
+Connecting additional profiles or sharing a cross-user feed does not expand this report schema.
+Raw conversations, hook payloads and credentials are not copied into reports.
+Existing user statusline commands receive their original input so their behavior can be preserved.
 
 ## Provider requests
 
@@ -18,12 +22,39 @@ Quota readings can include use from other terminals and sessions on the same acc
 
 ## Stored locally
 
-Provider connections keep a backup, connection receipt, stable collector runtime and sanitized reports under `~/.local/state/llm-account-usage/` on the terminal host. This owner-private storage survives removal of editor installation files, so a configured hook remains recoverable if editor files disappear. These are runtime data on the installing user's machine, never included in the downloadable package.
+Each provider profile keeps its own backup, connection receipt and stable collector runtime under `~/.local/state/llm-account-usage/` on the profile owner's Linux host account.
+Same-user reports also stay in that owner-private storage.
+It survives removal of editor installation files, so a configured hook remains recoverable if editor files disappear.
+Connections are distinguished by provider, numeric Linux UID and settings path, not by an account email or a user-to-account registry.
+These are runtime data on the installing user's machine, never included in the downloadable package.
+
+For explicit cross-user setup, the target user publishes sanitized reports in a separate feed: by default `~/.llm-account-usage-feeds/<connection-id>/`, or an existing directory selected during setup.
+That feed must be owned by the target user and readable by the extension host through an existing Linux group.
+Directory permissions are at most `2750` (`0750` without setgid); report files and the connection descriptor are at most `0640`.
+Members of that group can read the reports, including account email when present, and the connection descriptor's UID and local configuration/runtime paths.
+Backed-up settings and the private collector runtime are not placed in the shared feed.
+The extension records the accepted feed path in machine-local editor state.
+It does not add group memberships, change existing permissions or make reports world-readable if access fails.
+
+The copied setup command stages local helper code and a short-lived result containing connection metadata such as provider, UID and paths.
+This temporary handoff is readable by other local users so the two Linux accounts can exchange the result; it contains no account email, quota readings, backed-up settings or credentials.
+The extension validates the result's owner and selected live process before accepting it, then cleans up the known staged files.
+Running the command is explicit: the extension never invokes `sudo` or stops the selected agent.
 
 The backup is a copy of the **full provider settings or hooks file**, which may include secrets or sensitive configuration you put there. Backups are readable only by your operating-system user and remain after disconnection for recovery. Treat them as private credentials and do not attach them to issues.
 
-When you explicitly approve shared or externally owned Linux CLI paths during connection, each path's kind, numeric owner/group IDs and permission mode are saved in the extension host's local editor state and copied into its private launcher. This approval is not synchronized through VS Code Settings Sync. People who control those paths must be trusted; the extension does not make shared software private. The collector rechecks the fingerprint before each observation. Ownership or permission changes disable collection and require another review. World-writable paths and writable settings files remain refused.
+When you explicitly approve shared or externally owned Linux CLI paths during connection, each path's kind, numeric owner/group IDs and permission mode are saved in that profile's private launcher.
+Same-user setup also saves the approval in the extension host's local editor state; cross-user setup asks for consent in the target user's shell.
+This approval is not synchronized through VS Code Settings Sync.
+People who control those paths must be trusted; the extension does not make shared software private.
+The collector rechecks the fingerprint before each observation.
+Ownership or permission changes disable collection and require another review.
+World-writable paths and writable settings files remain refused.
 
-Run **Account Usage: Disconnect Provider** before uninstalling to restore provider settings. Backups and reports may remain locally for recovery; they can be removed after checking the disconnect result. Do not publish this storage folder in a bug report.
+Run **Account Usage: Disconnect Provider** before uninstalling and choose each profile you want to remove.
+Disconnect restores only the selected profile's backed-up statusline or removes its exact managed hook; other profiles remain connected.
+Cross-user disconnect requires an explicit command under the target user too.
+Backups and reports may remain locally for recovery; they can be removed after checking the disconnect result.
+Do not publish this storage folder in a bug report.
 
 The card itself displays personal data. Review screenshots before sharing them, including expanded report details and terminal names.

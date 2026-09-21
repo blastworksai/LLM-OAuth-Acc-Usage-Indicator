@@ -79,19 +79,23 @@ test('missing editor ownership is recovered only after explicit confirmation for
   }
 });
 
-test('shared-directory trust requires the explicit connection choice and is retained only after success',async()=>{
-  const sharedDirectories=[{path:'/example/home',uid:1000,gid:1000},{path:'/example/home/.claude',uid:1000,gid:1000}];
+test('shared-path trust explains the exact control boundary and is retained only after success',async()=>{
+  const sharedDirectories=[
+    {path:'/example/shared',kind:'directory',uid:2000,gid:1000,mode:0o2775},
+    {path:'/example/shared/cli',kind:'executable',uid:3000,gid:1000,mode:0o775}
+  ];
   for(const confirm of ['Cancel','Connect','Trust and connect']) {
-    const h=harness({confirm,discover:async()=>({profilePath:'/example/home/.claude',sharedDirectories})});
+    const h=harness({confirm,discover:async()=>({profilePath:'/example/profile',sharedDirectories})});
     await h.commands.get('llmAccountUsage.connect')();
-    assert.match(h.confirmations[0].options.detail,/\/example\/home/);
-    assert.match(h.confirmations[0].options.detail,/group 1000/);
+    assert.match(h.confirmations[0].options.detail,/Directory: \/example\/shared \(owner UID 2000, group GID 1000, mode 2775\)/);
+    assert.match(h.confirmations[0].options.detail,/Executable: \/example\/shared\/cli \(owner UID 3000, group GID 1000, mode 775\)/);
+    assert.match(h.confirmations[0].options.detail,/trust the listed owners and everyone who can write through these groups/i);
     assert.equal(h.confirmations[0].actions[0],'Trust and connect');
     assert.equal(h.connected.length,confirm==='Trust and connect'?1:0);
     assert.deepEqual(JSON.parse(JSON.stringify(h.storage.get('trustedDirectories'))),confirm==='Trust and connect'?sharedDirectories:[]);
     if(h.connected.length)assert.deepEqual(JSON.parse(JSON.stringify(h.connected[0].trustedDirectories)),sharedDirectories);
   }
-  const h=harness({confirm:'Trust and connect',discover:async()=>({profilePath:'/example/home/.claude',sharedDirectories}),
+  const h=harness({confirm:'Trust and connect',discover:async()=>({profilePath:'/example/profile',sharedDirectories}),
     connect:async()=>{throw problem('SETTINGS_CHANGED');}});
   await h.commands.get('llmAccountUsage.connect')();
   assert.deepEqual(h.storage.get('trustedDirectories'),[]);
@@ -146,10 +150,24 @@ test('unknown sessions stop offering setup when all providers are connected',asy
 });
 
 test('a detected connected provider waits for a fresh report without setup',async()=>{
- const h=harness({terminal:terminal(),detect:async()=>target('claude'),connections:[{provider:'claude',reportDir:'/example/reports'}]});
+ const detected=target('claude');
+ const h=harness({terminal:terminal(),detect:async()=>detected,connections:[{provider:'claude',reportDir:'/example/reports',cliLookupPath:detected.cliPath}]});
  await h.api.refresh();
  assert.equal(h.api.getState().setupTarget,undefined);
  assert.match(h.api.getState().reason,/connected.*fresh/i);
+});
+
+test('a detected package update can reconnect an existing provider to its new native target',async()=>{
+ const detected=target('codex');
+ const h=harness({terminal:terminal(),detect:async()=>detected,
+  connections:[{provider:'codex',reportDir:'/example/codex',cliLookupPath:'/example/native/codex-v1'}]});
+ await h.api.refresh();
+ assert.deepEqual(JSON.parse(JSON.stringify(h.api.getState().setupTarget)),detected);
+ await h.commands.get('llmAccountUsage.connect')();
+ assert.equal(h.connected.length,1);
+ assert.equal(h.connected[0].provider,'codex');
+ assert.equal(h.connected[0].cliPath,detected.cliPath);
+ assert.equal(h.picks,0);
 });
 
 test('Codex selection reads its connected report and never invokes direct collection',async()=>{

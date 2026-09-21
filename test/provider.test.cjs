@@ -111,3 +111,13 @@ test('real symlink layouts resolve versioned native files while shell launchers 
  assert.deepEqual(await fixture(deps).detect(10),{provider:'claude',cliPath:path.join(bin,'claude'),process:identity});
  assert.equal(await fixture({...deps,getExecutable:async()=>script}).detect(10),null);
 });
+
+test('a package-manager launcher binds the exact native provider process without assuming its layout',async()=>{
+ const wrapper='/opt/shared/node_modules/vendor/bin/codex.js',native='/srv/provider/releases/42/codex';
+ const f=fixture({
+  getExecutable:async pid=>pid===20?native:'/usr/bin/bash',
+  resolveCommand:async lookup=>lookup==='/opt/tools/codex'?wrapper:null,
+  resolveExecutable:async lookup=>lookup===native?native:null
+ });
+ assert.deepEqual(await f.detect(10),{provider:'codex',cliPath:native,process:identity});
+});

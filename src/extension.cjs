@@ -15,6 +15,10 @@ function activate(context) {
   const setupReady=process.platform==='linux'
     ? setup.refreshRuntime(setupOptions).catch(()=>({warnings:['Saved provider connections need attention. Run Account Usage: Connect Provider.']}))
     : Promise.resolve({warnings:[]});
+  const changedTarget=(connections,target)=> {
+    const connection=target&&connections.find(value=>value.provider===target.provider);
+    return !!connection && typeof connection.cliLookupPath==='string' && connection.cliLookupPath!==target.cliPath;
+  };
   const getViewModel=()=>buildViewModel(controller.state);
   const getHtml=()=>renderContent(getViewModel(),assets);
   const render=()=> {
@@ -38,7 +42,7 @@ function activate(context) {
     if(result.status==='unavailable') {
       const target=await detectProvider(pid);
       const connected=new Set(connections.map(connection=>connection.provider));
-      if(target && !connected.has(target.provider))result.setupTarget=target;
+      if(target && (!connected.has(target.provider) || changedTarget(connections,target)))result.setupTarget=target;
       else if(target)result.reason='This provider is connected. Waiting for this session to finish a fresh turn.';
       else if(connected.size<3)result.setupTarget={provider:null};
     }
@@ -74,12 +78,13 @@ function activate(context) {
     await setupReady;
     const connections=await setup.listConnections(setupOptions).catch(()=>[]);
     const connected=new Set(connections.map(connection=>connection.provider));
+    const reconnect=changedTarget(connections,detected);
     const choices=[
       {label:'Codex',provider:'codex'},
       {label:'Claude Code',provider:'claude'},
       {label:'Antigravity',provider:'antigravity'}
-    ].filter(choice=>!connected.has(choice.provider));
-    const picked=detected && !connected.has(detected.provider) ? detected : await vscode.window.showQuickPick(
+    ].filter(choice=>!connected.has(choice.provider) || (reconnect && choice.provider===detected.provider));
+    const picked=detected && (!connected.has(detected.provider) || reconnect) ? detected : await vscode.window.showQuickPick(
       choices,{title:'Connect an account usage provider',placeHolder:'Choose the CLI running in this terminal.'});
     if(!picked)return;
     try {
@@ -103,9 +108,11 @@ function activate(context) {
         }
         const shared=found.sharedDirectories||[];
         const connectAction=shared.length?'Trust and connect':'Connect';
-        const trustDetail=shared.length?'\n\nThese directories are writable by a shared Linux group:\n'+
-          shared.map(item=>`${item.path} (group ${item.gid})`).join('\n')+
-          '\n\nContinue only if you trust everyone who can write there. This approval is saved on this host. Directory permissions stay unchanged.':'';
+        const trustDetail=shared.length?'\n\nThese local paths have changed since approval, are controlled by another Linux owner, or are writable by a shared group:\n'+
+          shared.map(item=>`${item.kind==='executable'?'Executable':'Directory'}: ${item.path} `+
+            `(owner UID ${item.uid}, group GID ${item.gid}, mode ${(item.mode&0o7777).toString(8)})`).join('\n')+
+          '\n\nContinue only if you trust the listed owners and everyone who can write through these groups. '+
+          'This approval is saved on this host; ownership or permission changes require review again.':'';
         const setupDetail=picked.provider==='codex'
           ? (found.hasExistingHooks?'Your existing Codex hooks will be preserved. This adds one Stop hook for account usage.':'This adds one Codex Stop hook for account usage.')
           : (found.hasExistingStatusLine?'Your existing statusline will be preserved.':'This adds a statusline reader for account usage.');

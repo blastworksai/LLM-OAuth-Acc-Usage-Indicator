@@ -41,6 +41,9 @@ test('fresh connect installs stable private runtime and preserves unrelated conf
   assert.equal((await fs.stat(path.dirname(result.launcherPath))).mode & 0o777, 0o700);
   const run = JSON.parse(execFileSync('/bin/sh', [result.launcherPath], {input:'{}', encoding:'utf8'}));
   assert.ok(run.args.includes('--claude-auth-status'));
+  const trustIndex = run.args.indexOf('--trusted-cli-paths-json');
+  assert.notEqual(trustIndex, -1);
+  assert.deepEqual(JSON.parse(run.args[trustIndex + 1]), []);
   assert.equal(run.electron, '1');
   assert.equal(run.args[0], 'claude-statusline');
   assert.deepEqual((await f.setup.listConnections(f.options)).map(v => v.reportDir), [result.reportDir]);
@@ -85,6 +88,148 @@ test('shared directory trust cannot approve a different group, world writes, lin
   const link = path.join(f.homeDir, 'linked');
   await fs.symlink(f.profilePath, link);
   await assert.rejects(f.setup.connectProvider({...options, profilePath:link}), {code:'UNSAFE_PATH'});
+});
+
+test('a CLI controlled by another user or shared group reaches explicit trust instead of being refused', async t => {
+  const f = await fixture(t, 'codex');
+  await writeJson(f.settingsPath, {});
+  const sharedRoot = path.join(f.homeDir, 'shared-cli');
+  const sharedLib = path.join(sharedRoot, 'lib');
+  const executable = path.join(sharedLib, 'codex');
+  await fs.mkdir(sharedLib, {recursive:true, mode:0o2775});
+  await fs.chmod(sharedRoot, 0o2775);
+  await fs.chmod(sharedLib, 0o2775);
+  await fs.copyFile(process.execPath, executable);
+  await fs.chmod(executable, 0o775);
+  const externalUid = process.getuid() + 1000;
+  const sharedGid = 4242;
+  const externalInfo = async (method, file, ...args) => {
+    const info = await fs[method](file, ...args);
+    if(file === sharedRoot || file === sharedLib || file === executable) {
+      info.uid = externalUid;
+      info.gid = sharedGid;
+    }
+    return info;
+  };
+  const io = new Proxy(fs, {get(target, key) {
+    if(key === 'lstat' || key === 'stat')return (file, ...args) => externalInfo(key, file, ...args);
+    return target[key];
+  }});
+  const setup = createSetup({fs:io});
+  const options = {...f.options, cliPath:executable};
+
+  const preview = await setup.discoverProvider(options);
+  assert.deepEqual(preview.sharedDirectories.map(item => ({path:item.path,kind:item.kind,uid:item.uid,gid:item.gid})), [
+    {path:sharedRoot,kind:'directory',uid:externalUid,gid:sharedGid},
+    {path:sharedLib,kind:'directory',uid:externalUid,gid:sharedGid},
+    {path:executable,kind:'executable',uid:externalUid,gid:sharedGid}
+  ]);
+  await assert.rejects(setup.connectProvider(options), {code:'DIRECTORY_TRUST_REQUIRED'});
+  const result = await setup.connectProvider({...options, trustedDirectories:preview.sharedDirectories});
+  assert.equal(result.connected, true);
+});
+
+test('CLI trust is invalidated by changed ownership or permissions and never accepts world writes', async t => {
+  const f = await fixture(t, 'codex');
+  await writeJson(f.settingsPath, {});
+  const executable = path.join(f.homeDir, 'shared-codex');
+  await fs.copyFile(process.execPath, executable);
+  await fs.chmod(executable, 0o755);
+  const externalUid = process.getuid() + 1000;
+  const sharedGid = 4242;
+  let permissions = 0o755;
+  const io = new Proxy(fs, {get(target, key) {
+    if(key === 'stat')return async (file, ...args) => {
+      const info = await target.stat(file, ...args);
+      if(file === executable) {
+        info.uid = externalUid;
+        info.gid = sharedGid;
+        info.mode = (info.mode & ~0o7777) | permissions;
+      }
+      return info;
+    };
+    return target[key];
+  }});
+  const setup = createSetup({fs:io});
+  const options = {...f.options, cliPath:executable};
+  const preview = await setup.discoverProvider(options);
+  const trusted = {...options, trustedDirectories:preview.sharedDirectories};
+
+  assert.deepEqual((await setup.discoverProvider(trusted)).sharedDirectories, []);
+  permissions = 0o775;
+  const changed = await setup.discoverProvider(trusted);
+  assert.deepEqual(changed.sharedDirectories.map(item => item.path), [executable]);
+  await assert.rejects(setup.connectProvider(trusted), {code:'DIRECTORY_TRUST_REQUIRED'});
+  permissions = 0o777;
+  await assert.rejects(setup.discoverProvider(trusted), {code:'UNSUPPORTED_CLI'});
+});
+
+test('permission drift hides the connection, disables its launcher and requires renewed trust', async t => {
+  const f = await fixture(t);
+  await writeJson(f.settingsPath, {});
+  const executable = path.join(f.homeDir, 'shared-claude');
+  await fs.copyFile(process.execPath, executable);
+  await fs.chmod(executable, 0o755);
+  const externalUid = process.getuid() + 1000, sharedGid = 4242;
+  let permissions = 0o755;
+  const io = new Proxy(fs, {get(target, key) {
+    if(key === 'stat')return async (file, ...args) => {
+      const info = await target.stat(file, ...args);
+      if(file === executable) {
+        info.uid = externalUid;info.gid = sharedGid;
+        info.mode = (info.mode & ~0o7777) | permissions;
+      }
+      return info;
+    };
+    return target[key];
+  }});
+  const setup = createSetup({fs:io});
+  const options = {...f.options, cliPath:executable};
+  const firstReview = await setup.discoverProvider(options);
+  const trusted = {...options, trustedDirectories:firstReview.sharedDirectories};
+  const installed = await setup.connectProvider(trusted);
+  permissions = 0o775;
+  assert.deepEqual(await setup.listConnections(trusted), []);
+  const refreshed = await setup.refreshRuntime(trusted);
+  assert.deepEqual(refreshed.refreshed, []);
+  assert.equal(refreshed.warnings.length, 1);
+  assert.equal(execFileSync('/bin/sh', [installed.launcherPath], {input:'{}', encoding:'utf8'}), '');
+  const nextReview = await setup.discoverProvider(trusted);
+  assert.deepEqual(nextReview.sharedDirectories.map(item => item.path), [executable]);
+  const renewed = {...options, trustedDirectories:firstReview.sharedDirectories.filter(item => item.path !== executable).concat(nextReview.sharedDirectories)};
+  await setup.connectProvider(renewed);
+  const run = JSON.parse(execFileSync('/bin/sh', [installed.launcherPath], {input:'{}', encoding:'utf8'}));
+  const trustIndex = run.args.indexOf('--trusted-cli-paths-json');
+  assert.deepEqual(JSON.parse(run.args[trustIndex + 1]).find(item => item.path === executable).mode, 0o775);
+});
+
+test('reconnect persists a newly detected native target after a package launcher update', async t => {
+  const f = await fixture(t);
+  const first = path.join(f.homeDir, 'native-v1'), second = path.join(f.homeDir, 'native-v2');
+  await fs.copyFile(process.execPath, first);await fs.chmod(first, 0o700);
+  await fs.copyFile(process.execPath, second);await fs.chmod(second, 0o700);
+  const installed = await f.setup.connectProvider({...f.options,cliPath:first});
+  await f.setup.connectProvider({...f.options,cliPath:second});
+  const run = JSON.parse(execFileSync('/bin/sh', [installed.launcherPath], {input:'{}', encoding:'utf8'}));
+  assert.equal(run.args[run.args.indexOf('--cli-executable') + 1], second);
+  const receipt = await readJson(path.join(path.dirname(installed.launcherPath), 'connection.json'));
+  assert.equal(receipt.cliPath, second);
+  assert.equal(receipt.cliLookupPath, second);
+});
+
+test('disabling a drifted collector still preserves the original statusline byte stream', async t => {
+  const f = await fixture(t);
+  await writeJson(f.settingsPath, {statusLine:{type:'command',command:'printf "kept:"; cat'}});
+  const executable = path.join(f.homeDir, 'shared-claude');
+  await fs.copyFile(process.execPath, executable);await fs.chmod(executable, 0o770);
+  const options = {...f.options,cliPath:executable};
+  const preview = await f.setup.discoverProvider(options);
+  const trusted = {...options,trustedDirectories:preview.sharedDirectories};
+  await f.setup.connectProvider(trusted);
+  await fs.chmod(executable, 0o750);
+  assert.equal((await f.setup.refreshRuntime(trusted)).warnings.length, 1);
+  const command = (await readJson(f.settingsPath)).statusLine.command;
+  assert.equal(execFileSync('/bin/sh', ['-c', command], {input:'original bytes',encoding:'utf8'}), 'kept:original bytes');
 });
 
 test('repeated connect preserves original backup and statusline stdin, shell syntax and stdout', async t => {

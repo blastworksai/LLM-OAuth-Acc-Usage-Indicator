@@ -21,7 +21,7 @@ async function fixture(t) {
  t.after(()=>fs.rm(base,{recursive:true,force:true}));
  const proc=path.join(base,'proc'),exe=path.join(base,'codex'),reports=path.join(base,'reports');
  await fs.mkdir(path.join(proc,'sys/kernel/random'),{recursive:true});await fs.writeFile(path.join(proc,'sys/kernel/random/boot_id'),boot+'\n');
- await fs.writeFile(exe,'');await fs.mkdir(reports,{mode:0o700});
+ await fs.writeFile(exe,'',{mode:0o700});await fs.mkdir(reports,{mode:0o700});
  async function processFile(pid,parent,executable,start=String(890+pid),comm='native') {
   const dir=path.join(proc,String(pid));await fs.mkdir(path.join(dir,'fd'),{recursive:true});
   await fs.writeFile(path.join(dir,'stat'),`${pid} (${comm}) S ${parent} ${Array(17).fill('0').join(' ')} ${start} 0\n`);
@@ -34,6 +34,25 @@ async function fixture(t) {
  async function held(file,name='1') {await fs.symlink(file,path.join(proc,'10/fd',name));}
  return {base,proc,exe,reports,processFile,transcript,held,options:{proc,startPid:30}};
 }
+test('runtime CLI trust requires exact reviewed metadata and rejects world-writable paths',async t=>{
+ const f=await fixture(t);await fs.chmod(f.base,0o770);await fs.chmod(f.exe,0o770);
+ const reviewed=[];
+ for(const [file,kind] of [[f.base,'directory'],[f.exe,'executable']]) {
+  const info=await fs.stat(file);reviewed.push({path:file,kind,uid:info.uid,gid:info.gid,mode:info.mode&0o7777});
+ }
+ assert.deepEqual([...await p.trustedExecutablePaths(f.exe,undefined,JSON.stringify(reviewed))],[f.exe]);
+ await fs.chmod(f.exe,0o750);
+ await assert.rejects(p.trustedExecutablePaths(f.exe,undefined,JSON.stringify(reviewed)),/cli-trust-review-required/);
+ await fs.chmod(f.exe,0o770);
+ await fs.chmod(f.base,0o775);
+ await assert.rejects(p.trustedExecutablePaths(f.exe,undefined,JSON.stringify(reviewed)),/cli-trust-review-required/);
+ let queries=0;
+ await assert.rejects(p.runCollection({mode:'claude-statusline',cliExecutable:f.exe,reportDir:f.reports,claudeAuthStatus:true,trustedCliPathsJson:JSON.stringify(reviewed)},Buffer.from('{}'),stamp,{...f.options,spawnProcess:()=>{queries++;throw Error('must not spawn');}}),/cli-trust-review-required/);
+ assert.equal(queries,0);
+ reviewed[0].mode=0o775;await fs.chmod(f.exe,0o777);
+ await assert.rejects(p.trustedExecutablePaths(f.exe,undefined,JSON.stringify(reviewed)),/unsafe-cli-path/);
+ await assert.rejects(p.trustedExecutablePaths(f.exe,undefined,'{}'),/invalid-cli-trust/);
+});
 test('closed native statusline normalization pairs current account and omits private fields',()=>{
  const report=p.antigravityReport({...agy(),secret:'PRIVATE',quota:{...agy().quota,PRIVATE:{remaining_fraction:.1}}},identity,stamp);
  assert.equal(report.windows[0].used_percent,6.22);assert.equal(report.plan_type,'pro');
@@ -416,7 +435,7 @@ test('successive conversation clears stay bounded beyond the reader entry limit'
  const entries=await fs.readdir(f.reports);assert.equal(entries.length,1);assert.equal(JSON.parse(await fs.readFile(path.join(f.reports,entries[0]),'utf8')).session_id,'session-139');
 });
 test('CLI lookup rollover recognizes old and new native processes and rejects unrelated targets',async t=>{
- const f=await fixture(t),lookup=path.join(f.base,'claude'),updated=path.join(f.base,'native-v2');await fs.writeFile(updated,'');await fs.symlink(updated,lookup);
+ const f=await fixture(t),lookup=path.join(f.base,'claude'),updated=path.join(f.base,'native-v2');await fs.writeFile(updated,'',{mode:0o700});await fs.symlink(updated,lookup);
  const args={...claudeArgs(f),claudeAuthStatus:false,cliLookupPath:lookup};
  assert.equal((await p.runCollection(args,claudeRaw(),stamp,f.options)).process.pid,10);
  await fs.unlink(path.join(f.proc,'10/exe'));await fs.symlink(updated,path.join(f.proc,'10/exe'));

@@ -56,6 +56,27 @@ function createSetup(dependencies = {}) {
   async function stat(file) {
     try { return await io.lstat(file); } catch(error) { if(error.code === 'ENOENT') return null; throw error; }
   }
+  function reviewItem(file, entry, kind) {
+    return {path:file, kind, uid:entry.uid, gid:entry.gid, mode:entry.mode & 0o7777};
+  }
+  const hasPathTrust = (file, o, kind) => Array.isArray(o.trustedDirectories) &&
+    o.trustedDirectories.some(saved => saved?.path === file && saved.kind === kind);
+  function requirePathTrust(file, entry, o, kind) {
+    const item = reviewItem(file, entry, kind);
+    const approved = Array.isArray(o.trustedDirectories) && o.trustedDirectories.some(saved =>
+      saved?.path === item.path && saved.kind === item.kind && saved.uid === item.uid &&
+      saved.gid === item.gid && saved.mode === item.mode);
+    if(approved) {
+      if(o.usedPathTrust)o.usedPathTrust.set(`${kind}:${file}`, item);
+      return;
+    }
+    if(o.sharedDirectoryReview) {
+      o.sharedDirectoryReview.set(`${kind}:${file}`, item);
+      return;
+    }
+    throw failure('DIRECTORY_TRUST_REQUIRED',
+      `A path is controlled by another Linux owner or writable by a shared group. Connect Provider again to review and trust it: ${file}`);
+  }
   // Inspect every path component. System-owned ancestors are acceptable; an
   // owner-owned sticky directory (e.g. /tmp) is not acceptable as our data root.
   async function safeDirectories(directory, o, {create = false, privateLeaf = false, ownerLeaf = true, allowMissing = false} = {}) {
@@ -72,20 +93,14 @@ function createSetup(dependencies = {}) {
       if(!entry) throw failure('PROFILE_REQUIRED', 'The selected profile directory does not exist. Sign in with the provider separately first.');
       const leaf = current === target;
       const trustedSticky = !leaf && entry.uid === o.systemUid && (entry.mode & 0o1000);
+      const externalOwner = entry.uid !== o.uid && entry.uid !== o.systemUid;
       if(entry.isSymbolicLink() || !entry.isDirectory() ||
-        (entry.uid !== o.uid && entry.uid !== o.systemUid) ||
-        (leaf && ownerLeaf && entry.uid !== o.uid) ||
+        (leaf && ownerLeaf && externalOwner) ||
         ((entry.mode & 0o002) && !trustedSticky) ||
         (leaf && privateLeaf && (entry.mode & 0o077)))
         throw failure('UNSAFE_PATH', `Setup refused an unsafe directory owner, link, or permission mode: ${current}`);
-      if((entry.mode & 0o020) && !trustedSticky) {
-        const approved = Array.isArray(o.trustedDirectories) && o.trustedDirectories.some(item =>
-          item?.path === current && item.uid === entry.uid && item.gid === entry.gid);
-        if(!approved) {
-          if(o.sharedDirectoryReview) o.sharedDirectoryReview.set(current, {path:current, uid:entry.uid, gid:entry.gid});
-          else throw failure('DIRECTORY_TRUST_REQUIRED', `A directory is writable by a shared group. Connect Provider again to review and trust it: ${current}`);
-        }
-      }
+      if(hasPathTrust(current, o, 'directory') || (!trustedSticky && (externalOwner || (entry.mode & 0o020))))
+        requirePathTrust(current, entry, o, 'directory');
     }
     return target;
   }
@@ -138,8 +153,10 @@ function createSetup(dependencies = {}) {
     try { real = await io.realpath(absolute(file, code)); } catch { throw failure(code, 'The native executable was not found on this Linux host.'); }
     await safeDirectories(path.dirname(real), o, {ownerLeaf:false});
     const entry = await io.stat(real);
-    if(!entry.isFile() || !(entry.mode & 0o111) || (entry.mode & 0o022) || ![o.systemUid, o.uid].includes(entry.uid))
-      throw failure(code, 'The executable must be a trusted, non-writable native Linux binary.');
+    if(!entry.isFile() || !(entry.mode & 0o111) || (entry.mode & 0o002))
+      throw failure(code, 'The executable must be a trusted native Linux binary that is not writable by everyone.');
+    if(hasPathTrust(real, o, 'executable') || (entry.mode & 0o020) || ![o.systemUid, o.uid].includes(entry.uid))
+      requirePathTrust(real, entry, o, 'executable');
     const handle = await io.open(real, constants.O_RDONLY | constants.O_NOFOLLOW);
     try {
       const magic = Buffer.alloc(4);
@@ -359,11 +376,13 @@ function createSetup(dependencies = {}) {
   }
   function publicConnection(data, loc) {
     return {provider:data.provider, connected:data.status === 'connected', settingsPath:data.settingsPath,
-      reportDir:loc.reportDir, launcherPath:loc.launcherPath, backupPath:path.join(loc.root, data.backupName)};
+      cliLookupPath:data.cliLookupPath, reportDir:loc.reportDir, launcherPath:loc.launcherPath,
+      backupPath:path.join(loc.root, data.backupName)};
   }
   async function writeRuntime(o, loc, data) {
     const nodePath = await nativeExecutable(o.nodePath, o, 'UNSUPPORTED_RUNTIME');
-    const cliPath = await nativeExecutable(data.cliLookupPath, o);
+    const cliOptions = {...o, usedPathTrust:new Map()};
+    const cliPath = await nativeExecutable(data.cliLookupPath, cliOptions);
     const commands = o.provider === 'codex' ? ['/bin/sh', '/usr/bin/timeout'] :
       ['/bin/sh', '/usr/bin/cat', '/usr/bin/tee', '/usr/bin/mktemp', '/usr/bin/mkfifo', '/usr/bin/timeout', '/usr/bin/rm', '/usr/bin/rmdir'];
     for(const command of commands)
@@ -375,8 +394,12 @@ function createSetup(dependencies = {}) {
     const sourcePath = absolute(o.collectorPath);
     const source = await io.readFile(sourcePath);
     if(source.length > 1024 * 1024) throw failure('UNSAFE_PATH', 'The bundled collector is too large.');
+    const trustedCliPathsJson = JSON.stringify([...cliOptions.usedPathTrust.values()]);
+    if(Buffer.byteLength(trustedCliPathsJson) > 32768 || cliOptions.usedPathTrust.size > 128)
+      throw failure('UNSAFE_PATH', 'The reviewed CLI path is too deep to save safely.');
     const args = [nodePath, loc.collectorPath, o.provider === 'codex' ? 'codex-hook' : `${o.provider}-statusline`, '--cli-executable', cliPath,
       '--cli-lookup-path', data.cliLookupPath,
+      '--trusted-cli-paths-json', trustedCliPathsJson,
       '--report-dir', loc.reportDir];
     if(o.provider !== 'codex') args.push(o.provider === 'claude' ? '--claude-auth-status' : '--agy-full-usage');
     const collector = 'ELECTRON_RUN_AS_NODE=1 /usr/bin/timeout --kill-after=1s 12s ' + args.map(quote).join(' ');
@@ -403,7 +426,11 @@ function createSetup(dependencies = {}) {
     await safeDirectories(loc.reportDir, o, {create:true, privateLeaf:true});
     await put(loc.collectorPath, source, o, 0o600);
     await put(loc.launcherPath, launcher, o, 0o700);
-    return createHash('sha256').update(source).digest('hex');
+    return {collectorHash:createHash('sha256').update(source).digest('hex'),cliPath};
+  }
+  async function disableRuntime(o, loc, data) {
+    const action=data.kind==='statusline' && data.hadStatusLine?'exec /usr/bin/cat':'exit 0';
+    await put(loc.launcherPath, Buffer.from(`#!/bin/sh\n# ${MARKER}\n${action}\n`), o, 0o700);
   }
   async function connectProvider(input) {
     const o = options(input);
@@ -419,8 +446,10 @@ function createSetup(dependencies = {}) {
             throw failure('SETTINGS_CHANGED', 'The installed Codex hook was edited. Review it before reconnecting or disconnecting.');
         } else if(!isDeepStrictEqual(found.config.statusLine, data.installedStatusLine))
           throw failure('SETTINGS_CHANGED', 'The installed status line was edited. Review it before reconnecting or disconnecting.');
-        await writeRuntime(o, loc, data);
-        return publicConnection(data, loc);
+        const nextData={...data,cliPath:found.cliPath,cliLookupPath:found.cliLookupPath};
+        const runtime=await writeRuntime(o, loc, nextData);nextData.cliPath=runtime.cliPath;
+        await put(loc.receiptPath, json(nextData), o, 0o600);
+        return publicConnection(nextData, loc);
       }
       if(o.provider === 'codex') {
         if(codexHookState(found.config, installedCodexHook(loc.launcherPath)).managed.length)
@@ -449,7 +478,7 @@ function createSetup(dependencies = {}) {
         next={...found.config,statusLine:installedStatusLine};
       }
       await put(path.join(loc.root, data.backupName), found.bytes || json({}), o, 0o600);
-      await writeRuntime(o, loc, data);
+      const runtime=await writeRuntime(o, loc, data);data.cliPath=runtime.cliPath;
       // Save recovery information before touching provider settings. If a crash
       // occurs, disconnect checks the installed value before restoring one key.
       await put(loc.receiptPath, json(data), o, 0o600);
@@ -502,6 +531,7 @@ function createSetup(dependencies = {}) {
         await safeDirectories(loc.root, o, {privateLeaf:true});
         const data = await receipt(o, loc);
         if(data?.status !== 'connected' || data.ownerStoragePath !== absolute(o.storagePath)) continue;
+        await nativeExecutable(data.cliLookupPath, o);
         await safeDirectories(loc.reportDir, o, {privateLeaf:true});
         const config = parse(await readSafe(data.settingsPath, o));
         if(data.kind === 'codex-hook') {
@@ -526,7 +556,11 @@ function createSetup(dependencies = {}) {
               if(state.exact.length!==1 || state.managed.length!==1)
                 throw failure('SETTINGS_CHANGED','The installed Codex hook was edited. Runtime was not refreshed.');
             }
-            await writeRuntime(o, current, data); refreshed.push(provider);
+            try {
+              const runtime=await writeRuntime(o, current, data);
+              if(data.cliPath!==runtime.cliPath) {data.cliPath=runtime.cliPath;await put(current.receiptPath,json(data),o,0o600);}
+              refreshed.push(provider);
+            } catch(error) {await disableRuntime(o,current,data);throw error;}
           }
         });
       } catch(error) { if(error.code !== 'SETUP_BUSY') warnings.push(`${provider}: saved collector runtime could not be refreshed; reconnect after reviewing setup.`); }

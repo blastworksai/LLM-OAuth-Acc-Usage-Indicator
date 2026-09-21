@@ -9,6 +9,7 @@ const os=require('node:os');
 const {createHash,randomBytes}=require('node:crypto');
 const {spawn}=require('node:child_process');
 const MAX_REPORT=32768,MAX_NATIVE_STDERR=8192,MAX_INPUT=1048576,MAX_HEAD=524288,MAX_TAIL=262144,MAX_FDS=512,MAX_TRANSCRIPTS=32;
+const MAX_CLI_TRUST=32768,MAX_CLI_TRUST_ITEMS=128;
 const MAX_PRUNE_ENTRIES=1024,MAX_PUBLISHED_ENTRIES=120;
 const COVERAGE='Only windows supplied by this session. Other account limits may be unavailable.';
 const CODEX_PLANS=new Set(['free','go','plus','pro','prolite','team','self_serve_business_prolite','self_serve_business_usage_based','business','ent26','enterprise_cbp_automation','enterprise_cbp_usage_based','enterprise','edu','edu_plus','edu_pro']);
@@ -73,6 +74,61 @@ async function executablePaths(executable,lookupPath) {
   try{expected.add(await fs.realpath(lookupPath));}catch(error){if(error.code!=='ENOENT')throw error;}
  }
  return expected;
+}
+function cliTrust(raw) {
+ if(raw===undefined)return new Map();
+ if(typeof raw!=='string' || Buffer.byteLength(raw)>MAX_CLI_TRUST)fail('invalid-cli-trust');
+ let items;try{items=JSON.parse(raw);}catch{fail('invalid-cli-trust');}
+ if(!Array.isArray(items) || items.length>MAX_CLI_TRUST_ITEMS)fail('invalid-cli-trust');
+ const trusted=new Map();
+ for(const item of items) {
+  const keys=object(item)?Object.keys(item).sort():[];
+  if(keys.join(',')!=='gid,kind,mode,path,uid' || !['directory','executable'].includes(item.kind) ||
+    typeof item.path!=='string' || !path.isAbsolute(item.path) || path.normalize(item.path)!==item.path ||
+    !Number.isSafeInteger(item.uid) || item.uid<0 || !Number.isSafeInteger(item.gid) || item.gid<0 ||
+    !Number.isSafeInteger(item.mode) || item.mode<0 || item.mode>0o7777)fail('invalid-cli-trust');
+  const key=`${item.kind}:${item.path}`;if(trusted.has(key))fail('invalid-cli-trust');trusted.set(key,item);
+ }
+ return trusted;
+}
+function enforceCliTrust(file,kind,info,trusted,required) {
+ const saved=trusted.get(`${kind}:${file}`);
+ if((saved && (saved.uid!==info.uid || saved.gid!==info.gid || saved.mode!==(info.mode&0o7777))) || (!saved && required))
+  fail('cli-trust-review-required');
+}
+async function validateCliTarget(file,trusted,{uid=process.getuid?.(),systemUid=0}={}) {
+ let directory,executable;
+ try {
+  let current='/';directory=await fs.open('/',C.O_RDONLY|C.O_DIRECTORY);
+  const parent=path.dirname(file),segments=parent.split('/').filter(Boolean);
+  for(let index=0;index<segments.length;index++) {
+   current=path.join(current,segments[index]);
+   const next=await fs.open(`/proc/self/fd/${directory.fd}/${segments[index]}`,C.O_RDONLY|C.O_DIRECTORY|C.O_NOFOLLOW);
+   await directory.close();directory=next;
+   const info=await directory.stat(),leaf=index===segments.length-1;
+   const stickySystem=!leaf && info.uid===systemUid && !!(info.mode&0o1000);
+   const external=info.uid!==uid && info.uid!==systemUid;
+   if(!info.isDirectory() || ((info.mode&0o002) && !stickySystem))fail('unsafe-cli-path');
+   enforceCliTrust(current,'directory',info,trusted,!stickySystem && (external || (info.mode&0o020)));
+  }
+  executable=await fs.open(`/proc/self/fd/${directory.fd}/${path.basename(file)}`,C.O_RDONLY|C.O_NOFOLLOW|C.O_NONBLOCK);
+  const info=await executable.stat(),external=info.uid!==uid && info.uid!==systemUid;
+  if(!info.isFile() || !(info.mode&0o111) || (info.mode&0o002))fail('unsafe-cli-path');
+  enforceCliTrust(file,'executable',info,trusted,external || (info.mode&0o020));
+ } catch(error) {if(error instanceof CollectorError)throw error;fail('unsafe-cli-path');}
+ finally {await executable?.close();await directory?.close();}
+}
+async function trustedExecutablePaths(executable,lookupPath,trustedJson,options={}) {
+ if(typeof executable!=='string' || !path.isAbsolute(executable))fail('absolute-cli-executable-required');
+ if(lookupPath!==undefined && (typeof lookupPath!=='string' || !path.isAbsolute(lookupPath)))fail('absolute-cli-lookup-path-required');
+ const targets=new Set();
+ for(const candidate of [executable,lookupPath])if(candidate!==undefined) {
+  try{targets.add(await fs.realpath(candidate));}catch(error){if(error.code!=='ENOENT')fail('unsafe-cli-path');}
+ }
+ if(!targets.size)fail('cli-executable-unavailable');
+ const trusted=cliTrust(trustedJson);
+ for(const target of targets)await validateCliTarget(target,trusted,options);
+ return targets;
 }
 async function checkedProcess(pid,executable,options={}) {
  const expected=options.executablePaths||await executablePaths(executable,options.cliLookupPath),record=await processRecord(pid,options);
@@ -508,6 +564,7 @@ async function runCollection(args,raw,capturedAt=utcNow(),options={}) {
  // A native usage query may itself run a statusline. Its observation-only hook
  // is suppressed so there can be no recursive query or replacement snapshot.
  if(!['codex-read','codex-fd'].includes(args.mode) && process.env.ACCOUNT_USAGE_NATIVE_QUERY==='1')return null;
+ options={...options,executablePaths:await trustedExecutablePaths(args.cliExecutable,args.cliLookupPath,args.trustedCliPathsJson,options)};
  let report;
  if(['codex-fd','codex-read'].includes(args.mode))report=await codexFdReport(args.pid,args.cliExecutable,capturedAt,options);
  else {
@@ -515,7 +572,6 @@ async function runCollection(args,raw,capturedAt=utcNow(),options={}) {
   if(args.mode==='antigravity-statusline' && args.agyFullUsage && (!object(data) || data.agent_state!=='idle'))return null;
   // Freeze both trusted native targets once. A self-updater may move the stable
   // lookup between invocations; it cannot change this invocation's binding.
-  options={...options,executablePaths:await executablePaths(args.cliExecutable,args.cliLookupPath)};
   const identity=await findCliAncestor(options.startPid||process.pid,args.cliExecutable,options);
   if(args.mode==='claude-statusline') {
    report=claudeReport(data,identity,capturedAt);
@@ -540,7 +596,7 @@ async function runCollection(args,raw,capturedAt=utcNow(),options={}) {
  await publishReport(args.reportDir,report,options);return report;
 }
 function parseArgs(argv) {
- const args={mode:argv[0]},valueFlags={'--report-dir':'reportDir','--cli-executable':'cliExecutable','--cli-lookup-path':'cliLookupPath','--pid':'pid','--original-argv-json':'originalArgvJson'},booleanFlags={'--claude-auth-status':'claudeAuthStatus','--claude-account':'claudeAuthStatus','--agy-full-usage':'agyFullUsage'};
+ const args={mode:argv[0]},valueFlags={'--report-dir':'reportDir','--cli-executable':'cliExecutable','--cli-lookup-path':'cliLookupPath','--trusted-cli-paths-json':'trustedCliPathsJson','--pid':'pid','--original-argv-json':'originalArgvJson'},booleanFlags={'--claude-auth-status':'claudeAuthStatus','--claude-account':'claudeAuthStatus','--agy-full-usage':'agyFullUsage'};
  if(!['claude-statusline','antigravity-statusline','codex-hook','codex-fd','codex-read'].includes(args.mode))fail('invalid-mode');
  for(let i=1;i<argv.length;i++) {
   const flag=argv[i];if(Object.hasOwn(booleanFlags,flag))args[booleanFlags[flag]]=true;
@@ -600,5 +656,5 @@ async function main(argv=process.argv.slice(2)) {
  } catch {process.stderr.write('usage-collector: collection-unavailable\n');return ['codex-fd','codex-read'].includes(args.mode)?1:0;}
  finally{await saved?.close();if(tempDir)await fs.rmdir(tempDir).catch(()=>{});}
 }
-module.exports={CollectorError,processRecord,checkedProcess,findCliAncestor,openDirectory,openTranscript,readMeta,latestQuota,baseReport,claudeReport,antigravityReport,parseAntigravityUsage,boundedNative,antigravityNativeUsage,claudeAuthMetadata,codexProfileEnvironment,codexAppServerObservation,codexNativeReport,codexFromStream,codexReport,codexFdReport,publishReport,runCollection,parseArgs,timestamp,number,validEmail,main};
+module.exports={CollectorError,processRecord,checkedProcess,findCliAncestor,trustedExecutablePaths,openDirectory,openTranscript,readMeta,latestQuota,baseReport,claudeReport,antigravityReport,parseAntigravityUsage,boundedNative,antigravityNativeUsage,claudeAuthMetadata,codexProfileEnvironment,codexAppServerObservation,codexNativeReport,codexFromStream,codexReport,codexFdReport,publishReport,runCollection,parseArgs,timestamp,number,validEmail,main};
 if(require.main===module)main().then(code=>{process.exitCode=code;}).catch(()=>{process.stderr.write('usage-collector: collection-unavailable\n');process.exitCode=1;});

@@ -2,9 +2,8 @@
 
 ## Status
 
-Draft for written review. The simplified direction was agreed in conversation on
-21 September 2026: retain the existing after-turn collector and correct only the
-connection/setup control plane.
+Approved in conversation on 21 September 2026. Retain the existing after-turn
+collector and correct only the connection/setup control plane.
 
 ## Outcome
 

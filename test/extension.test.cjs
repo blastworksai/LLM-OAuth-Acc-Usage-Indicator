@@ -309,6 +309,15 @@ test('unavailable foreign topology never falls back to host profile setup',async
  assert.equal(h.discovered.length,0);assert.equal(h.connected.length,0);assert.equal(h.handoffCalls.length,0);
  assert.equal(h.errors.length,1);
 });
+test('foreign reuse during first ancestry matching cannot fall through to host setup',async()=>{
+ const {createProviderDetector}=require('../src/provider.cjs');let reads=0;
+ const detect=createProviderDetector({uid:1000,processIds:async function*(){yield 30;},getProcess:async pid=>pid===10?
+  {pid:10,ppid:1,uid:1000,start_ticks:'10',boot_id:'boot',pgrp:10,tty_nr:1,tpgid:30}:
+  {pid:30,ppid:10,uid:2000,start_ticks:++reads===1?'30':'reused',boot_id:'boot',pgrp:30,tty_nr:1,tpgid:30}});
+ const h=harness({terminal:terminal(),detect:pid=>detect(pid,{allowForeign:true,topologyOnly:true})});
+ await h.commands.get('llmAccountUsage.connect')();
+ assert.equal(h.errors.length,1);assert.equal(h.discovered.length,0);assert.equal(h.connected.length,0);assert.equal(h.handoffCalls.length,0);
+});
 test('cancelled, unsafe, unreadable or mismatched cross-user results persist no feed',async()=>{
   for(const outcome of ['cancel','wrong-owner','feed','descriptor','mismatch','changed-terminal']) {
     const connection=foreignConnection();let h;
@@ -337,7 +346,51 @@ test('an older managed runtime retains its last report and offers an explicit re
     reports:[report],match:async()=>({status:'ready',report})});
   await h.api.refresh();assert.equal(h.api.getState().report,report);assert.equal(h.api.getState().needsReconnect,true);
   assert.equal(h.api.getState().setupTarget.provider,'claude');assert.equal(h.api.getState().reconnectConnection.id,connection.id);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.api.getState().reconnectTarget)),{provider:'claude',process:report.process});
   assert.match(h.api.getHtml(),/Reconnect/);assert.equal(h.api.getViewModel().stale,true);
+});
+test('command-palette reconnect refuses a replacement process behind a retained profile card',async()=>{
+ const connection={...foreignConnection(),runtimeVersion:'0.3.0'},first=target('claude',30,2000);
+ const report={provider:'claude',process:first.process};let detected=first;
+ const h=harness({terminal:terminal(),detect:async()=>detected,managed:[connection.reportDir],descriptors:[connection],
+  reports:[report],match:async()=>({status:'ready',report}),confirm:'Copy setup command',handoff:async()=>({ok:false})});
+ await h.api.refresh();assert.equal(h.api.getState().needsReconnect,true);
+ detected=target('claude',40,2000);
+ await h.commands.get('llmAccountUsage.connect')();
+ assert.equal(h.handoffCalls.length,0);assert.equal(h.discovered.length,0);assert.equal(h.connected.length,0);
+});
+test('reconnect state refuses changed birth, boot, owner, provider or missing identity before any setup',async()=>{
+ for(const mutation of ['birth','boot','owner','provider','missing']) {
+  const first=target('claude',30,2000),connection={...foreignConnection(),runtimeVersion:'0.3.0'},report={provider:'claude',process:first.process};let detected=first;
+  const h=harness({terminal:terminal(),detect:async()=>detected,managed:[connection.reportDir],descriptors:[connection],
+   reports:[report],match:async()=>({status:'ready',report}),confirm:'Connect'});
+  await h.api.refresh();assert.equal(h.api.getState().needsReconnect,true);
+  if(mutation==='missing')delete h.api.getState().reconnectTarget;
+  else detected={...first,...(mutation==='provider'?{provider:'codex'}:{}),process:{...first.process,
+   ...({birth:{start_ticks:'31'},boot:{boot_id:'other'},owner:{uid:1000}}[mutation]||{})}};
+  await h.commands.get('llmAccountUsage.connect')();
+  assert.equal(h.handoffCalls.length,0,mutation);assert.equal(h.discovered.length,0,mutation);assert.equal(h.connected.length,0,mutation);
+ }
+});
+test('reconnect discovery cannot attach a retained report to another detected process',async()=>{
+ const first=target('claude',30,2000),connection={...foreignConnection(),runtimeVersion:'0.3.0'},report={provider:'claude',process:first.process};
+ const h=harness({terminal:terminal(),detect:async()=>target('claude',40,2000),managed:[connection.reportDir],descriptors:[connection],
+  reports:[report],match:async()=>({status:'ready',report})});
+ await h.api.refresh();assert.equal(h.api.getState().needsReconnect,undefined);assert.equal(h.api.getState().reconnectTarget,undefined);
+ assert.equal(h.api.getState().report,report);
+});
+test('an exact reconnect keeps its captured report/profile through a concurrent UI refresh',async()=>{
+ const first=target('claude',30,2000),connection={...foreignConnection(),runtimeVersion:'0.3.0'},report={provider:'claude',process:first.process};let h;
+ h=harness({terminal:terminal(),detect:async()=>first,managed:[connection.reportDir],descriptors:[connection],reports:[report],
+  match:async()=>({status:'ready',report}),confirm:()=>{
+   // The asynchronous dialog must not reread a different controller state.
+   h.api.getState().reconnectConnection={...connection,profilePath:'/another',reportDir:'/another-feed'};
+   return 'Copy setup command';
+  },handoff:async()=>({ok:false})});
+ await h.api.refresh();await h.commands.get('llmAccountUsage.connect')();
+ assert.equal(h.handoffCalls.length,1);assert.equal(h.handoffCalls[0].profilePath,connection.profilePath);
+ assert.equal(h.handoffCalls[0].reportDir,connection.reportDir);assert.equal(h.handoffCalls[0].target.process.pid,30);
+ assert.equal(h.discovered.length,0);assert.equal(h.connected.length,0);
 });
 test('a generic foreign reconnect cannot pair another selected provider with the retained profile',async()=>{
  const connection={...foreignConnection(),runtimeVersion:'0.3.0'},targetProcess=target('claude',30,2000).process;

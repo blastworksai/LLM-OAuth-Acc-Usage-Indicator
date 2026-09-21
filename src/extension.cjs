@@ -59,8 +59,9 @@ function activate(context) {
         const old=await readFeeds([connection.reportDir]);
         if(old.reports.some(value=>JSON.stringify(value)===JSON.stringify(result.report))) {
           const target=await detectProvider(pid,{allowForeign:true});
-          if((target?.provider===connection.provider || target?.provider===null) && target.process?.uid===connection.uid)
-            Object.assign(result,{needsReconnect:true,setupTarget:target,reconnectConnection:connection});
+          if((target?.provider===connection.provider || target?.provider===null) && sameProcess(target.process,result.report.process))
+            Object.assign(result,{needsReconnect:true,setupTarget:target,reconnectConnection:connection,
+              reconnectTarget:{provider:result.report.provider,process:{...result.report.process}}});
           break;
         }
       }
@@ -157,10 +158,18 @@ function activate(context) {
       await vscode.window.showInformationMessage('Provider connections currently support Linux terminal hosts.');return;
     }
     const selected=vscode.window.activeTerminal;
+    const reconnect=controller.state.needsReconnect?{connection:controller.state.reconnectConnection,target:controller.state.reconnectTarget}:null;
+    const matchesReconnect=(current,provider=current?.provider)=>!reconnect || !!(reconnect.connection && reconnect.target &&
+      reconnect.connection.provider===reconnect.target.provider && sameProcess(reconnect.target.process,current?.process) &&
+      (provider===null || provider===reconnect.target.provider));
     const offered=fromCard?controller.state.setupTarget:null;
     if(fromCard && !offered)return;
     const pid=selected?await selected.processId:null;
     const detected=pid?await detectProvider(pid,{allowForeign:true}):null;
+    if(!matchesReconnect(detected)) {
+      await vscode.window.showInformationMessage('The reconnect session changed. Select its original terminal and try again.');
+      await refresh();return;
+    }
     if(fromCard && (selected!==vscode.window.activeTerminal ||
       ((offered.provider!==null || offered.process) && !sameTarget(offered,detected)))) {await refresh();return;}
     await setupReady;
@@ -177,15 +186,16 @@ function activate(context) {
       const currentTarget=detected?await detectProvider(pid):null;
       const currentPid=selected?await selected.processId:null;
       if(selected!==vscode.window.activeTerminal || currentPid!==pid ||
-        (detected && !sameTarget(detected,currentTarget))) {
+        (detected && !sameTarget(detected,currentTarget)) || !matchesReconnect(currentTarget,picked.provider)) {
         await vscode.window.showInformationMessage('The selected terminal changed. Select its session and connect again.');
         await refresh();return false;
       }
       return setup.connectProvider(options);
     };
     try {
+      if(!matchesReconnect(detected,picked.provider))throw safeError('PROVIDER_MISMATCH','Choose the same provider as the profile being reconnected.');
       if(detected && detected.process.uid!==process.getuid()) {
-        if(await crossUser({selected,pid,target:{...detected,provider:picked.provider},connection:controller.state.needsReconnect?controller.state.reconnectConnection:undefined})) {
+        if(await crossUser({selected,pid,target:{...detected,provider:picked.provider},connection:reconnect?.connection})) {
           await vscode.window.showInformationMessage(`${providerName(picked.provider)} connected. Finish a fresh turn to publish account usage.`);
           await refresh();
         }

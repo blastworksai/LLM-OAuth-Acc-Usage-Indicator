@@ -120,7 +120,13 @@ function createProviderDetector({platform=process.platform,uid=process.getuid?.(
     if(++inspected>MAX_PROCESSES)return unavailable;
     const current=await checked(pid);
     if(current.uid===uid || !current.tty_nr || current.tpgid<=0 || current.pgrp!==current.tpgid)continue;
-    if((await matchReports(terminalPid,[{process:current}],checked)).status==='ready') {
+    const stableCandidate=async observedPid=>{
+     const next=await checked(observedPid);
+     if(observedPid===current.pid && (!sameForeground(current,next)||current.ppid!==next.ppid))
+      throw new Error('changed-foreign-topology');
+     return next;
+    };
+    if((await matchReports(terminalPid,[{process:current}],stableCandidate)).status==='ready') {
      candidates.push({process:current});if(candidates.length>1)return unavailable;
     }
    }

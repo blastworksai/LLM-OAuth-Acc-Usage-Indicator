@@ -334,6 +334,17 @@ function createSetup(dependencies = {}) {
     await safeDirectories(parent,o);
     const names=[];
     let count=0;
+    if(reserveSlot)for(const provider of PROVIDERS) {
+      const legacy=legacyLocations(o,provider);
+      // Admission only reads the owner's receipts. A separate review map lets
+      // it count valid legacy state without approving shared ancestors for use.
+      const review={...o,provider:undefined,sharedDirectoryReview:new Map()};
+      try {
+        if(!await stat(legacy.root))continue;
+        await safeDirectories(legacy.root,review,{privateLeaf:true});
+        if(await receipt(review,legacy))count++;
+      } catch { /* An invalid legacy receipt does not consume a connection. */ }
+    }
     for await(const entry of await io.opendir(parent)) {
       if(++count>(reserveSlot?127:128))throw failure('TOO_MANY_CONNECTIONS','Too many saved profile connections were found.');
       if(entry.isDirectory()&&/^v2-[a-f0-9]{32}$/.test(entry.name))names.push(entry.name);

@@ -506,6 +506,70 @@ test('connection capacity rejects creation while existing connections remain usa
   assert.deepEqual((await f.setup.refreshRuntime(f.options)).refreshed,[first.id]);
   assert.equal((await f.setup.disconnectProvider({...f.options,connectionId:first.id})).connected,false);
 });
+test('mixed legacy and v2 capacity rejects a new profile before reserving or changing it',async t=>{
+ const f=await fixture(t),legacy=await seedLegacyConnection(f);
+ const existingProfile=await createProfile(f,'existing'),existing=await f.setup.connectProvider({...f.options,profilePath:existingProfile});
+ const parent=path.join(f.homeDir,'.local/state/llm-account-usage/connections');
+ for(let i=0;i<126;i++)await fs.mkdir(path.join(parent,`v2-${i.toString(16).padStart(32,'0')}`),{mode:0o700});
+ const profilePath=await createProfile(f,'overflow'),before=await fs.readFile(legacy.receiptPath);
+ await assert.rejects(f.setup.connectProvider({...f.options,profilePath}),{code:'TOO_MANY_CONNECTIONS'});
+ assert.equal((await fs.readdir(parent)).length,127);
+ assert.deepEqual(await readJson(path.join(profilePath,'settings.json')),{profile:'overflow'});
+ assert.deepEqual(await fs.readFile(legacy.receiptPath),before);
+ const reconnected=await f.setup.connectProvider(f.options);
+ assert.equal(reconnected.legacy,true);assert.equal(reconnected.launcherPath,legacy.launcherPath);
+ assert.equal((await f.setup.connectProvider({...f.options,profilePath:existingProfile})).id,existing.id);
+ assert.equal((await fs.readdir(parent)).length,127);
+});
+test('all providers share the legacy capacity budget while damaged legacy receipts stay isolated',async t=>{
+ const f=await fixture(t),legacy=await seedLegacyConnection(f);
+ const damaged=path.join(f.homeDir,'.local/state/llm-account-usage/providers/codex');await fs.mkdir(damaged,{mode:0o700});
+ const damagedReceipt=path.join(damaged,'connection.json');await fs.writeFile(damagedReceipt,'corrupt',{mode:0o600});
+ const parent=path.join(f.homeDir,'.local/state/llm-account-usage/connections');await fs.mkdir(parent,{mode:0o700});
+ for(let i=0;i<126;i++)await fs.mkdir(path.join(parent,`v2-${i.toString(16).padStart(32,'0')}`),{mode:0o700});
+ const profilePath=path.join(f.homeDir,'new-codex');await fs.mkdir(profilePath,{mode:0o700});await writeJson(path.join(profilePath,'hooks.json'),{profile:'codex'});
+ const before=await fs.readFile(legacy.receiptPath);
+ const last=await f.setup.connectProvider({...f.options,provider:'codex',profilePath});assert.equal(last.provider,'codex');
+ assert.equal((await fs.readdir(parent)).length,127);
+ const overflow=await createProfile(f,'overflow');
+ await assert.rejects(f.setup.connectProvider({...f.options,profilePath:overflow}),{code:'TOO_MANY_CONNECTIONS'});
+ assert.equal((await f.setup.listConnections(f.options)).length,2);
+ assert.equal(await fs.readFile(damagedReceipt,'utf8'),'corrupt');assert.deepEqual(await fs.readFile(legacy.receiptPath),before);
+ assert.deepEqual(await readJson(path.join(overflow,'settings.json')),{profile:'overflow'});
+});
+test('a valid legacy receipt behind unapproved shared ancestry still consumes capacity without granting trust',async t=>{
+ const f=await fixture(t),legacy=await seedLegacyConnection(f);
+ await fs.chmod(path.dirname(legacy.root),0o2770);
+ const parent=path.join(f.homeDir,'.local/state/llm-account-usage/connections');await fs.mkdir(parent,{mode:0o700});
+ for(let i=0;i<127;i++)await fs.mkdir(path.join(parent,`v2-${i.toString(16).padStart(32,'0')}`),{mode:0o700});
+ const profilePath=await createProfile(f,'overflow'),before=await fs.readFile(legacy.receiptPath);
+ await assert.rejects(f.setup.connectProvider({...f.options,profilePath}),{code:'TOO_MANY_CONNECTIONS'});
+ assert.equal((await fs.readdir(parent)).length,127);assert.deepEqual(await fs.readFile(legacy.receiptPath),before);
+ assert.deepEqual(await readJson(path.join(profilePath,'settings.json')),{profile:'overflow'});
+ await assert.rejects(f.setup.connectProvider(f.options),{code:'TOO_MANY_CONNECTIONS'});
+ assert.equal(f.options.trustedDirectories,undefined);
+ const preview=await f.setup.discoverProvider(f.options);
+ const reconnected=await f.setup.connectProvider({...f.options,trustedDirectories:preview.sharedDirectories});
+ assert.equal(reconnected.launcherPath,legacy.launcherPath);assert.equal((await fs.readdir(parent)).length,127);
+});
+test('concurrent mixed legacy and v2 admission cannot reserve the final slot twice',async t=>{
+ const f=await fixture(t),legacy=await seedLegacyConnection(f);
+ const parent=path.join(f.homeDir,'.local/state/llm-account-usage/connections');await fs.mkdir(parent,{mode:0o700});
+ for(let i=0;i<126;i++)await fs.mkdir(path.join(parent,`v2-${i.toString(16).padStart(32,'0')}`),{mode:0o700});
+ const profileA=await createProfile(f,'racing-a'),profileB=await createProfile(f,'racing-b');
+ const preview=await f.setup.discoverProvider({...f.options,profilePath:profileA}),rootA=path.join(parent,preview.id);
+ let release,entered;const gate=new Promise(resolve=>{release=resolve;}),reached=new Promise(resolve=>{entered=resolve;});
+ const io=new Proxy(fs,{get(target,key){if(key==='mkdir')return async(file,...args)=>{if(file===rootA){entered();await gate;}return target.mkdir(file,...args);};return target[key];}});
+ const connecting=createSetup({fs:io}).connectProvider({...f.options,profilePath:profileA});await reached;
+ try {
+  assert.equal((await f.setup.connectProvider(f.options)).launcherPath,legacy.launcherPath);
+  await assert.rejects(f.setup.connectProvider({...f.options,profilePath:profileB}),{code:'SETUP_BUSY'});
+ } finally {release();}
+ await connecting;
+ await assert.rejects(f.setup.connectProvider({...f.options,profilePath:profileB}),{code:'TOO_MANY_CONNECTIONS'});
+ assert.equal((await fs.readdir(parent)).length,127);
+ assert.deepEqual(await readJson(path.join(profileB,'settings.json')),{profile:'racing-b'});
+});
 
 test('concurrent connection creation cannot claim the same final capacity slot',async t=>{
   const f=await fixture(t);

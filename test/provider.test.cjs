@@ -67,6 +67,21 @@ test('foreign topology rechecks the original terminal after final ancestry match
   proc(10,1,{start_ticks:++terminalReads>=6?'changed':'10'}):proc(20,10,{uid:2000})});
  assert.deepEqual(await f.detect(10,{allowForeign:true,topologyOnly:true}),{provider:null,unavailable:true});
 });
+test('foreign reuse during the first ancestry match remains unavailable instead of absent',async()=>{
+ for(const mutation of [{start_ticks:'21'},{uid:1000},{boot_id:'changed'},{ppid:1},{pgrp:10,tpgid:10}]) {
+  let reads=0;
+  const f=fixture({processIds:async function*(){yield 20;},getProcess:async pid=>pid===10?proc(10,1):
+   proc(20,10,{uid:2000,...(++reads>1?mutation:{})})});
+  assert.deepEqual(await f.detect(10,{allowForeign:true,topologyOnly:true}),{provider:null,unavailable:true});
+ }
+});
+test('stable unrelated, background and host-owned processes do not become foreign targets',async()=>{
+ for(const candidate of [proc(20,10),proc(20,1,{uid:2000}),proc(20,10,{uid:2000,pgrp:10}),
+  proc(20,10,{uid:2000,tty_nr:2,pgrp:30,tpgid:30})]) {
+  const f=fixture({processIds:async function*(){yield 20;},getProcess:async pid=>pid===10?proc(10,1):candidate});
+  assert.equal(await f.detect(10,{allowForeign:true,topologyOnly:true}),null);
+ }
+});
 test('target-user verification resolves only the same live native selected provider',async t=>{
  const {verifyTargetProcess}=require('../src/provider.cjs');
  const directory=await fs.mkdtemp(path.join(os.tmpdir(),'target-provider-'));t.after(()=>fs.rm(directory,{recursive:true,force:true}));

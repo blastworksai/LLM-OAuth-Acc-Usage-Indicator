@@ -39,6 +39,52 @@ test('the exact foreground provider may run as another Linux user',async()=>{
   process:{pid:20,uid:2000,start_ticks:'20',boot_id:'boot'}
  });
 });
+test('explicit foreign discovery survives host EACCES without claiming a provider',async()=>{
+ const f=fixture({getExecutable:async()=>{throw Object.assign(new Error('readlink denied'),{code:'EACCES'});}});
+ f.processes[1]=proc(20,10,{uid:2000});
+ assert.equal(await f.detect(10),null,'automatic detection still requires executable proof');
+ assert.deepEqual(await f.detect(10,{allowForeign:true}),{
+  provider:null,cliPath:null,process:{pid:20,uid:2000,start_ticks:'20',boot_id:'boot'}
+ });
+});
+test('foreign topology fails closed for ambiguity, unreadable ancestry, reuse and terminal changes',async()=>{
+ for(const mutation of ['ambiguous','unreadable','birth','uid','boot','background','terminal','terminal-owner','terminal-foreground']) {
+  let scanned=false;
+  const f=fixture({getExecutable:async()=>{throw Object.assign(new Error('denied'),{code:'EACCES'});},
+   processIds:async function*(){yield 10;yield 20;if(mutation==='ambiguous')yield 30;scanned=true;},
+   getProcess:async pid=>{
+    if(pid===10)return proc(10,1,scanned?({'terminal':{start_ticks:'99'},'terminal-owner':{uid:2000},'terminal-foreground':{tpgid:10}}[mutation]||{}):{});
+    if(pid===30)return proc(30,10,{uid:2000});
+    if(mutation==='unreadable')return null;
+    return proc(20,10,{uid:2000,...(scanned?({birth:{start_ticks:'99'},uid:{uid:3000},boot:{boot_id:'changed'},background:{tpgid:10}}[mutation]||{}):{})});
+   }});
+  assert.deepEqual(await f.detect(10,{allowForeign:true,topologyOnly:true}),{provider:null,unavailable:true},mutation);
+ }
+});
+test('foreign topology rechecks the original terminal after final ancestry matching',async()=>{
+ let terminalReads=0;
+ const f=fixture({processIds:async function*(){yield 20;},getProcess:async pid=>pid===10?
+  proc(10,1,{start_ticks:++terminalReads>=6?'changed':'10'}):proc(20,10,{uid:2000})});
+ assert.deepEqual(await f.detect(10,{allowForeign:true,topologyOnly:true}),{provider:null,unavailable:true});
+});
+test('target-user verification resolves only the same live native selected provider',async t=>{
+ const {verifyTargetProcess}=require('../src/provider.cjs');
+ const directory=await fs.mkdtemp(path.join(os.tmpdir(),'target-provider-'));t.after(()=>fs.rm(directory,{recursive:true,force:true}));
+ const bin=path.join(directory,'bin');await fs.mkdir(bin);
+ const native=path.join(directory,'native');await fs.copyFile(process.execPath,native);await fs.chmod(native,0o755);
+ await fs.symlink(native,path.join(bin,'claude'));await fs.writeFile(path.join(bin,'codex'),'#!/bin/sh\n',{mode:0o755});
+ const target={provider:'claude',process:{...identity,uid:2000}};
+ const dependencies={uid:2000,env:{PATH:bin},home:directory,getProcess:async()=>proc(20,10,{uid:2000}),getExecutable:async()=>native};
+ assert.deepEqual(await verifyTargetProcess(target,dependencies),{...target,cliPath:path.join(bin,'claude')});
+ for(const change of ['owner','reuse','boot','provider','shell','exit','foreground','exec-change']) {
+  let reads=0;
+  const next={...dependencies,
+   ...(change==='owner'?{uid:1000}:{}),
+   getProcess:async()=>change==='exit'?null:proc(20,10,{uid:2000,...({reuse:{start_ticks:'99'},boot:{boot_id:'other'},foreground:{tpgid:10}}[change]||{})}),
+   getExecutable:async()=>change==='shell'||(change==='exec-change'&&++reads>1)?path.join(bin,'codex'):native};
+  assert.equal(await verifyTargetProcess({...target,...(change==='provider'?{provider:'codex'}:{})},next),null,change);
+ }
+});
 test('an unrelated other-user provider is never selected',async()=>{
  const f=fixture({getExecutable:async pid=>pid===10?'/usr/bin/bash':'/opt/releases/claude/2.0.0'});
  f.processes.push(proc(30,1,{uid:2000}));

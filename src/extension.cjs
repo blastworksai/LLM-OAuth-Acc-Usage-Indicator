@@ -2,7 +2,7 @@
 const vscode=require('vscode');
 const path=require('node:path');
 const os=require('node:os');
-const {readFeeds,matchReports,buildRows,SelectionController}=require('./core.cjs');
+const {readFeeds,readFeedBatches,matchReports,buildRows,SelectionController}=require('./core.cjs');
 const {detectProvider}=require('./provider.cjs');
 const {connectionForTarget,sameProcess,publicPath,validatePublicConnection}=require('./connection.cjs');
 const {prepareHandoff}=require('./handoff.cjs');
@@ -11,14 +11,16 @@ const {buildViewModel,renderContent,renderDocument}=require('./panel.cjs');
 const setup=require('./setup.cjs');
 
 function activate(context) {
-  let view, assets={}, lastContent='';
+  let view, assets={}, lastContent='',handoffBusy=false;
   const pendingCrossUser=new Map(),runtimeVersion=context.extension.packageJSON.version;
+  const capacityError=()=>Object.assign(new Error('Too many report directories. Keep at most 128 local, 128 target-user and 128 configured feeds.'),{safeToDisplay:true});
+  const bounded=(values)=>{if(!Array.isArray(values)||values.length>128)throw capacityError();return values;};
   const managedDirectories=()=>{
     const saved=context.globalState.get('managedFeedDirectories',[]);
-    return Array.isArray(saved)?[...new Set(saved.filter(publicPath))].slice(0,128):[];
+    return [...new Set(bounded(saved).filter(publicPath))];
   };
   const managedConnections=async(includeDisconnected=false)=>{
-    const {connections}=await readConnectionFeeds(managedDirectories());
+    const {connections}=await readFeedBatches(managedDirectories(),readConnectionFeeds,{key:'connections',maximum:128});
     return connections.filter(value=>value.connected||includeDisconnected).map(value=>({...value,pendingProcess:pendingCrossUser.get(value.id)}));
   };
   const setupOptions={storagePath:context.globalStorageUri.fsPath,nodePath:process.execPath,
@@ -43,10 +45,11 @@ function activate(context) {
     if(!pid)return {status:'unavailable',reason:'The terminal does not expose a process on this host.'};
     await setupReady;
     const shared=await managedConnections();
-    const connections=[...await setup.listConnections(setupOptions).catch(()=>[]),...shared];
+    const connections=[...bounded(await setup.listConnections(setupOptions).catch(()=>[])),...shared];
     const dirs=[...connections.map(connection=>connection.reportDir),
-      ...vscode.workspace.getConfiguration('llmAccountUsage').get('feedDirectories',[])];
-    const {reports,rejected}=await readFeeds(dirs);
+      ...bounded(vscode.workspace.getConfiguration('llmAccountUsage').get('feedDirectories',[]))];
+    const {reports,rejected,overflow}=await readFeedBatches(dirs,readFeeds);
+    if(overflow)return {status:'unavailable',reason:capacityError().message};
     const result=await matchReports(pid,reports);
     if(result.status==='ready') {
       // Reports remain authoritative. Find the descriptor through its feed,
@@ -55,8 +58,8 @@ function activate(context) {
         value.provider===result.report.provider && value.uid===result.report.process.uid)) {
         const old=await readFeeds([connection.reportDir]);
         if(old.reports.some(value=>JSON.stringify(value)===JSON.stringify(result.report))) {
-          const target=await detectProvider(pid);
-          if(target?.provider===connection.provider && target.process.uid===connection.uid)
+          const target=await detectProvider(pid,{allowForeign:true});
+          if((target?.provider===connection.provider || target?.provider===null) && target.process?.uid===connection.uid)
             Object.assign(result,{needsReconnect:true,setupTarget:target,reconnectConnection:connection});
           break;
         }
@@ -64,7 +67,7 @@ function activate(context) {
     }
     if(result.status==='unavailable' && rejected)result.reason='No matching readable report. A report directory is missing, unreadable or unsafe.';
     if(result.status==='unavailable') {
-      const target=await detectProvider(pid);
+      const target=await detectProvider(pid,{allowForeign:true});
       const connection=connectionForTarget(connections,target);
       if(target&&(!connection || (connection.runtimeVersion&&connection.runtimeVersion!==runtimeVersion)))result.setupTarget=target;
       else if(connection)result.reason='This profile is connected. Waiting for this session to finish a fresh turn.';
@@ -89,11 +92,15 @@ function activate(context) {
   const sameTarget=(a,b)=>a && b && a.provider===b.provider && a.cliPath===b.cliPath &&
     sameProcess(a.process,b.process);
   const safeError=(code,message)=>Object.assign(new Error(message),{code,safeToDisplay:true});
-  const crossUser=async({selected,pid,target,action='connect',connection})=>{
+  const performCrossUser=async({selected,pid,target,action='connect',connection})=>{
+    if(connection && connection.provider!==target.provider)
+      throw safeError('PROVIDER_MISMATCH','Choose the same provider as the profile being reconnected.');
     const revalidate=async()=>{
-      const current=await detectProvider(pid),currentPid=await selected.processId;
-      return selected===vscode.window.activeTerminal && currentPid===pid && sameTarget(target,current)?current:null;
+      const current=await detectProvider(pid,{allowForeign:true,topologyOnly:target.cliPath===null}),currentPid=await selected.processId;
+      const matches=target.cliPath===null?current?.provider===null&&!current.unavailable&&sameProcess(target.process,current.process):sameTarget(target,current);
+      return selected===vscode.window.activeTerminal && currentPid===pid && matches?current:null;
     };
+    if(action==='connect' && managedDirectories().length>=128 && !managedDirectories().includes(connection?.reportDir))throw capacityError();
     const handoff=await prepareHandoff({extensionPath:context.extensionPath,provider:target.provider,target,action,
       connectionId:connection?.id,runtimeVersion,revalidate,
       ...(connection?{reportDir:connection.reportDir,...(action==='connect'?{profilePath:connection.profilePath}:{})}:{})});
@@ -130,12 +137,20 @@ function activate(context) {
       if(descriptors.rejected || descriptors.connections.length!==1 || !validatePublicConnection(descriptors.connections[0]) ||
         !Object.keys(value).every(key=>descriptors.connections[0][key]===value[key]))
         throw safeError('CONNECTION_FEED_UNREADABLE','The target-user connection descriptor could not be verified.');
-      if(action==='connect')managed.add(value.reportDir);else managed.delete(value.reportDir);
+      if(action==='connect') {
+        if(!managed.has(value.reportDir)&&managed.size>=128)throw capacityError();
+        managed.add(value.reportDir);
+      } else managed.delete(value.reportDir);
       if(cancellation.isCancellationRequested || !await revalidate())return false;
       await context.globalState.update('managedFeedDirectories',[...managed]);
       if(action==='connect')pendingCrossUser.set(value.id,{...target.process});else pendingCrossUser.delete(value.id);
       return true;
     } finally {const cleanup=await handoff.dispose();if(cleanup?.warning)await vscode.window.showWarningMessage(cleanup.warning);}
+  };
+  const crossUser=async options=>{
+    if(handoffBusy)throw safeError('SETUP_IN_PROGRESS','Target-user setup is already in progress. Finish or cancel it before starting another.');
+    handoffBusy=true;
+    try {return await performCrossUser(options);}finally {handoffBusy=false;}
   };
   const connect=async(fromCard=false)=>{
     if(process.platform!=='linux') {
@@ -145,16 +160,17 @@ function activate(context) {
     const offered=fromCard?controller.state.setupTarget:null;
     if(fromCard && !offered)return;
     const pid=selected?await selected.processId:null;
-    const detected=pid?await detectProvider(pid):null;
+    const detected=pid?await detectProvider(pid,{allowForeign:true}):null;
     if(fromCard && (selected!==vscode.window.activeTerminal ||
-      (offered.provider!==null && !sameTarget(offered,detected)))) {await refresh();return;}
+      ((offered.provider!==null || offered.process) && !sameTarget(offered,detected)))) {await refresh();return;}
     await setupReady;
+    if(detected?.unavailable) {await showSetupError(safeError('TARGET_UNAVAILABLE','The selected terminal process cannot be verified. Select one live foreground session and connect again.'));return;}
     const choices=[
       {label:'Codex',provider:'codex'},
       {label:'Claude Code',provider:'claude'},
       {label:'Antigravity',provider:'antigravity'}
     ];
-    const picked=detected || await vscode.window.showQuickPick(
+    const picked=detected?.provider?detected:await vscode.window.showQuickPick(
       choices,{title:'Connect an account usage provider',placeHolder:'Choose the CLI running in this terminal.'});
     if(!picked)return;
     const connectCurrent=async options=>{
@@ -169,7 +185,7 @@ function activate(context) {
     };
     try {
       if(detected && detected.process.uid!==process.getuid()) {
-        if(await crossUser({selected,pid,target:detected,connection:controller.state.needsReconnect?controller.state.reconnectConnection:undefined})) {
+        if(await crossUser({selected,pid,target:{...detected,provider:picked.provider},connection:controller.state.needsReconnect?controller.state.reconnectConnection:undefined})) {
           await vscode.window.showInformationMessage(`${providerName(picked.provider)} connected. Finish a fresh turn to publish account usage.`);
           await refresh();
         }
@@ -236,10 +252,10 @@ function activate(context) {
         {title:'Disconnect account usage profile',placeHolder:'Removes Account Usage while preserving the provider configuration it does not own.'});
       if(!picked)return;
       if(picked.connection.uid!==process.getuid()) {
-        const selected=vscode.window.activeTerminal,pid=selected?await selected.processId:null,target=pid?await detectProvider(pid):null;
-        if(!target || target.provider!==picked.connection.provider || target.process.uid!==picked.connection.uid)
+        const selected=vscode.window.activeTerminal,pid=selected?await selected.processId:null,target=pid?await detectProvider(pid,{allowForeign:true}):null;
+        if(!target || target.unavailable || (target.provider!==null&&target.provider!==picked.connection.provider) || target.process?.uid!==picked.connection.uid)
           throw safeError('TARGET_REQUIRED','Select a running terminal owned by this profile’s Linux user before disconnecting.');
-        if(await crossUser({selected,pid,target,action:'disconnect',connection:picked.connection})) {
+        if(await crossUser({selected,pid,target:{...target,provider:picked.connection.provider},action:'disconnect',connection:picked.connection})) {
           await refresh();await vscode.window.showInformationMessage(`${providerName(picked.connection.provider)} disconnected.`);
         }
         return;

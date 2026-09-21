@@ -11,7 +11,7 @@ const invalid=()=>Object.assign(new Error('The target-user setup result could no
 async function prepareHandoff({extensionPath,provider,target,action='connect',connectionId,tempRoot=os.tmpdir(),fs:io=fs,
   runtimeVersion,revalidate,profilePath,reportDir}) {
   if(!['claude','codex','antigravity'].includes(provider)||!['connect','disconnect'].includes(action)||!publicPath(extensionPath)||
-    !publicPath(target?.cliPath)||!Number.isSafeInteger(target?.process?.uid)||target.process.uid<0||
+    !(target?.cliPath===null||publicPath(target?.cliPath))||!Number.isSafeInteger(target?.process?.uid)||target.process.uid<0||
     !Number.isSafeInteger(target.process.pid)||target.process.pid<=0||!/^\d{1,30}$/.test(target.process.start_ticks||'')||
     typeof target.process.boot_id!=='string'||!target.process.boot_id.length||target.process.boot_id.length>128||
     /[\x00-\x1f\x7f]/.test(target.process.boot_id)||
@@ -22,13 +22,13 @@ async function prepareHandoff({extensionPath,provider,target,action='connect',co
     runtimeVersion=runtimeVersion??JSON.parse(await io.readFile(path.join(extensionPath,'package.json'),'utf8')).version;
     if(!validVersion(runtimeVersion))throw invalid();
   }
-  const verify=revalidate||(()=>require('./provider.cjs').detectProvider(target.terminalPid||target.process.pid));
+  const verify=revalidate||(()=>require('./provider.cjs').detectProvider(target.terminalPid||target.process.pid,{allowForeign:true,topologyOnly:target.cliPath===null}));
   const root=await io.mkdtemp(path.join(tempRoot,'llm-account-usage-'));
   let drop,disposed=false,cleanupResult;
   const rootHandle=await io.open(root,constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
   const rootAnchor=`/proc/self/fd/${rootHandle.fd}`,directories=new Map();
   const filename=`${randomUUID()}.json`;
-  const manifest=['src/setup-cli.cjs','src/setup.cjs','src/connection.cjs','src/connection-feed.cjs','collectors/passive.cjs'];
+  const manifest=['src/setup-cli.cjs','src/setup.cjs','src/connection.cjs','src/connection-feed.cjs','src/provider.cjs','src/core.cjs','collectors/passive.cjs'];
   const identity=await io.lstat(root);
   async function dispose() {
     if(disposed)return cleanupResult;disposed=true;
@@ -76,8 +76,9 @@ async function prepareHandoff({extensionPath,provider,target,action='connect',co
     const dropPath=path.join(root,'results');await io.mkdir(dropPath,{mode:0o1733});await io.chmod(dropPath,0o1733);
     drop=await io.open(dropPath,constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
     const resultPath=path.join(dropPath,filename);
-    const args=action==='connect'?['--provider',provider,'--cli',target.cliPath,'--result',resultPath,'--runtime-version',runtimeVersion,
+    const args=action==='connect'?['--provider',provider,...(target.cliPath?['--cli',target.cliPath]:[]),'--result',resultPath,'--runtime-version',runtimeVersion,
       ...(profilePath?['--profile',profilePath]:[]),...(reportDir?['--report-dir',reportDir]:[])]:['--connection-id',connectionId,'--result',resultPath];
+    if(target.cliPath===null)args.push('--target',JSON.stringify({provider,process:target.process}));
     const command=`node ${quote(path.join(root,'src/setup-cli.cjs'))} ${action} `+args.map((value,index)=>index%2?quote(value):value).join(' ');
     async function readResult() {
       if(disposed)throw invalid();
@@ -97,13 +98,14 @@ async function prepareHandoff({extensionPath,provider,target,action='connect',co
           const connection=result.connection;
           if(Object.keys(result).length!==2||!validatePublicConnection(connection)||connection.provider!==provider||
             connection.uid!==expected.process.uid||connection.connected!==(action==='connect')||
-            (action==='connect'&&(connection.runtimeVersion!==runtimeVersion || connection.cliLookupPath!==expected.cliPath))||
+            (action==='connect'&&(connection.runtimeVersion!==runtimeVersion || (expected.cliPath!==null&&connection.cliLookupPath!==expected.cliPath)))||
             (action==='disconnect'&&connection.id!==connectionId)||
             (profilePath&&connection.profilePath!==profilePath)||(reportDir&&connection.reportDir!==reportDir))throw invalid();
         } else if(result.ok!==false||Object.keys(result).length!==3||!['CANCELLED','SETUP_FAILED'].includes(result.code)||
           typeof result.message!=='string'||result.message.length>512||/[\x00-\x1f\x7f]/.test(result.message))throw invalid();
         const current=await verify();
-        if(disposed||!current||current.provider!==expected.provider||current.cliPath!==expected.cliPath||!sameProcess(current.process,expected.process))throw invalid();
+        if(disposed||!current||current.unavailable||current.provider!==(expected.cliPath===null?null:expected.provider)||
+          current.cliPath!==expected.cliPath||!sameProcess(current.process,expected.process))throw invalid();
         return result.ok?result:{ok:false,code:result.code,message:result.code==='CANCELLED'?'Setup cancelled.':'Target-user setup could not finish.'};
       } catch {throw invalid();}
       finally {await file?.close();}

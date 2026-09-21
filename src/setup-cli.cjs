@@ -6,9 +6,9 @@ const path=require('node:path');
 const {randomUUID}=require('node:crypto');
 const {publicPath:absolute,runtimeVersion:version}=require('./connection.cjs');
 function parse(argv) {
-  if(!Array.isArray(argv)||argv.length>15)throw new Error('arguments');
-  const [action,...args]=argv,allowed=action==='connect'?['provider','cli','result','profile','report-dir','runtime-version']:
-    action==='disconnect'?['connection-id','result']:[];
+  if(!Array.isArray(argv)||argv.length>17)throw new Error('arguments');
+  const [action,...args]=argv,allowed=action==='connect'?['provider','cli','result','profile','report-dir','runtime-version','target']:
+    action==='disconnect'?['connection-id','result','target']:[];
   if(!allowed.length || args.length%2)throw new Error('arguments');
   const values={action};
   for(let i=0;i<args.length;i+=2) {
@@ -17,8 +17,17 @@ function parse(argv) {
     values[key]=args[i+1];
   }
   if(!absolute(values.result))throw new Error('arguments');
+  if(Object.hasOwn(values,'target')) {
+    const target=JSON.parse(values.target),p=target?.process;
+    if(!target||Object.keys(target).length!==2||!['claude','codex','antigravity'].includes(target.provider)||!p||
+      Object.keys(p).length!==4||!['pid','uid','start_ticks','boot_id'].every(key=>Object.hasOwn(p,key))||
+      !Number.isSafeInteger(p.pid)||p.pid<=0||!Number.isSafeInteger(p.uid)||p.uid<0||!/^\d{1,30}$/.test(p.start_ticks)||
+      typeof p.start_ticks!=='string'||typeof p.boot_id!=='string'||!p.boot_id.length||p.boot_id.length>128||/[\x00-\x1f\x7f]/.test(p.boot_id))throw new Error('arguments');
+    values.target=target;
+  }
   if(action==='connect') {
-    if(!['claude','codex','antigravity'].includes(values.provider)||!absolute(values.cli)||!version(values['runtime-version']))throw new Error('arguments');
+    if(!['claude','codex','antigravity'].includes(values.provider)||
+      (values.target?(values.target.provider!==values.provider||Object.hasOwn(values,'cli')):!absolute(values.cli))||!version(values['runtime-version']))throw new Error('arguments');
     for(const key of ['profile','report-dir'])if(Object.hasOwn(values,key)&&!absolute(values[key]))throw new Error('arguments');
   } else if(!/^v2-[a-f0-9]{32}$/.test(values['connection-id']||''))throw new Error('arguments');
   return values;
@@ -60,9 +69,18 @@ async function run(argv,dependencies={}) {
     storagePath:path.join(homeDir,'.local/state/llm-account-usage/target-setup')};
   const publish=dependencies.writeResult||((file,result)=>writeResult(file,result,dependencies.fs||fs));
   try {
+    const verify=async()=>{
+      if(!args.target)return null;
+      if(args.target.process.uid!==uid)throw new Error('wrong-target-user');
+      const value=await (dependencies.verifyTargetProcess||require('./provider.cjs').verifyTargetProcess)(args.target,{uid,env:options.env,home:homeDir});
+      if(!value||value.provider!==args.target.provider||!absolute(value.cliPath)||
+        !require('./connection.cjs').sameProcess(value.process,args.target.process))throw new Error('unverified-target-process');
+      return value;
+    };
+    const verified=await verify();
     let preview;
     if(args.action==='connect') {
-      Object.assign(options,{provider:args.provider,cliPath:args.cli,sharedFeed:true,...(args.profile?{profilePath:args.profile}:{}),
+      Object.assign(options,{provider:args.provider,cliPath:verified?.cliPath||args.cli,sharedFeed:true,...(args.profile?{profilePath:args.profile}:{}),
         ...(args['report-dir']?{reportDir:args['report-dir']}:{})});
       preview=await setup.discoverProvider(options);
     } else {
@@ -70,6 +88,7 @@ async function run(argv,dependencies={}) {
       preview=(await setup.listDisconnectConnections({...options,sharedDirectoryReview,sharedFeed:true,includeDisconnected:true,
         connectionId:args['connection-id']})).find(value=>value.id===args['connection-id'] && value.uid===uid);
       if(!preview)throw new Error('connection-not-found');
+      if(verified&&preview.provider!==verified.provider)throw new Error('wrong-target-provider');
       preview={...preview,sharedDirectories:[...sharedDirectoryReview.values()]};
       options.connectionId=preview.id;
     }
@@ -85,6 +104,7 @@ async function run(argv,dependencies={}) {
       await publish(args.result,{ok:false,code:'CANCELLED',message:'Setup cancelled.'});return {code:1};
     }
     options.trustedDirectories=preview.sharedDirectories||[];
+    if(verified && (await verify()).cliPath!==verified.cliPath)throw new Error('changed-target-executable');
     if(args.action==='disconnect')options.reportDir=preview.reportDir;
     await (dependencies.ensureReportDirectory||setup.ensureReportDirectory)(options.reportDir,{...options,
       create:args.action==='connect'&&(preview.createReportDirectory??!args['report-dir'])});

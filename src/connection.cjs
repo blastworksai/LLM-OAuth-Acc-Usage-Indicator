@@ -30,7 +30,9 @@ function sameProcess(a,b) {
 }
 function connectionForTarget(connections,target) {
   if(!target || !Array.isArray(connections))return null;
-  const matches=connections.filter(value=>value?.provider===target.provider &&
+  // A completed target-user verification can supply the provider while the
+  // host still cannot read exe. Only its exact, unique pending process binds.
+  const matches=connections.filter(value=>value && (target.provider===null || value.provider===target.provider) &&
     value.uid===target.process?.uid && sameProcess(value.pendingProcess,target.process));
   return matches.length===1?matches[0]:null;
 }

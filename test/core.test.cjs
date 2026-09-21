@@ -17,6 +17,18 @@ const report = (pid = 20, session = 'session-a') => ({
 });
 const table = (...entries) => async pid => entries.find(p => p?.pid === pid) || null;
 
+test('feed batching deduplicates canonical paths and isolates rejected batches within fixed bounds',async()=>{
+ const {readFeedBatches}=require('../src/core.cjs'),calls=[];
+ const directories=Array.from({length:33},(_,index)=>`/feed/${index}`);
+ const read=async batch=>{calls.push(batch);if(batch[0]==='/feed/16')throw new Error('unreadable batch');return {reports:batch,rejected:0};};
+ const result=await readFeedBatches([...directories,'/feed/0/../0',null,'bad\npath'],read);
+ assert.equal(calls.length,3);assert.deepEqual(calls.map(value=>value.length),[16,16,1]);
+ assert.equal(result.rejected,3);assert.equal(result.reports.at(-1),'/feed/32');assert.equal(result.reports.length,17);
+ for(const entries of [Array.from({length:385},(_,index)=>`/feed/${index}`),Array(1153).fill('/feed/0')]) {
+  assert.equal((await readFeedBatches(entries,async()=>assert.fail('overflow must not be partially read'))).overflow,true);
+ }
+});
+
 test('matches exact live ancestry through a different Unix user; ignores title/provider guesses', async () => {
   const r = report(); r.process.uid = 2000;
   const result = await matchReports(10, [r, report(40,'other')], table(proc(10,1),proc(15,10),proc(20,15,2000),proc(40,1)));

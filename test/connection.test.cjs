@@ -51,3 +51,11 @@ test('connectionForTarget requires one exact pending owner and process birth ide
   assert.equal(connectionForTarget([connection],null),null);
   assert.equal(connectionForTarget([connection],{provider:'claude'}),null);
 });
+test('a target-verified pending connection binds unresolved host detection only for its exact unique process',()=>{
+  const connection={id:'first',provider:'claude',uid:2000,pendingProcess:{pid:30,uid:2000,start_ticks:'30',boot_id:'boot'}};
+  const target={provider:null,process:{...connection.pendingProcess}};
+  assert.equal(connectionForTarget([null,connection],target),connection);
+  assert.equal(connectionForTarget([connection,{...connection,id:'second',provider:'codex'}],target),null);
+  assert.equal(connectionForTarget([connection],{...target,process:{...target.process,start_ticks:'31'}}),null);
+  assert.equal(connectionForTarget([{...connection,pendingProcess:undefined}],target),null);
+});

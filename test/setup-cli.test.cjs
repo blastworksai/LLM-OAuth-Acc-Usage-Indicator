@@ -4,6 +4,8 @@ const assert=require('node:assert/strict');
 const {run}=require('../src/setup-cli.cjs');
 const id='v2-'+'a'.repeat(32);
 const argv=['connect','--provider','claude','--cli','/opt/claude','--result','/drop/result.json','--runtime-version','0.4.0'];
+const foreignTarget={provider:'claude',process:{pid:30,uid:2000,start_ticks:'30',boot_id:'boot'}};
+const foreignArgv=['connect','--provider','claude','--target',JSON.stringify(foreignTarget),'--result','/drop/result.json','--runtime-version','0.4.0'];
 function deps(answer='yes') {
   const calls=[],results=[],output=[],feeds=[],directories=[];
   const preview={id,profilePath:'/home/target/.claude',sharedDirectories:[{path:'/opt/native',kind:'directory',uid:0,gid:2000,mode:0o2750}]};
@@ -28,6 +30,25 @@ test('target setup uses its own identity and only explicit options after exact t
   assert.match(d.output.join('\n'),/trust.*owners.*groups/i);
   assert.equal(d.feeds[0][1].runtimeVersion,'0.4.0');
   assert.equal(d.results[0][0],'/drop/result.json');assert.equal(d.results[0][1].ok,true);
+});
+test('foreign target verification precedes preview and repeats after consent before mutation',async()=>{
+ for(const drift of [false,true]) {
+  const d=deps(),order=[];let changed=false;
+  d.verifyTargetProcess=async target=>{order.push('verify');assert.deepEqual(target,foreignTarget);return changed?null:{...target,cliPath:'/opt/claude'};};
+  const discover=d.setup.discoverProvider;d.setup.discoverProvider=async options=>{order.push('preview');assert.equal(options.cliPath,'/opt/claude');return discover(options);};
+  d.readConsent=async()=>{order.push('consent');changed=drift;return 'yes';};
+  assert.equal((await run(foreignArgv,d)).code,drift?1:0);
+  assert.deepEqual(order,['verify','preview','consent','verify']);assert.equal(d.calls.length,drift?0:1);
+  if(drift)assert.equal(d.directories.length,0);
+ }
+});
+test('a foreign target UID or provider mismatch cannot preview a host profile',async()=>{
+ for(const target of [{...foreignTarget,provider:'codex'},{...foreignTarget,process:{...foreignTarget.process,uid:1000}}]) {
+  const d=deps();d.setup.discoverProvider=async()=>assert.fail('unverified target reached preview');
+  d.verifyTargetProcess=async()=>assert.fail('mismatched target must fail locally');
+  const args=foreignArgv.map(value=>value===JSON.stringify(foreignTarget)?JSON.stringify(target):value);
+  assert.notEqual((await run(args,d)).code,0);assert.equal(d.calls.length,0);
+ }
 });
 test('invalid, duplicate, relative, unknown, oversized and malformed version arguments never reach setup',async()=>{
   for(const args of [[],[...argv,'--provider','codex'],[...argv,'--unknown','x'],argv.map(s=>s==='/opt/claude'?'relative':s),

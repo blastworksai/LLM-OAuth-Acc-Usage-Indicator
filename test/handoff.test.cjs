@@ -22,10 +22,11 @@ test('handoff stages exactly immutable readable code and a nonce result dropbox'
   const f=await fixture(t),h=f.handoff;
   assert.equal((await fs.stat(h.root)).mode&0o7777,0o755);
   assert.equal((await fs.stat(path.dirname(h.resultPath))).mode&0o7777,0o1733);
-  for(const file of ['src/setup-cli.cjs','src/setup.cjs','src/connection.cjs','src/connection-feed.cjs','collectors/passive.cjs']) {
+  for(const file of ['src/setup-cli.cjs','src/setup.cjs','src/connection.cjs','src/connection-feed.cjs','src/provider.cjs','src/core.cjs','collectors/passive.cjs']) {
     assert.deepEqual(await fs.readFile(path.join(h.root,file)),await fs.readFile(path.join(extensionPath,file)));
     assert.equal((await fs.stat(path.join(h.root,file))).mode&0o7777,file.startsWith('collectors')?0o444:0o555);
   }
+  assert.equal(typeof require(path.join(h.root,'src/provider.cjs')).verifyTargetProcess,'function','the staged verifier has every runtime dependency');
   assert.match(h.command,/^node '/);assert.doesNotMatch(h.command,/sudo|ELECTRON_RUN_AS_NODE/);
   // The shell decodes every argument literally, including a quoted CLI path.
   const command=h.command.replace(/^node /,'printf \'%s\\n\' ');
@@ -37,6 +38,21 @@ test('handoff stages exactly immutable readable code and a nonce result dropbox'
   assert.deepEqual(await h.readResult(),{ok:true,connection:f.connection});
   await h.dispose();await h.dispose();await assert.rejects(fs.stat(h.root),{code:'ENOENT'});
   await assert.rejects(h.readResult(),/setup result could not be verified/i);
+});
+test('unresolved handoff stages process proof and accepts only the same foreign topology and selected provider',async t=>{
+ for(const mutation of ['valid','reuse','provider','ambiguous','executable']) {
+  const target={provider:'claude',cliPath:null,process:{pid:20,uid:process.getuid(),start_ticks:'20',boot_id:'boot'}};
+  let changed=false;
+  const f=await fixture(t,{target,revalidate:async()=>mutation==='ambiguous'&&changed?{provider:null,unavailable:true}:
+   {...target,provider:null,...(mutation==='executable'&&changed?{cliPath:'/another'}:{}),
+    process:{...target.process,...(mutation==='reuse'&&changed?{start_ticks:'21'}:{})}}});
+  const decoded=execFileSync('/bin/sh',['-c',f.handoff.command.replace(/^node /,'printf \'%s\\n\' ')],{encoding:'utf8'}).trim().split('\n');
+  assert.equal(decoded.includes('--cli'),false);assert.deepEqual(JSON.parse(decoded[decoded.indexOf('--target')+1]),{provider:'claude',process:target.process});
+  const connection={...f.connection,cliLookupPath:'/home/target/bin/claude',...(mutation==='provider'?{provider:'codex'}:{})};
+  await publish(f.handoff,{ok:true,connection});changed=true;
+  if(mutation==='valid')assert.equal((await f.handoff.readResult()).connection.cliLookupPath,connection.cliLookupPath);
+  else await assert.rejects(f.handoff.readResult(),/could not be verified/);
+ }
 });
 test('result rejects unsafe ownership, mode, type, links, size, schema and changed target',async t=>{
   for(const mutation of ['owner','mode','symlink','hardlink','fifo','oversized','extra','provider','uid','id','version','process']) {

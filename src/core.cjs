@@ -7,6 +7,9 @@ const {createHash}=require('node:crypto');
 const MAX_BYTES = 32768;
 const MAX_FILES = 128;
 const MAX_DIRS = 16;
+// Up to 128 local connections, 128 managed foreign feeds and 128 configured
+// feeds. Inputs are bounded before normalization; no reader call exceeds 16.
+const MAX_FEED_DIRECTORIES = 384;
 const STALE_MS = 15 * 60 * 1000;
 const text = (v, max=256) => typeof v==='string' && v.length>0 && v.length<=max && !/[\x00-\x1f\x7f]/.test(v);
 const object = v => !!v && typeof v==='object' && !Array.isArray(v);
@@ -115,6 +118,8 @@ async function matchReports(terminalPid, reports, getProcess=readProcess) {
 
 async function readFeeds(directories) {
   const reports=[];let rejected=0;
+  if(!Array.isArray(directories))return {reports,rejected:1};
+  if(directories.length>MAX_DIRS)rejected++;
   for(const input of directories.slice(0,MAX_DIRS)) {
     if(typeof input!=='string') {rejected++;continue;}
     const dir=path.resolve(input.startsWith('~/')?path.join(os.homedir(),input.slice(2)):input);
@@ -152,6 +157,25 @@ async function readFeeds(directories) {
     } catch {rejected++;} finally {await directory?.close();}
   }
   return {reports,rejected};
+}
+async function readFeedBatches(directories,reader=readFeeds,{key='reports',maximum=MAX_FEED_DIRECTORIES}={}) {
+  const values=[],seen=new Set();let rejected=0;
+  if(!Array.isArray(directories)||directories.length>MAX_FEED_DIRECTORIES*3)
+    return {[key]:values,rejected:1,overflow:true};
+  for(const input of directories) {
+    if(typeof input!=='string'||!input.length||input.length>4096||/[\x00-\x1f\x7f]/.test(input)){rejected++;continue;}
+    const directory=path.resolve(input.startsWith('~/')?path.join(os.homedir(),input.slice(2)):input);
+    seen.add(directory);
+    if(seen.size>maximum)return {[key]:values,rejected:rejected+1,overflow:true};
+  }
+  const unique=[...seen];
+  for(let offset=0;offset<unique.length;offset+=MAX_DIRS) {
+    try {
+      const result=await reader(unique.slice(offset,offset+MAX_DIRS));
+      values.push(...result[key]);rejected+=result.rejected;
+    } catch {rejected++;}
+  }
+  return {[key]:values,rejected,overflow:false};
 }
 function reportFilename(report){return `${report.provider}-${createHash('sha256').update(report.session_id).digest('hex').slice(0,24)}.json`;}
 
@@ -203,10 +227,11 @@ class SelectionController {
     try {
       const next=terminal ? await this.resolve(terminal) : {status:'no-terminal'};
       if(!this.disposed && generation===this.generation)this.publish({...next,terminalName:terminal?.name});
-    } catch {
-      if(!this.disposed && generation===this.generation)this.publish({status:'unavailable',terminalName:terminal?.name,reason:'Local session report could not be read.'});
+    } catch(error) {
+      if(!this.disposed && generation===this.generation)this.publish({status:'unavailable',terminalName:terminal?.name,
+        reason:error?.safeToDisplay===true?error.message:'Local session report could not be read.'});
     }
   }
   dispose(){this.disposed=true;this.generation++;}
 }
-module.exports={validateReport,readProcess,matchReports,readFeeds,buildRows,SelectionController,reportFilename,planLabel,accountEmail};
+module.exports={validateReport,readProcess,matchReports,readFeeds,readFeedBatches,buildRows,SelectionController,reportFilename,planLabel,accountEmail};

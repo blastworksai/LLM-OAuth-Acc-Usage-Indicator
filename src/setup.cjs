@@ -238,14 +238,14 @@ function createSetup(dependencies = {}) {
     return {id:identity.id, root, receiptPath:path.join(root, 'connection.json'), launcherPath:path.join(root, 'run.sh'),
       collectorPath:path.join(root, 'passive.cjs'), reportDir:path.join(root, 'reports')};
   }
-  async function connectionLocations(o) {
+  async function connectionLocations(o, {reserveSlot=false} = {}) {
     const parent=path.join(absolute(o.homeDir),'.local/state/llm-account-usage/connections');
     if(!await stat(parent))return [];
     await safeDirectories(parent,o);
     const names=[];
     let count=0;
     for await(const entry of await io.opendir(parent)) {
-      if(++count>128)throw failure('TOO_MANY_CONNECTIONS','Too many saved profile connections were found.');
+      if(++count>(reserveSlot?127:128))throw failure('TOO_MANY_CONNECTIONS','Too many saved profile connections were found.');
       if(entry.isDirectory()&&/^v2-[a-f0-9]{32}$/.test(entry.name))names.push(entry.name);
     }
     return names.sort().map(id=>locations(o,{id}));
@@ -467,7 +467,18 @@ function createSetup(dependencies = {}) {
     const o = options(input);
     const found = await inspect(o, {validateStatusLine:false});
     const pending=pendingProcess(o.pendingProcess,o.uid);
-    return locked(o, locations(o,found.identity), async loc => {
+    const loc=locations(o,found.identity);
+    if(!await stat(loc.root)) {
+      // Reserve capacity and create its directory under one cross-process lock.
+      // Keep admission state outside the bounded connection-directory scan.
+      const admission={root:path.join(absolute(o.homeDir),'.local/state/llm-account-usage/.connection-admission')};
+      await locked(o,admission,async()=>{
+        if(await stat(loc.root))return;
+        await connectionLocations(o,{reserveSlot:true});
+        await safeDirectories(loc.root,o,{create:true,privateLeaf:true});
+      });
+    }
+    return locked(o, loc, async loc => {
       let data = await retireMissingHook(o, loc, await receipt(o, loc));
       if(data?.status === 'connected') {
         await claimConnection(o, loc, data);

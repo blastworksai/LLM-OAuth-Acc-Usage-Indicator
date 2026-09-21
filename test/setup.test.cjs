@@ -102,6 +102,55 @@ test('connection directory enumeration refuses more than 128 entries',async t=>{
   await assert.rejects(f.setup.refreshRuntime(f.options),{code:'TOO_MANY_CONNECTIONS'});
 });
 
+test('connection capacity rejects creation while existing connections remain usable',async t=>{
+  const f=await fixture(t);
+  const first=await f.setup.connectProvider(f.options);
+  const parent=path.dirname(path.dirname(first.launcherPath));
+  for(let i=0;i<127;i++)await fs.mkdir(path.join(parent,`v2-${i.toString(16).padStart(32,'0')}`),{mode:0o700});
+  const profilePath=await createProfile(f,'overflow');
+  await assert.rejects(f.setup.connectProvider({...f.options,profilePath}),{code:'TOO_MANY_CONNECTIONS'});
+  assert.equal((await fs.readdir(parent)).length,128);
+  assert.deepEqual(await readJson(path.join(profilePath,'settings.json')),{profile:'overflow'});
+  assert.equal((await f.setup.connectProvider(f.options)).id,first.id);
+  assert.deepEqual((await f.setup.listConnections(f.options)).map(value=>value.id),[first.id]);
+  assert.deepEqual((await f.setup.refreshRuntime(f.options)).refreshed,['claude']);
+  assert.equal((await f.setup.disconnectProvider({...f.options,connectionId:first.id})).connected,false);
+});
+
+test('concurrent connection creation cannot claim the same final capacity slot',async t=>{
+  const f=await fixture(t);
+  const first=await f.setup.connectProvider(f.options);
+  const parent=path.dirname(path.dirname(first.launcherPath));
+  for(let i=0;i<126;i++)await fs.mkdir(path.join(parent,`v2-${i.toString(16).padStart(32,'0')}`),{mode:0o700});
+  const profileA=await createProfile(f,'racing-a'),profileB=await createProfile(f,'racing-b');
+  const preview=await f.setup.discoverProvider({...f.options,profilePath:profileA});
+  const rootA=path.join(parent,preview.id);
+  let release,entered;
+  const gate=new Promise(resolve=>{release=resolve;});
+  const reached=new Promise(resolve=>{entered=resolve;});
+  const io=new Proxy(fs,{get(target,key){
+    if(key==='mkdir')return async(file,...args)=>{
+      if(file===rootA){entered();await gate;}
+      return target.mkdir(file,...args);
+    };
+    return target[key];
+  }});
+  const setup=createSetup({fs:io});
+  const connecting=setup.connectProvider({...f.options,profilePath:profileA});
+  await reached;
+  let competing;
+  try {
+    assert.equal((await f.setup.connectProvider(f.options)).id,first.id);
+    competing=await Promise.allSettled([f.setup.connectProvider({...f.options,profilePath:profileB})]);
+  } finally {release();}
+  await connecting;
+  assert.equal(competing[0].status,'rejected');
+  assert.ok(['SETUP_BUSY','TOO_MANY_CONNECTIONS'].includes(competing[0].reason.code));
+  assert.equal((await fs.readdir(parent)).length,128);
+  assert.deepEqual(await readJson(path.join(profileB,'settings.json')),{profile:'racing-b'});
+  assert.equal((await f.setup.listConnections(f.options)).length,2);
+});
+
 test('fresh connect installs stable private runtime and preserves unrelated config', async t => {
   const f = await fixture(t);
   await writeJson(f.settingsPath, {theme:'dark', permissions:{deny:['example']}});

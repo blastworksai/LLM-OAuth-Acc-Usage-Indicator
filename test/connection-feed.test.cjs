@@ -64,3 +64,15 @@ test('a descriptor writer cannot replace a different profile in an existing feed
   await assert.rejects(writeConnectionFeed(f.dir,other));
   assert.deepEqual(await readConnectionFeeds([f.dir]),{connections:[f.connection],rejected:0});
 });
+test('feed directories require an exact allowed mode before and after opening',async t=>{
+  for(const mode of [0o550,0o500,0o2500,0o2550]) {
+    const f=await fixture(t);await writeConnectionFeed(f.dir,f.connection);await fs.chmod(f.dir,mode);
+    assert.deepEqual(await readConnectionFeeds([f.dir]),{connections:[],rejected:1});
+    await assert.rejects(writeConnectionFeed(f.dir,f.connection));await fs.chmod(f.dir,0o700);
+  }
+  const f=await fixture(t);await writeConnectionFeed(f.dir,f.connection);
+  const io=new Proxy(fs,{get(target,key){if(key==='open')return async(...args)=>{
+    const handle=await fs.open(...args);if(args[0]===f.dir){const stat=handle.stat.bind(handle);handle.stat=async()=>{const value=await stat();value.mode=(value.mode&~0o7777)|0o550;return value;};}return handle;
+  };return target[key];}});
+  assert.deepEqual(await readConnectionFeeds([f.dir],{fs:io}),{connections:[],rejected:1});
+});

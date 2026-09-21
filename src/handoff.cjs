@@ -24,19 +24,50 @@ async function prepareHandoff({extensionPath,provider,target,action='connect',co
   }
   const verify=revalidate||(()=>require('./provider.cjs').detectProvider(target.terminalPid||target.process.pid));
   const root=await io.mkdtemp(path.join(tempRoot,'llm-account-usage-'));
-  let drop,disposed=false;
+  let drop,disposed=false,cleanupResult;
+  const rootHandle=await io.open(root,constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
+  const rootAnchor=`/proc/self/fd/${rootHandle.fd}`,directories=new Map();
+  const filename=`${randomUUID()}.json`;
+  const manifest=['src/setup-cli.cjs','src/setup.cjs','src/connection.cjs','src/connection-feed.cjs','collectors/passive.cjs'];
   const identity=await io.lstat(root);
   async function dispose() {
-    if(disposed)return;disposed=true;
-    await drop?.close();drop=null;
-    const current=await io.lstat(root).catch(error=>{if(error.code!=='ENOENT')throw error;});
-    if(current && current.isDirectory() && current.ino===identity.ino && current.dev===identity.dev && current.uid===identity.uid)
-      await io.rm(root,{recursive:true,force:true});
+    if(disposed)return cleanupResult;disposed=true;
+    let left=false;
+    const attempt=async operation=>{try {await operation();}catch(error){if(error.code!=='ENOENT')left=true;}};
+    const removeFile=async(handle,name,uid)=>attempt(async()=>{
+      const file=`/proc/self/fd/${handle.fd}/${name}`,info=await io.lstat(file);
+      if(!info.isFile()||info.uid!==uid||info.nlink!==1){left=true;return;}
+      // unlink never follows the final component, even if it is swapped here.
+      await io.unlink(file);
+    });
+    try {
+      if(drop)await removeFile(drop,filename,expected.process.uid);
+      for(const name of manifest) {
+        const [directory,file]=name.split('/'),handle=directories.get(directory);
+        if(handle)await removeFile(handle,file,identity.uid);
+      }
+      // Only known, empty directories may be removed. Unexpected entries are
+      // neither enumerated nor traversed; ENOTEMPTY leaves them for the owner.
+      for(const [name,handle] of directories) {
+        await handle.close();await attempt(()=>io.rmdir(`${rootAnchor}/${name}`));
+      }
+      if(drop){await drop.close();drop=null;await attempt(()=>io.rmdir(`${rootAnchor}/results`));}
+      const current=await io.lstat(root).catch(error=>{if(error.code!=='ENOENT')throw error;});
+      if(current && current.isDirectory() && current.ino===identity.ino && current.dev===identity.dev && current.uid===identity.uid)
+        await attempt(()=>io.rmdir(root));
+      else if(current)left=true;
+    } finally {await rootHandle.close();}
+    cleanupResult=left?{removed:false,warning:'Unexpected entries in the setup bundle were left safely in place.'}:{removed:true};
+    return cleanupResult;
   }
   try {
     await io.chmod(root,0o755);
-    for(const name of ['src','collectors']) {await io.mkdir(path.join(root,name),{mode:0o755});await io.chmod(path.join(root,name),0o755);}
-    for(const name of ['src/setup-cli.cjs','src/setup.cjs','src/connection.cjs','src/connection-feed.cjs','collectors/passive.cjs']) {
+    for(const name of ['src','collectors']) {
+      await io.mkdir(`${rootAnchor}/${name}`,{mode:0o755});
+      const handle=await io.open(`${rootAnchor}/${name}`,constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
+      directories.set(name,handle);await handle.chmod(0o755);
+    }
+    for(const name of manifest) {
       const source=path.join(extensionPath,name),info=await io.lstat(source);
       if(!info.isFile()||info.size>1024*1024)throw invalid();
       await io.copyFile(source,path.join(root,name),constants.COPYFILE_EXCL);
@@ -44,7 +75,7 @@ async function prepareHandoff({extensionPath,provider,target,action='connect',co
     }
     const dropPath=path.join(root,'results');await io.mkdir(dropPath,{mode:0o1733});await io.chmod(dropPath,0o1733);
     drop=await io.open(dropPath,constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
-    const filename=`${randomUUID()}.json`,resultPath=path.join(dropPath,filename);
+    const resultPath=path.join(dropPath,filename);
     const args=action==='connect'?['--provider',provider,'--cli',target.cliPath,'--result',resultPath,'--runtime-version',runtimeVersion,
       ...(profilePath?['--profile',profilePath]:[]),...(reportDir?['--report-dir',reportDir]:[])]:['--connection-id',connectionId,'--result',resultPath];
     const command=`node ${quote(path.join(root,'src/setup-cli.cjs'))} ${action} `+args.map((value,index)=>index%2?quote(value):value).join(' ');
@@ -55,7 +86,9 @@ async function prepareHandoff({extensionPath,provider,target,action='connect',co
         try {file=await io.open(`/proc/self/fd/${drop.fd}/${filename}`,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);}
         catch(error) {if(error.code==='ENOENT'&&!disposed)return null;throw error;}
         const st=await file.stat();
-        if(!st.isFile()||st.nlink!==1||st.uid!==expected.process.uid||((st.mode&0o7777)&~0o644)||st.size>32768)throw invalid();
+        if(!st.isFile()||st.uid!==expected.process.uid||((st.mode&0o7777)&~0o644)||st.size>32768)throw invalid();
+        if(st.nlink===2)return null; // Completed publication is unlinking its temporary name.
+        if(st.nlink!==1)throw invalid();
         const bytes=Buffer.alloc(32769),{bytesRead}=await file.read(bytes,0,bytes.length,0);
         if(bytesRead>32768)throw invalid();
         const result=JSON.parse(bytes.toString('utf8',0,bytesRead));

@@ -70,6 +70,29 @@ test('disconnect discovery can review a shared profile without requiring its van
   assert.ok([...sharedDirectoryReview.values()].some(value=>value.path===f.profilePath));
   await f.setup.disconnectProvider({...f.options,connectionId:connection.id,trustedDirectories:[...sharedDirectoryReview.values()]});
 });
+test('feed claims exclude another live installer and retain exact identity after failure',async t=>{
+  const f=await fixture(t),feed=path.join(f.homeDir,'claimed');await fs.mkdir(feed,{mode:0o700});
+  const first='v2-'+'a'.repeat(32),second='v2-'+'b'.repeat(32);
+  let entered,release;const active=new Promise(resolve=>{entered=resolve;}),gate=new Promise(resolve=>{release=resolve;});
+  const work=f.setup.withReportFeedClaim(feed,first,f.options,async()=>{entered();await gate;throw new Error('publication failed');});
+  await active;
+  try {await assert.rejects(f.setup.withReportFeedClaim(feed,second,f.options,async()=>assert.fail('second installer entered')),{code:'SETUP_BUSY'});}
+  finally {release();await assert.rejects(work,/publication failed/);}
+  await assert.rejects(f.setup.withReportFeedClaim(feed,second,f.options,async()=>assert.fail('different identity reused uncertain claim')),{code:'FEED_ALREADY_CLAIMED'});
+  assert.equal(await f.setup.withReportFeedClaim(feed,first,f.options,async()=>true),true);
+});
+test('feed claim recovery removes only a proven dead process marker and rejects unsafe claim files',async t=>{
+  const f=await fixture(t),feed=path.join(f.homeDir,'claimed');await fs.mkdir(feed,{mode:0o700});
+  const id='v2-'+'a'.repeat(32);
+  await f.setup.withReportFeedClaim(feed,id,f.options,async()=>{});
+  const control=path.join(feed,'.connection-control'),lock=path.join(control,'.setup-lock');
+  await fs.mkdir(lock,{mode:0o700});
+  await fs.writeFile(path.join(lock,'owner-00000000-0000-0000-0000-000000000001.json'),JSON.stringify({pid:2147483647,uid:process.getuid(),start_ticks:'1',
+    boot_id:'00000000-0000-0000-0000-000000000000',connectionId:id}),{mode:0o600});
+  assert.equal(await f.setup.withReportFeedClaim(feed,id,f.options,async()=>true),true);
+  const claim=path.join(control,'claim.json');await fs.chmod(claim,0o660);
+  await assert.rejects(f.setup.withReportFeedClaim(feed,id,f.options,async()=>assert.fail('unsafe claim entered')));
+});
 
 async function createProfile(f,name) {
   const profilePath=path.join(f.homeDir,name);

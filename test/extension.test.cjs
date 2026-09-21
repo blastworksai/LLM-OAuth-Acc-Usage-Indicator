@@ -8,7 +8,7 @@ const vm=require('node:vm');
 const {createSetup}=require('../src/setup.cjs');
 
 function harness({discover,connect,disconnect,recover='Recover connection',confirm='Connect',pickPath='/example/profile',pickProvider='claude',pickConnection,savedTrust=[],terminal,detect=async()=>null,connections=[],reports=[],match,collect,
-  uid=1000,handoff,descriptors=[],managed=[],version='0.4.0',cancelProgress=false,feedRejected=0,descriptorRejected=0,
+  uid=1000,handoff,descriptors=[],managed=[],version='0.4.0',cancelProgress=false,feedRejected=0,descriptorRejected=0,cleanupWarning,
   setupApi,storagePath='/example/editor-storage',nodePath='/example/editor-node',extensionPath='/example/extension'}={}) {
   const commands=new Map(),connected=[],discovered=[],errors=[],warnings=[],confirmations=[],storage=new Map([['trustedDirectories',savedTrust],['managedFeedDirectories',managed]]);
   let clipboard='',disposedHandoffs=0;const handoffCalls=[];
@@ -31,7 +31,7 @@ function harness({discover,connect,disconnect,recover='Recover connection',confi
   const exports={};
   const sandbox={module:{exports},exports,process:{platform:'linux',execPath:nodePath,getuid:()=>uid},setInterval:()=>1,clearInterval(){},setTimeout,clearTimeout,
     require:name=>name==='vscode'?vscode:name==='./setup.cjs'?setup:name==='./core.cjs'?core:name==='./collect.cjs'?{collectTerminal:async pid=>{collectionCalls++;return collect?.(pid)??null;}}:name==='./provider.cjs'?{detectProvider:detect}:
-      name==='./handoff.cjs'?{prepareHandoff:async options=>{handoffCalls.push(options);return {command:"node '/bundle/src/setup-cli.cjs' connect",resultPath:'/drop/r',readResult:async()=>handoff(options),dispose:async()=>{disposedHandoffs++;}};}}:
+      name==='./handoff.cjs'?{prepareHandoff:async options=>{handoffCalls.push(options);return {command:"node '/bundle/src/setup-cli.cjs' connect",resultPath:'/drop/r',readResult:async()=>handoff(options),dispose:async()=>{disposedHandoffs++;return cleanupWarning?{removed:false,warning:cleanupWarning}:{removed:true};}};}}:
       name==='./connection-feed.cjs'?{readConnectionFeeds:async directories=>({connections:descriptors.filter(value=>directories.includes(value.reportDir)),rejected:descriptorRejected})}:
       name==='./connection.cjs'?require('../src/connection.cjs'):name==='./panel.cjs'?{buildViewModel:()=>({}),renderContent:()=>'',renderDocument:()=>''}:require(name)};
   vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../src/extension.cjs'),'utf8'),sandbox);
@@ -241,6 +241,20 @@ test('cross-user disconnect runs a target-user handoff and removes only that man
   assert.equal(h.connected.length,0);assert.equal(h.handoffCalls[0].action,'disconnect');
   assert.equal(h.handoffCalls[0].connectionId,connection.id);
   assert.deepEqual([...h.storage.get('managedFeedDirectories')],['/another']);assert.equal(h.disposedHandoffs,1);
+});
+test('a disconnected descriptor remains actionable until verified editor removal completes',async()=>{
+  const connection={...foreignConnection(),connected:false};
+  const h=harness({terminal:terminal(),detect:async()=>target('claude',30,2000),managed:[connection.reportDir],descriptors:[connection],
+    confirm:'Copy setup command',pickConnection:connection.id,handoff:async()=>({ok:true,connection})});
+  await h.commands.get('llmAccountUsage.disconnect')();
+  assert.equal(h.handoffCalls.length,1);assert.deepEqual([...h.storage.get('managedFeedDirectories')],[]);
+});
+test('unexpected handoff cleanup entries are reported without traversing or hiding setup success',async()=>{
+  const connection=foreignConnection(),warning='Unexpected entries in the setup bundle were left safely in place.';
+  const h=harness({terminal:terminal(),detect:async()=>target('claude',30,2000),confirm:'Copy setup command',descriptors:[connection],
+    handoff:async()=>({ok:true,connection}),cleanupWarning:warning});
+  await h.commands.get('llmAccountUsage.connect')();
+  assert.ok(h.warnings.includes(warning));assert.deepEqual([...h.storage.get('managedFeedDirectories')],[connection.reportDir]);
 });
 test('card connects the detected provider without a picker and retains permission confirmation',async()=>{
  for(const provider of ['claude','codex','antigravity']) {

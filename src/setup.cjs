@@ -134,6 +134,27 @@ function createSetup(dependencies = {}) {
     }
     return safeReportDirectory(directory,o);
   }
+  async function withReportFeedClaim(directory,connectionId,input,operation) {
+    const o=options(input);
+    if(!/^v2-[a-f0-9]{32}$/.test(connectionId||'')||typeof operation!=='function')throw failure('INVALID_CONNECTION','A valid profile connection is required.');
+    await safeReportDirectory(directory,o);
+    const loc={root:path.join(directory,'.connection-control'),connectionId};
+    await safeDirectories(loc.root,o,{create:true,privateLeaf:true});
+    if((await stat(loc.root)).uid!==o.uid)throw failure('UNSAFE_REPORT_DIRECTORY','The feed claim must be owned by this user.');
+    return locked(o,loc,async()=>{
+      const file=path.join(loc.root,'claim.json'),bytes=await readSafe(file,o,{privateFile:true,limit:512});
+      if(bytes!==null) {
+        const saved=parse(bytes);
+        if(Object.keys(saved).length!==1||saved.connectionId!==connectionId)
+          throw failure('FEED_ALREADY_CLAIMED','This report feed is reserved for a different profile. Choose a separate feed directory.');
+      }
+      await require('./connection-feed.cjs').checkConnectionFeed(directory,connectionId,{fs:io});
+      // Keep the exact ID even after an interrupted hook/descriptor write.
+      // Only that connection can recover; another profile cannot inherit it.
+      if(bytes===null)await put(file,json({connectionId}),o,0o600);
+      return operation();
+    });
+  }
   async function readSafe(file, o, {privateFile = false, limit = MAX_SETTINGS} = {}) {
     await safeDirectories(path.dirname(file), o);
     const entry = await stat(file);
@@ -274,6 +295,20 @@ function createSetup(dependencies = {}) {
     } catch { /* An unverifiable legacy neighbor cannot select this profile's runtime. */ }
     await safeDirectories(loc.root, o, {allowMissing:true});
     await nativeExecutable(o.nodePath, o, 'UNSUPPORTED_RUNTIME');
+    if(o.sharedFeed) {
+      const saved=await stat(loc.root)?await receipt(o,loc):null;
+      const defaultFeed=path.join(absolute(o.homeDir),'.llm-account-usage-feeds',preview.id);
+      const reportDir=o.reportDir??saved?.reportDir??defaultFeed;
+      const createReportDirectory=reportDir===defaultFeed && !await stat(reportDir);
+      if(createReportDirectory) {
+        await safeDirectories(o.homeDir,o);
+        if((await stat(o.homeDir)).uid!==o.uid)throw failure('UNSAFE_REPORT_DIRECTORY','The home directory must be owned by the target user.');
+        const feedRoot=path.dirname(defaultFeed);
+        if(await stat(feedRoot))await safeReportDirectory(feedRoot,o);
+        else await safeDirectories(feedRoot,o,{allowMissing:true});
+      } else await safeReportDirectory(reportDir,o);
+      Object.assign(preview,{reportDir,createReportDirectory});
+    }
     return {...preview, sharedDirectories:[...o.sharedDirectoryReview.values()]};
   }
   function locations(o, identity) {
@@ -442,7 +477,7 @@ function createSetup(dependencies = {}) {
     const prepared = `${anchor}/.setup-${unique}`, marker = `owner-${unique}.json`;
     let acquired = false, preparedExists = false;
     try {
-      const self = await processIdentity(process.pid);
+      const self = {...await processIdentity(process.pid),...(loc.connectionId?{connectionId:loc.connectionId}:{})};
       await io.mkdir(prepared, {mode:0o700}); preparedExists = true;
       await io.writeFile(`${prepared}/${marker}`, json(self), {mode:0o600, flag:'wx'});
       for(let attempt = 0; attempt < 3; attempt++) {
@@ -703,12 +738,14 @@ function createSetup(dependencies = {}) {
   async function listDisconnectConnections(input) {
     const base=options(input),storagePath=absolute(base.storagePath),results=[];
     for(const {loc,data,error} of await savedConnections(base)) {
-      if(error || data?.status!=='connected')continue;
+      const recovering=base.includeDisconnected===true && base.connectionId===data?.id && data?.status==='disconnected';
+      if(error || (data?.status!=='connected'&&!recovering) || (base.connectionId&&base.connectionId!==data?.id))continue;
       try {
         // Recovery needs the validated receipt even when its CLI or report
         // feed is unavailable. Only disconnectProvider may claim an orphan.
         if(data.ownerStoragePath!==storagePath && await stat(absolute(data.ownerStoragePath)))continue;
         if(base.sharedDirectoryReview)await safeDirectories(path.dirname(data.settingsPath),base);
+        if(base.sharedFeed)await safeReportDirectory(loc.reportDir,base);
         results.push(publicConnection(data,loc));
       } catch { /* An unverifiable owner cannot suppress a sibling receipt. */ }
     }
@@ -747,7 +784,7 @@ function createSetup(dependencies = {}) {
     }
     return {refreshed, warnings};
   }
-  return {discoverProvider, connectProvider, disconnectProvider, listConnections, listDisconnectConnections, refreshRuntime, ensureReportDirectory};
+  return {discoverProvider, connectProvider, disconnectProvider, listConnections, listDisconnectConnections, refreshRuntime, ensureReportDirectory, withReportFeedClaim};
 }
 
 module.exports = {createSetup, ...createSetup()};

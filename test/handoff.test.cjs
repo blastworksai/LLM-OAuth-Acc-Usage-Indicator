@@ -61,7 +61,8 @@ test('result rejects unsafe ownership, mode, type, links, size, schema and chang
       if(mutation==='fifo')execFileSync('/usr/bin/mkfifo',[h.resultPath]);
     }
     changed=true;
-    await assert.rejects(h.readResult(),/setup result could not be verified/i,mutation);
+    if(mutation==='hardlink')assert.equal(await h.readResult(),null,'a two-link result is never accepted');
+    else await assert.rejects(h.readResult(),/setup result could not be verified/i,mutation);
   }
 });
 test('disconnect accepts only the named disconnected profile and verifies the selected process',async t=>{
@@ -75,4 +76,49 @@ test('a result is rejected when process revalidation fails with ENOENT',async t=
   const f=await fixture(t,{revalidate:async()=>{throw Object.assign(new Error('process gone'),{code:'ENOENT'});}});
   await publish(f.handoff,{ok:true,connection:f.connection});
   await assert.rejects(f.handoff.readResult(),/setup result could not be verified/i);
+});
+test('cleanup never traverses unexpected dropbox children or their symlink targets',async t=>{
+  const visited=[];
+  const io=new Proxy(fs,{get(target,key){
+    if(key==='rm')return async(...args)=>{visited.push(args);return fs.rm(...args);};
+    return target[key];
+  }});
+  const f=await fixture(t,{fs:io}),drop=path.dirname(f.handoff.resultPath);
+  const outside=await fs.mkdtemp(path.join(os.tmpdir(),'handoff-outside-'));t.after(()=>fs.rm(outside,{recursive:true,force:true}));
+  const sentinel=path.join(outside,'keep');await fs.writeFile(sentinel,'untouched');
+  await fs.mkdir(path.join(drop,'untrusted'));await fs.symlink(outside,path.join(drop,'untrusted','swappable'));
+  await fs.writeFile(path.join(drop,'untrusted','leave'),'untrusted data');
+  await publish(f.handoff,{ok:true,connection:f.connection});
+  const result=await f.handoff.dispose();
+  assert.equal(visited.length,0,'cleanup must never call recursive removal');
+  assert.equal(await fs.readFile(sentinel,'utf8'),'untouched');
+  assert.equal(await fs.readFile(path.join(drop,'untrusted','leave'),'utf8'),'untrusted data');
+  assert.equal(result.removed,false);assert.match(result.warning,/unexpected entries.*left/i);
+  await assert.rejects(fs.lstat(f.handoff.resultPath),{code:'ENOENT'});
+  await assert.rejects(fs.lstat(path.join(f.handoff.root,'src/setup-cli.cjs')),{code:'ENOENT'});
+});
+test('polling cannot see a partial result while its completed bytes are prepared',async t=>{
+  const f=await fixture(t),{writeResult}=require('../src/setup-cli.cjs');
+  let entered,release;const preparing=new Promise(resolve=>{entered=resolve;}),gate=new Promise(resolve=>{release=resolve;});
+  const io=new Proxy(fs,{get(target,key){if(key==='open')return async(...args)=>{
+    const handle=await fs.open(...args),write=handle.writeFile.bind(handle);
+    handle.writeFile=async bytes=>{entered();await gate;return write(bytes);};return handle;
+  };return target[key];}});
+  const writing=writeResult(f.handoff.resultPath,{ok:true,connection:f.connection},io);
+  await preparing;
+  try {assert.equal(await f.handoff.readResult(),null);}finally {release();await writing;}
+  assert.deepEqual(await f.handoff.readResult(),{ok:true,connection:f.connection});
+});
+test('exclusive completed-result publication tolerates the temporary two-link window',async t=>{
+  const f=await fixture(t),{writeResult}=require('../src/setup-cli.cjs');
+  let entered,release;const linked=new Promise(resolve=>{entered=resolve;}),gate=new Promise(resolve=>{release=resolve;});
+  const io=new Proxy(fs,{get(target,key){if(key==='link')return async(...args)=>{await fs.link(...args);entered(true);await gate;};return target[key];}});
+  const writing=writeResult(f.handoff.resultPath,{ok:true,connection:f.connection},io);
+  const sawLink=await Promise.race([linked,writing.then(()=>false)]);
+  try {
+    assert.equal(sawLink,true);assert.equal((await fs.lstat(f.handoff.resultPath)).nlink,2);
+    assert.equal(await f.handoff.readResult(),null);
+  } finally {release();await writing;}
+  assert.equal((await fs.lstat(f.handoff.resultPath)).nlink,1);
+  assert.equal((await f.handoff.readResult()).ok,true);
 });

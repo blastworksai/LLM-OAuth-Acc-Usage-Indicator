@@ -3,6 +3,7 @@ const fs=require('node:fs/promises');
 const {constants}=require('node:fs');
 const os=require('node:os');
 const path=require('node:path');
+const {randomUUID}=require('node:crypto');
 const {publicPath:absolute,runtimeVersion:version}=require('./connection.cjs');
 function parse(argv) {
   if(!Array.isArray(argv)||argv.length>15)throw new Error('arguments');
@@ -25,8 +26,22 @@ function parse(argv) {
 async function writeResult(file,result,io=fs) {
   const bytes=Buffer.from(JSON.stringify(result)+'\n');
   if(bytes.length>32768)throw new Error('result-too-large');
-  const handle=await io.open(file,constants.O_WRONLY|constants.O_CREAT|constants.O_EXCL|constants.O_NOFOLLOW,0o644);
-  try {await handle.chmod(0o644);await handle.writeFile(bytes);await handle.sync();}finally {await handle.close();}
+  // Linux O_PATH pins a write/execute-only (1733) dropbox without requiring
+  // directory listing permission. Both publication and cleanup use this anchor.
+  const directory=await io.open(path.dirname(file),0x200000|constants.O_DIRECTORY|constants.O_NOFOLLOW);
+  const anchor=`/proc/self/fd/${directory.fd}`,temporary=`${anchor}/.result-${randomUUID()}.tmp`;
+  let handle;
+  try {
+    handle=await io.open(temporary,constants.O_WRONLY|constants.O_CREAT|constants.O_EXCL|constants.O_NOFOLLOW,0o600);
+    await handle.writeFile(bytes);await handle.chmod(0o644);await handle.sync();await handle.close();handle=null;
+    // link is atomic and exclusive: only completed JSON appears, and an
+    // existing nonce can never be overwritten. Readers wait for nlink==1.
+    await io.link(temporary,`${anchor}/${path.basename(file)}`);
+  } finally {
+    await handle?.close();
+    try {await io.unlink(temporary).catch(error=>{if(error.code!=='ENOENT')throw error;});}
+    finally {await directory.close();}
+  }
 }
 async function consent() {
   if(!process.stdin.isTTY)return null;
@@ -47,20 +62,22 @@ async function run(argv,dependencies={}) {
   try {
     let preview;
     if(args.action==='connect') {
-      Object.assign(options,{provider:args.provider,cliPath:args.cli,...(args.profile?{profilePath:args.profile}:{})});
+      Object.assign(options,{provider:args.provider,cliPath:args.cli,sharedFeed:true,...(args.profile?{profilePath:args.profile}:{}),
+        ...(args['report-dir']?{reportDir:args['report-dir']}:{})});
       preview=await setup.discoverProvider(options);
     } else {
       const sharedDirectoryReview=new Map();
-      preview=(await setup.listDisconnectConnections({...options,sharedDirectoryReview})).find(value=>value.id===args['connection-id'] && value.uid===uid);
+      preview=(await setup.listDisconnectConnections({...options,sharedDirectoryReview,sharedFeed:true,includeDisconnected:true,
+        connectionId:args['connection-id']})).find(value=>value.id===args['connection-id'] && value.uid===uid);
       if(!preview)throw new Error('connection-not-found');
       preview={...preview,sharedDirectories:[...sharedDirectoryReview.values()]};
       options.connectionId=preview.id;
     }
     print(`Target UID ${uid}; ${args.action} ${preview.provider||args.provider}.\nProfile: ${preview.profilePath}`);
     if(args.action==='connect') {
-      options.reportDir=args['report-dir']||path.join(homeDir,'.llm-account-usage-feeds',preview.id);
-      print(`Report directory: ${options.reportDir}`);
+      options.reportDir=preview.reportDir||args['report-dir']||path.join(homeDir,'.llm-account-usage-feeds',preview.id);
     }
+    print(`Report directory: ${options.reportDir||preview.reportDir}`);
     print('Only this user’s selected provider configuration and sanitized usage feed will change. No provider process is restarted.');
     for(const item of preview.sharedDirectories||[])print(`${item.kind}: ${item.path} (owner UID ${item.uid}, group GID ${item.gid}, mode ${(item.mode&0o7777).toString(8)})`);
     if(preview.sharedDirectories?.length)print('Continuing trusts the listed owners and everyone who can write through these groups.');
@@ -68,16 +85,18 @@ async function run(argv,dependencies={}) {
       await publish(args.result,{ok:false,code:'CANCELLED',message:'Setup cancelled.'});return {code:1};
     }
     options.trustedDirectories=preview.sharedDirectories||[];
-    let result;
-    if(args.action==='connect') {
-      await (dependencies.ensureReportDirectory||setup.ensureReportDirectory)(options.reportDir,{...options,create:!args['report-dir']});
+    if(args.action==='disconnect')options.reportDir=preview.reportDir;
+    await (dependencies.ensureReportDirectory||setup.ensureReportDirectory)(options.reportDir,{...options,
+      create:args.action==='connect'&&(preview.createReportDirectory??!args['report-dir'])});
+    const connection=await (dependencies.withReportFeedClaim||setup.withReportFeedClaim)(options.reportDir,preview.id,options,async()=>{
       await (dependencies.checkConnectionFeed||require('./connection-feed.cjs').checkConnectionFeed)(options.reportDir,preview.id);
-      result=await setup.connectProvider(options);
-    } else result=await setup.disconnectProvider(options);
-    const connection={};
-    for(const key of ['id','provider','uid','profilePath','settingsPath','connected','cliLookupPath','reportDir','launcherPath','backupPath'])connection[key]=result[key];
-    connection.runtimeVersion=args['runtime-version']||preview.runtimeVersion||'0.0.0';
-    await (dependencies.writeConnectionFeed||require('./connection-feed.cjs').writeConnectionFeed)(connection.reportDir,connection);
+      const result=args.action==='connect'?await setup.connectProvider(options):await setup.disconnectProvider(options);
+      const value={};
+      for(const key of ['id','provider','uid','profilePath','settingsPath','connected','cliLookupPath','reportDir','launcherPath','backupPath'])value[key]=result[key];
+      value.runtimeVersion=args['runtime-version']||preview.runtimeVersion||'0.0.0';
+      await (dependencies.writeConnectionFeed||require('./connection-feed.cjs').writeConnectionFeed)(value.reportDir,value);
+      return value;
+    });
     await publish(args.result,{ok:true,connection});return {code:0};
   } catch {
     const result={ok:false,code:'SETUP_FAILED',message:'Target-user setup could not finish. Review the selected profile, executable and report-directory permissions.'};

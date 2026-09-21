@@ -17,9 +17,9 @@ function activate(context) {
     const saved=context.globalState.get('managedFeedDirectories',[]);
     return Array.isArray(saved)?[...new Set(saved.filter(publicPath))].slice(0,128):[];
   };
-  const managedConnections=async()=>{
+  const managedConnections=async(includeDisconnected=false)=>{
     const {connections}=await readConnectionFeeds(managedDirectories());
-    return connections.filter(value=>value.connected).map(value=>({...value,pendingProcess:pendingCrossUser.get(value.id)}));
+    return connections.filter(value=>value.connected||includeDisconnected).map(value=>({...value,pendingProcess:pendingCrossUser.get(value.id)}));
   };
   const setupOptions={storagePath:context.globalStorageUri.fsPath,nodePath:process.execPath,
     collectorPath:path.join(context.extensionPath,'collectors','passive.cjs'),
@@ -134,7 +134,7 @@ function activate(context) {
       await context.globalState.update('managedFeedDirectories',[...managed]);
       if(action==='connect')pendingCrossUser.set(value.id,{...target.process});else pendingCrossUser.delete(value.id);
       return true;
-    } finally {await handoff.dispose();}
+    } finally {const cleanup=await handoff.dispose();if(cleanup?.warning)await vscode.window.showWarningMessage(cleanup.warning);}
   };
   const connect=async(fromCard=false)=>{
     if(process.platform!=='linux') {
@@ -228,7 +228,7 @@ function activate(context) {
   const disconnect=async()=>{
     try {
       await setupReady;
-      const connections=[...await setup.listDisconnectConnections(setupOptions),...await managedConnections()];
+      const connections=[...await setup.listDisconnectConnections(setupOptions),...await managedConnections(true)];
       const items=connections.map(connection=>({label:providerName(connection.provider),
         description:`UID ${connection.uid} · ${connection.profilePath}`,connection}));
       const picked=await vscode.window.showQuickPick(items,

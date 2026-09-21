@@ -4,15 +4,16 @@ const {constants}=require('node:fs');
 const {randomUUID}=require('node:crypto');
 const {validatePublicConnection,publicPath}=require('./connection.cjs');
 const MAX_BYTES=32768;
+const directoryMode=mode=>[0o700,0o750,0o2700,0o2750].includes(mode&0o7777);
 async function openDirectory(directory,io) {
   if(!publicPath(directory))throw new Error('invalid-feed-directory');
   const before=await io.lstat(directory);
-  if(!before.isDirectory() || ((before.mode&0o7777)&~0o2750) || await io.realpath(directory)!==directory)throw new Error('unsafe-feed-directory');
+  if(!before.isDirectory() || !directoryMode(before.mode) || await io.realpath(directory)!==directory)throw new Error('unsafe-feed-directory');
   const handle=await io.open(directory,constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
   try {
     const pinned=await handle.stat();
     if(!pinned.isDirectory() || pinned.ino!==before.ino || pinned.dev!==before.dev || pinned.uid!==before.uid ||
-      ((pinned.mode&0o7777)&~0o2750) || await io.realpath(directory)!==directory)throw new Error('changed-feed-directory');
+      !directoryMode(pinned.mode) || await io.realpath(directory)!==directory)throw new Error('changed-feed-directory');
     return {handle,uid:pinned.uid,anchor:`/proc/self/fd/${handle.fd}`};
   } catch(error) {await handle.close();throw error;}
 }

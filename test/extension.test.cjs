@@ -8,15 +8,18 @@ const vm=require('node:vm');
 const {createSetup}=require('../src/setup.cjs');
 
 function harness({discover,connect,disconnect,recover='Recover connection',confirm='Connect',pickPath='/example/profile',pickProvider='claude',pickConnection,savedTrust=[],terminal,detect=async()=>null,connections=[],reports=[],match,collect,
+  uid=1000,handoff,descriptors=[],managed=[],version='0.4.0',cancelProgress=false,feedRejected=0,descriptorRejected=0,
   setupApi,storagePath='/example/editor-storage',nodePath='/example/editor-node',extensionPath='/example/extension'}={}) {
-  const commands=new Map(),connected=[],discovered=[],errors=[],warnings=[],confirmations=[],storage=new Map([['trustedDirectories',savedTrust]]);
+  const commands=new Map(),connected=[],discovered=[],errors=[],warnings=[],confirmations=[],storage=new Map([['trustedDirectories',savedTrust],['managedFeedDirectories',managed]]);
+  let clipboard='',disposedHandoffs=0;const handoffCalls=[];
   let provider,receive,picks=0,lastPickItems=[],collectionCalls=0,feedDirectories=[];
   const disposable=()=>({dispose(){}});
-  const vscode={Uri:{file:value=>({fsPath:value}),joinPath:(_base,...parts)=>({fsPath:parts.join('/')})},workspace:{getConfiguration:()=>({get:()=>[]}),onDidChangeConfiguration:disposable},
+  const vscode={ProgressLocation:{Notification:15},env:{clipboard:{writeText:async text=>{clipboard=text;}}},Uri:{file:value=>({fsPath:value}),joinPath:(_base,...parts)=>({fsPath:parts.join('/')})},workspace:{getConfiguration:()=>({get:()=>[]}),onDidChangeConfiguration:disposable},
     window:{activeTerminal:terminal,registerWebviewViewProvider:(_id,value)=>{provider=value;return disposable();},onDidChangeActiveTerminal:disposable,onDidCloseTerminal:disposable,
       showQuickPick:async items=>{picks++;lastPickItems=items;return items.find(item=>pickConnection?item.connection?.id===pickConnection:(item.provider??item.connection?.provider)===pickProvider);},showOpenDialog:async()=>pickPath?[{fsPath:pickPath}]:undefined,
       showInformationMessage:async(message,options,...actions)=>{if(options?.modal){confirmations.push({message,options,actions});return typeof confirm==='function'?confirm():confirm;}},
       showWarningMessage:async(message,action)=>{warnings.push(message);return action?.modal?(typeof recover==='function'?recover():recover):action;},
+      withProgress:async(_options,callback)=>callback({report(){}},{isCancellationRequested:cancelProgress,onCancellationRequested:disposable}),
       showErrorMessage:async message=>{errors.push(message);}},
     commands:{registerCommand:(name,callback)=>{commands.set(name,callback);return disposable();},executeCommand:async()=>{}}};
   const setup=setupApi||{refreshRuntime:async()=>({warnings:[]}),listConnections:async()=>connections,listDisconnectConnections:async()=>connections,
@@ -24,20 +27,22 @@ function harness({discover,connect,disconnect,recover='Recover connection',confi
     connectProvider:async options=>{connected.push(options);return connect?.(options);},
     disconnectProvider:async options=>{connected.push(options);return disconnect?.(options);}};
   const core={SelectionController:require('../src/core.cjs').SelectionController,buildRows:()=>[],
-    readFeeds:async directories=>{feedDirectories=directories;return {reports,rejected:0};},matchReports:match|| (async()=>({status:'unavailable'}))};
+    readFeeds:async directories=>{feedDirectories=directories;return {reports,rejected:feedRejected};},matchReports:match|| (async()=>({status:'unavailable'}))};
   const exports={};
-  const sandbox={module:{exports},exports,process:{platform:'linux',execPath:nodePath},setInterval:()=>1,clearInterval(){},
+  const sandbox={module:{exports},exports,process:{platform:'linux',execPath:nodePath,getuid:()=>uid},setInterval:()=>1,clearInterval(){},setTimeout,clearTimeout,
     require:name=>name==='vscode'?vscode:name==='./setup.cjs'?setup:name==='./core.cjs'?core:name==='./collect.cjs'?{collectTerminal:async pid=>{collectionCalls++;return collect?.(pid)??null;}}:name==='./provider.cjs'?{detectProvider:detect}:
+      name==='./handoff.cjs'?{prepareHandoff:async options=>{handoffCalls.push(options);return {command:"node '/bundle/src/setup-cli.cjs' connect",resultPath:'/drop/r',readResult:async()=>handoff(options),dispose:async()=>{disposedHandoffs++;}};}}:
+      name==='./connection-feed.cjs'?{readConnectionFeeds:async directories=>({connections:descriptors.filter(value=>directories.includes(value.reportDir)),rejected:descriptorRejected})}:
       name==='./connection.cjs'?require('../src/connection.cjs'):name==='./panel.cjs'?{buildViewModel:()=>({}),renderContent:()=>'',renderDocument:()=>''}:require(name)};
   vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../src/extension.cjs'),'utf8'),sandbox);
-  const api=sandbox.module.exports.activate({globalStorageUri:{fsPath:storagePath},extensionPath,subscriptions:[],
+  const api=sandbox.module.exports.activate({globalStorageUri:{fsPath:storagePath},extensionPath,extension:{packageJSON:{version}},subscriptions:[],
     globalState:{get:(key,fallback)=>storage.get(key)??fallback,update:async(key,value)=>{storage.set(key,value);}}});
   const openCard=()=>{
     provider.resolveWebviewView({webview:{asWebviewUri:uri=>uri.fsPath,postMessage:async()=>{},
       onDidReceiveMessage:callback=>{receive=callback;return disposable();}},onDidChangeVisibility:disposable,onDidDispose:disposable});
     return async message=>{receive(message);await new Promise(setImmediate);};
   };
-  return {commands,connected,discovered,errors,warnings,confirmations,storage,openCard,api,vscode,get picks(){return picks;},get lastPickItems(){return lastPickItems;},get collectionCalls(){return collectionCalls;},get feedDirectories(){return feedDirectories;}};
+  return {commands,connected,discovered,errors,warnings,confirmations,storage,openCard,api,vscode,handoffCalls,get clipboard(){return clipboard;},get disposedHandoffs(){return disposedHandoffs;},get picks(){return picks;},get lastPickItems(){return lastPickItems;},get collectionCalls(){return collectionCalls;},get feedDirectories(){return feedDirectories;}};
 }
 const problem=code=>Object.assign(new Error('Choose the required local resource.'),{code,safeToDisplay:true});
 
@@ -103,7 +108,7 @@ async function disconnectFixture(t,{orphan=false,missingCli=false}={}) {
   }
   if(orphan)await io.rmdir(storagePath);
   if(missingCli)await io.unlink(cliPath);
-  return {setup,installed,originals,extensionPath,nodePath:process.execPath,
+  return {setup,installed,originals,extensionPath,nodePath:process.execPath,uid:process.getuid(),
     storagePath:orphan?path.join(homeDir,'replacement-editor'):storagePath};
 }
 
@@ -178,6 +183,65 @@ test('a previously approved exact directory is passed to later setup operations'
 
 const target=(provider,pid=20,uid=1000)=>({provider,cliPath:`/example/native/${{claude:'claude',codex:'codex',antigravity:'agy'}[provider]}`,process:{pid,uid,start_ticks:String(pid),boot_id:'boot'}});
 const terminal=()=>({name:'Example terminal',processId:Promise.resolve(10)});
+function foreignConnection() {
+  const base={provider:'claude',uid:2000,settingsPath:'/home/target/.claude/settings.json'};
+  return {...require('../src/connection.cjs').connectionIdentity(base),profilePath:'/home/target/.claude',connected:true,
+    cliLookupPath:target('claude').cliPath,reportDir:'/home/target/.llm-account-usage-feeds/example',
+    launcherPath:'/home/target/runtime/run.sh',backupPath:'/home/target/runtime/backup.json',runtimeVersion:'0.4.0'};
+}
+test('cross-user Connect stages a command and stores only the validated feed path',async()=>{
+  const foreign=target('claude',30,2000),connection=foreignConnection();
+  const h=harness({terminal:terminal(),detect:async()=>foreign,confirm:'Copy setup command',descriptors:[connection],handoff:async()=>({ok:true,connection})});
+  await h.commands.get('llmAccountUsage.connect')();
+  assert.equal(h.connected.length,0);assert.equal(h.discovered.length,0);
+  assert.match(h.clipboard,/setup-cli\.cjs' connect/);
+  assert.deepEqual([...h.storage.get('managedFeedDirectories')],[connection.reportDir]);
+  assert.deepEqual([...h.storage.keys()].sort(),['managedFeedDirectories','trustedDirectories']);
+  assert.doesNotMatch(JSON.stringify([...h.storage]),/"uid"|profilePath|pendingProcess/);
+  assert.equal(h.disposedHandoffs,1);assert.equal(h.errors.length,0);
+  assert.match(h.confirmations[0].options.detail,/UID 2000/);assert.match(h.confirmations[0].options.detail,/node/);
+  await h.api.refresh();assert.equal(h.api.getState().setupTarget,undefined);
+  assert.match(h.api.getState().reason,/fresh turn/);
+});
+test('cancelled, unsafe, unreadable or mismatched cross-user results persist no feed',async()=>{
+  for(const outcome of ['cancel','wrong-owner','feed','descriptor','mismatch','changed-terminal']) {
+    const connection=foreignConnection();let h;
+    h=harness({terminal:terminal(),detect:async()=>target('claude',30,2000),confirm:'Copy setup command',
+      cancelProgress:outcome==='cancel',feedRejected:outcome==='feed'?1:0,descriptorRejected:outcome==='descriptor'?1:0,
+      descriptors:[outcome==='mismatch'?{...connection,id:'v2-'+'b'.repeat(32)}:connection],handoff:async()=>{
+        if(outcome==='wrong-owner')throw problem('UNVERIFIED_SETUP_RESULT');
+        if(outcome==='changed-terminal')h.vscode.window.activeTerminal=terminal();
+        return {ok:true,connection};
+      }});
+    await h.commands.get('llmAccountUsage.connect')();
+    assert.deepEqual([...h.storage.get('managedFeedDirectories')],[],outcome);assert.equal(h.connected.length,0,outcome);
+    assert.equal(h.disposedHandoffs,1,outcome);
+  }
+});
+test('managed descriptor reload has no persistent pending process and retains reports beside a bad descriptor',async()=>{
+  const connection=foreignConnection();
+  const h=harness({terminal:terminal(),detect:async()=>target('claude',30,2000),managed:[connection.reportDir,'/bad'],descriptors:[connection],descriptorRejected:1});
+  await h.api.refresh();assert.ok(h.api.getState().setupTarget);
+  assert.ok(h.feedDirectories.includes(connection.reportDir));
+});
+test('an older managed runtime retains its last report and offers an explicit reconnect for that profile',async()=>{
+  const connection={...foreignConnection(),runtimeVersion:'0.3.0'};
+  const report={provider:'claude',process:target('claude',30,2000).process};
+  const h=harness({terminal:terminal(),detect:async()=>target('claude',30,2000),managed:[connection.reportDir],descriptors:[connection],
+    reports:[report],match:async()=>({status:'ready',report})});
+  await h.api.refresh();assert.equal(h.api.getState().report,report);assert.equal(h.api.getState().needsReconnect,true);
+  assert.equal(h.api.getState().setupTarget.provider,'claude');assert.equal(h.api.getState().reconnectConnection.id,connection.id);
+  assert.match(h.api.getHtml(),/Reconnect/);assert.equal(h.api.getViewModel().stale,true);
+});
+test('cross-user disconnect runs a target-user handoff and removes only that managed path',async()=>{
+  const connection=foreignConnection();
+  const h=harness({terminal:terminal(),detect:async()=>target('claude',30,2000),managed:[connection.reportDir,'/another'],descriptors:[connection],
+    confirm:'Copy setup command',pickConnection:connection.id,handoff:async()=>({ok:true,connection:{...connection,connected:false}})});
+  await h.commands.get('llmAccountUsage.disconnect')();
+  assert.equal(h.connected.length,0);assert.equal(h.handoffCalls[0].action,'disconnect');
+  assert.equal(h.handoffCalls[0].connectionId,connection.id);
+  assert.deepEqual([...h.storage.get('managedFeedDirectories')],['/another']);assert.equal(h.disposedHandoffs,1);
+});
 test('card connects the detected provider without a picker and retains permission confirmation',async()=>{
  for(const provider of ['claude','codex','antigravity']) {
   const h=harness({terminal:terminal(),detect:async()=>target(provider)}),send=h.openCard();
@@ -266,7 +330,7 @@ test('each exact pending connection without a fresh report waits without a setup
 });
 
 test('the first Claude connection does not suppress Connect Claude for a second process',async()=>{
- const first=target('claude',20,1000),second=target('claude',30,2000);
+ const first=target('claude',20,1000),second=target('claude',30,1000);
  const h=harness({terminal:terminal(),detect:async()=>second,connections:[{
   id:'first',provider:'claude',uid:1000,reportDir:'/feeds/first',pendingProcess:first.process
  }]});
@@ -314,7 +378,7 @@ test('disconnect addresses one profile connection by ID',async()=>{
   {id:'first',provider:'claude',uid:1000,profilePath:'/home/one/.claude',reportDir:'/feeds/first'},
   {id:'second',provider:'claude',uid:2000,profilePath:'/home/two/.claude',reportDir:'/feeds/second'}
  ];
- const h=harness({connections,pickConnection:'second'});
+ const h=harness({connections,pickConnection:'second',uid:2000});
  await h.commands.get('llmAccountUsage.disconnect')();
  assert.equal(h.connected.length,1);
  assert.equal(h.connected[0].connectionId,'second');

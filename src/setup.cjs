@@ -105,6 +105,35 @@ function createSetup(dependencies = {}) {
     }
     return target;
   }
+  async function safeReportDirectory(directory,o) {
+    try {
+      const target=absolute(directory);
+      if(target!==directory)throw new Error('noncanonical');
+      await safeDirectories(target,o);
+      const entry=await stat(target);
+      if(entry.uid!==o.uid || ![0o700,0o750,0o2700,0o2750].includes(entry.mode&0o7777))throw new Error('mode');
+      return target;
+    } catch {throw failure('UNSAFE_REPORT_DIRECTORY','The report directory must be owned by this user, contain no links, and use mode 0700, 0750, 2700 or 2750.');}
+  }
+  async function ensureReportDirectory(directory,input={}) {
+    const o=options(input);
+    if(input.create) {
+      const root=path.join(absolute(o.homeDir),'.llm-account-usage-feeds');
+      if(path.dirname(directory)!==root || !/^v2-[a-f0-9]{32}$/.test(path.basename(directory)))
+        throw failure('UNSAFE_REPORT_DIRECTORY','Only the target user’s default feed root and connection directory can be created.');
+      await safeDirectories(o.homeDir,o);
+      if((await stat(o.homeDir)).uid!==o.uid)throw failure('UNSAFE_REPORT_DIRECTORY','The home directory must be owned by the target user.');
+      for(const target of [root,directory]) {
+        try {
+          await io.mkdir(target,{mode:0o2750});
+          const handle=await io.open(target,constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
+          try {if((await handle.stat()).uid!==o.uid)throw new Error('owner');await handle.chmod(0o2750);}finally {await handle.close();}
+        } catch(error) {if(error.code!=='EEXIST')throw error;}
+        await safeReportDirectory(target,o);
+      }
+    }
+    return safeReportDirectory(directory,o);
+  }
   async function readSafe(file, o, {privateFile = false, limit = MAX_SETTINGS} = {}) {
     await safeDirectories(path.dirname(file), o);
     const entry = await stat(file);
@@ -345,6 +374,11 @@ function createSetup(dependencies = {}) {
     absolute(data.profilePath);
     data.pendingProcess=pendingProcess(data.pendingProcess,data.uid);
     data.kind = kind;
+    if(data.reportDir!==undefined) {
+      if(absolute(data.reportDir)!==data.reportDir || data.reportDir.length>4096)
+        throw failure('INVALID_RECEIPT','The saved report directory cannot be verified.');
+      loc.reportDir=data.reportDir;
+    }
     return data;
   }
   async function processIdentity(pid) {
@@ -515,7 +549,8 @@ function createSetup(dependencies = {}) {
       script += `if [ -x ${quote(nodePath)} ] && [ -r ${quote(loc.collectorPath)} ]; then ${collector}; fi\nexit 0\n`;
     }
     const launcher = Buffer.from(script);
-    await safeDirectories(loc.reportDir, o, {create:true, privateLeaf:true});
+    if(data.reportDir)await safeReportDirectory(loc.reportDir,o);
+    else await safeDirectories(loc.reportDir, o, {create:true, privateLeaf:true});
     await put(loc.collectorPath, source, o, 0o600);
     await put(loc.launcherPath, launcher, o, 0o700);
     return {collectorHash:createHash('sha256').update(source).digest('hex'),cliPath};
@@ -526,6 +561,7 @@ function createSetup(dependencies = {}) {
   }
   async function connectProvider(input) {
     const o = options(input);
+    if(o.reportDir!==undefined)await safeReportDirectory(o.reportDir,o);
     const found = await inspect(o, {validateStatusLine:false});
     const pending=pendingProcess(o.pendingProcess,o.uid);
     const loc=await savedLocation(o,found.id) || locations(o,found.identity);
@@ -541,6 +577,7 @@ function createSetup(dependencies = {}) {
     }
     return locked(o, loc, async loc => {
       let data = await retireMissingHook(o, loc, await receipt(o, loc));
+      if(o.reportDir!==undefined)loc.reportDir=o.reportDir;
       if(data?.status === 'connected') {
         await claimConnection(o, loc, data);
         if(data.kind === 'codex-hook') {
@@ -550,6 +587,7 @@ function createSetup(dependencies = {}) {
         } else if(!isDeepStrictEqual(found.config.statusLine, data.installedStatusLine))
           throw failure('SETTINGS_CHANGED', 'The installed status line was edited. Review it before reconnecting or disconnecting.');
         const nextData={...data,cliPath:found.cliPath,cliLookupPath:found.cliLookupPath,
+          ...(o.reportDir!==undefined?{reportDir:o.reportDir}:{}),
           pendingProcess:o.pendingProcess === undefined ? data.pendingProcess : pending};
         const runtime=await writeRuntime(o, loc, nextData);nextData.cliPath=runtime.cliPath;
         await put(loc.receiptPath, json(nextData), o, 0o600);
@@ -566,6 +604,7 @@ function createSetup(dependencies = {}) {
       await safeDirectories(o.storagePath, o, {create:true});
       let next;
       const common = {version:loc.legacy?1:2, id:found.id, profilePath:found.profilePath, pendingProcess:pending,
+        ...((o.reportDir??data?.reportDir)?{reportDir:o.reportDir??data.reportDir}:{}),
         status:'connected', provider:o.provider, uid:o.uid, settingsPath:found.settingsPath,
         ownerStoragePath:absolute(o.storagePath), cliPath:found.cliPath, cliLookupPath:found.cliLookupPath,
         settingsExisted:found.bytes !== null};
@@ -650,7 +689,8 @@ function createSetup(dependencies = {}) {
       try {
         if(data?.status !== 'connected' || data.ownerStoragePath !== absolute(o.storagePath)) continue;
         await nativeExecutable(data.cliLookupPath, o);
-        await safeDirectories(loc.reportDir, o, {privateLeaf:true});
+        if(data.reportDir)await safeReportDirectory(loc.reportDir,o);
+        else await safeDirectories(loc.reportDir, o, {privateLeaf:true});
         const config = parse(await readSafe(data.settingsPath, o));
         if(data.kind === 'codex-hook') {
           const state=codexHookState(config,data.installedHook);
@@ -668,6 +708,7 @@ function createSetup(dependencies = {}) {
         // Recovery needs the validated receipt even when its CLI or report
         // feed is unavailable. Only disconnectProvider may claim an orphan.
         if(data.ownerStoragePath!==storagePath && await stat(absolute(data.ownerStoragePath)))continue;
+        if(base.sharedDirectoryReview)await safeDirectories(path.dirname(data.settingsPath),base);
         results.push(publicConnection(data,loc));
       } catch { /* An unverifiable owner cannot suppress a sibling receipt. */ }
     }
@@ -706,7 +747,7 @@ function createSetup(dependencies = {}) {
     }
     return {refreshed, warnings};
   }
-  return {discoverProvider, connectProvider, disconnectProvider, listConnections, listDisconnectConnections, refreshRuntime};
+  return {discoverProvider, connectProvider, disconnectProvider, listConnections, listDisconnectConnections, refreshRuntime, ensureReportDirectory};
 }
 
 module.exports = {createSetup, ...createSetup()};

@@ -1,7 +1,12 @@
 'use strict';
 const test=require('node:test');
 const assert=require('node:assert/strict');
-const {connectionIdentity,sameProcess,connectionForTarget}=require('../src/connection.cjs');
+const {connectionIdentity,sameProcess,connectionForTarget,runtimeVersion}=require('../src/connection.cjs');
+
+test('public runtime versions accept SemVer and reject leading-zero numeric prereleases',()=>{
+  for(const value of ['0.4.0','1.0.0-rc.1','1.0.0+build.001','1.0.0-0'])assert.equal(runtimeVersion(value),true,value);
+  for(const value of ['1.0.0-01','01.0.0','1.0.0-rc.01','1.0.0\n','v1.0.0','1.0','1'.repeat(129)] )assert.equal(runtimeVersion(value),false,value);
+});
 
 test('connection identity is stable per provider UID and canonical settings path',()=>{
   const base={provider:'claude',uid:1000,settingsPath:'/home/a/.claude/settings.json'};

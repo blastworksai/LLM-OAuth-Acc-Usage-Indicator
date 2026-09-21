@@ -23,6 +23,54 @@ async function fixture(t, provider = 'claude') {
 const readJson = async file => JSON.parse(await fs.readFile(file, 'utf8'));
 const writeJson = (file, value) => fs.writeFile(file, JSON.stringify(value), {mode:0o600});
 
+test('explicit target-owned setgid feed survives reconnect, listing and refresh',async t=>{
+  const f=await fixture(t),feed=path.join(f.homeDir,'shared-feed');
+  await fs.mkdir(feed,{mode:0o2750});await fs.chmod(feed,0o2750);
+  const connection=await f.setup.connectProvider({...f.options,reportDir:feed});
+  assert.equal(connection.reportDir,feed);
+  assert.equal((await fs.stat(feed)).mode&0o7777,0o2750);
+  const invocation=JSON.parse(execFileSync('/bin/sh',[connection.launcherPath],{input:'{}',encoding:'utf8'}));
+  assert.equal(invocation.args[invocation.args.indexOf('--report-dir')+1],feed);
+  const receiptPath=path.join(path.dirname(connection.launcherPath),'connection.json');
+  assert.equal((await readJson(receiptPath)).reportDir,feed);
+  assert.equal((await f.setup.connectProvider(f.options)).reportDir,feed);
+  assert.equal((await f.setup.listConnections(f.options))[0].reportDir,feed);
+  assert.deepEqual((await f.setup.refreshRuntime(f.options)).refreshed,[connection.id]);
+  assert.equal((await f.setup.disconnectProvider({...f.options,connectionId:connection.id})).reportDir,feed);
+  assert.equal((await f.setup.connectProvider(f.options)).reportDir,feed);
+});
+test('shared feed refuses world access, group writes, links, wrong owners and special mode bits',async t=>{
+  const f=await fixture(t);
+  for(const mode of [0o2755,0o2770,0o2777,0o4750,0o1750]) {
+    const feed=path.join(f.homeDir,`feed-${mode}`);await fs.mkdir(feed,{mode:0o700});await fs.chmod(feed,mode);
+    await assert.rejects(f.setup.connectProvider({...f.options,reportDir:feed}),{code:'UNSAFE_REPORT_DIRECTORY'});
+  }
+  const feed=path.join(f.homeDir,'safe');await fs.mkdir(feed,{mode:0o700});
+  const linked=path.join(f.homeDir,'linked');await fs.symlink(feed,linked);
+  await assert.rejects(f.setup.connectProvider({...f.options,reportDir:linked}),{code:'UNSAFE_REPORT_DIRECTORY'});
+  const io=new Proxy(fs,{get(target,key){if(key==='lstat')return async file=>{const st=await fs.lstat(file);if(file===feed)st.uid=process.getuid()+1;return st;};return target[key];}});
+  await assert.rejects(createSetup({fs:io}).connectProvider({...f.options,reportDir:feed}),{code:'UNSAFE_REPORT_DIRECTORY'});
+  assert.equal(await fs.stat(f.settingsPath).catch(()=>null),null);
+});
+test('default shared feed creation validates home ancestry and creates only root and leaf with mode 2750',async t=>{
+  const f=await fixture(t),feed=path.join(f.homeDir,'.llm-account-usage-feeds','v2-'+'a'.repeat(32));
+  await f.setup.ensureReportDirectory(feed,{...f.options,create:true});
+  assert.equal((await fs.stat(path.dirname(feed))).mode&0o7777,0o2750);
+  assert.equal((await fs.stat(feed)).mode&0o7777,0o2750);
+  await assert.rejects(f.setup.ensureReportDirectory(path.join(f.homeDir,'other','new'),{...f.options,create:true}),{code:'UNSAFE_REPORT_DIRECTORY'});
+});
+test('disconnect discovery can review a shared profile without requiring its vanished CLI',async t=>{
+  const f=await fixture(t),cli=path.join(f.homeDir,'cli');await fs.symlink(process.execPath,cli);f.options.cliPath=cli;
+  await fs.chmod(f.profilePath,0o770);
+  const preview=await f.setup.discoverProvider(f.options);
+  await f.setup.connectProvider({...f.options,trustedDirectories:preview.sharedDirectories});await fs.unlink(cli);
+  const sharedDirectoryReview=new Map();
+  const [connection]=await f.setup.listDisconnectConnections({...f.options,sharedDirectoryReview});
+  assert.ok(connection);
+  assert.ok([...sharedDirectoryReview.values()].some(value=>value.path===f.profilePath));
+  await f.setup.disconnectProvider({...f.options,connectionId:connection.id,trustedDirectories:[...sharedDirectoryReview.values()]});
+});
+
 async function createProfile(f,name) {
   const profilePath=path.join(f.homeDir,name);
   await fs.mkdir(profilePath,{mode:0o700});
@@ -572,7 +620,9 @@ test('permission drift hides the connection, disables its launcher and requires 
   const refreshed = await setup.refreshRuntime(trusted);
   assert.deepEqual(refreshed.refreshed, []);
   assert.equal(refreshed.warnings.length, 1);
-  assert.equal(execFileSync('/bin/sh', [installed.launcherPath], {input:'{}', encoding:'utf8'}), '');
+  // A disabled launcher exits immediately; no stdin writer is needed to prove
+  // it emits nothing, and racing a write against that exit can raise EPIPE.
+  assert.equal(execFileSync('/bin/sh', [installed.launcherPath], {stdio:['ignore','pipe','pipe'], encoding:'utf8'}), '');
   const nextReview = await setup.discoverProvider(trusted);
   assert.deepEqual(nextReview.sharedDirectories.map(item => item.path), [executable]);
   const renewed = {...options, trustedDirectories:firstReview.sharedDirectories.filter(item => item.path !== executable).concat(nextReview.sharedDirectories)};

@@ -4,20 +4,32 @@ const path=require('node:path');
 const os=require('node:os');
 const {readFeeds,matchReports,buildRows,SelectionController}=require('./core.cjs');
 const {detectProvider}=require('./provider.cjs');
-const {connectionForTarget,sameProcess}=require('./connection.cjs');
+const {connectionForTarget,sameProcess,publicPath,validatePublicConnection}=require('./connection.cjs');
+const {prepareHandoff}=require('./handoff.cjs');
+const {readConnectionFeeds}=require('./connection-feed.cjs');
 const {buildViewModel,renderContent,renderDocument}=require('./panel.cjs');
 const setup=require('./setup.cjs');
 
 function activate(context) {
   let view, assets={}, lastContent='';
+  const pendingCrossUser=new Map(),runtimeVersion=context.extension.packageJSON.version;
+  const managedDirectories=()=>{
+    const saved=context.globalState.get('managedFeedDirectories',[]);
+    return Array.isArray(saved)?[...new Set(saved.filter(publicPath))].slice(0,128):[];
+  };
+  const managedConnections=async()=>{
+    const {connections}=await readConnectionFeeds(managedDirectories());
+    return connections.filter(value=>value.connected).map(value=>({...value,pendingProcess:pendingCrossUser.get(value.id)}));
+  };
   const setupOptions={storagePath:context.globalStorageUri.fsPath,nodePath:process.execPath,
     collectorPath:path.join(context.extensionPath,'collectors','passive.cjs'),
     trustedDirectories:context.globalState.get('trustedDirectories',[])};
   const setupReady=process.platform==='linux'
     ? setup.refreshRuntime(setupOptions).catch(()=>({warnings:['Saved provider connections need attention. Run Account Usage: Connect Provider.']}))
     : Promise.resolve({warnings:[]});
-  const getViewModel=()=>buildViewModel(controller.state);
-  const getHtml=()=>renderContent(getViewModel(),assets);
+  const getViewModel=()=>({...buildViewModel(controller.state),...(controller.state.needsReconnect?{stale:true,needsReconnect:true}:{})});
+  const getHtml=()=>renderContent(getViewModel(),assets)+(controller.state.needsReconnect?
+    '<p class="stale-notice">Last report retained. Reconnect this profile to update its target-user collector.</p><div class="card-actions"><button class="connect-provider" type="button" data-action="connect">Reconnect provider</button></div>':'');
   const render=()=> {
     if(!view)return;
     const html=getHtml();
@@ -30,16 +42,31 @@ function activate(context) {
     const pid=await terminal.processId;
     if(!pid)return {status:'unavailable',reason:'The terminal does not expose a process on this host.'};
     await setupReady;
-    const connections=await setup.listConnections(setupOptions).catch(()=>[]);
+    const shared=await managedConnections();
+    const connections=[...await setup.listConnections(setupOptions).catch(()=>[]),...shared];
     const dirs=[...connections.map(connection=>connection.reportDir),
       ...vscode.workspace.getConfiguration('llmAccountUsage').get('feedDirectories',[])];
     const {reports,rejected}=await readFeeds(dirs);
     const result=await matchReports(pid,reports);
+    if(result.status==='ready') {
+      // Reports remain authoritative. Find the descriptor through its feed,
+      // never by assuming every process with one provider/UID uses one profile.
+      for(const connection of shared.filter(value=>value.runtimeVersion!==runtimeVersion &&
+        value.provider===result.report.provider && value.uid===result.report.process.uid)) {
+        const old=await readFeeds([connection.reportDir]);
+        if(old.reports.some(value=>JSON.stringify(value)===JSON.stringify(result.report))) {
+          const target=await detectProvider(pid);
+          if(target?.provider===connection.provider && target.process.uid===connection.uid)
+            Object.assign(result,{needsReconnect:true,setupTarget:target,reconnectConnection:connection});
+          break;
+        }
+      }
+    }
     if(result.status==='unavailable' && rejected)result.reason='No matching readable report. A report directory is missing, unreadable or unsafe.';
     if(result.status==='unavailable') {
       const target=await detectProvider(pid);
       const connection=connectionForTarget(connections,target);
-      if(target&&!connection)result.setupTarget=target;
+      if(target&&(!connection || (connection.runtimeVersion&&connection.runtimeVersion!==runtimeVersion)))result.setupTarget=target;
       else if(connection)result.reason='This profile is connected. Waiting for this session to finish a fresh turn.';
       else result.setupTarget={provider:null};
     }
@@ -61,6 +88,54 @@ function activate(context) {
   };
   const sameTarget=(a,b)=>a && b && a.provider===b.provider && a.cliPath===b.cliPath &&
     sameProcess(a.process,b.process);
+  const safeError=(code,message)=>Object.assign(new Error(message),{code,safeToDisplay:true});
+  const crossUser=async({selected,pid,target,action='connect',connection})=>{
+    const revalidate=async()=>{
+      const current=await detectProvider(pid),currentPid=await selected.processId;
+      return selected===vscode.window.activeTerminal && currentPid===pid && sameTarget(target,current)?current:null;
+    };
+    const handoff=await prepareHandoff({extensionPath:context.extensionPath,provider:target.provider,target,action,
+      connectionId:connection?.id,runtimeVersion,revalidate,
+      ...(action==='connect'&&connection?{profilePath:connection.profilePath,reportDir:connection.reportDir}:{})});
+    try {
+      const choice=await vscode.window.showInformationMessage(`${action==='connect'?'Connect':'Disconnect'} ${providerName(target.provider)} as UID ${target.process.uid}?`,
+        {modal:true,detail:`Run this command in a separate shell already owned by UID ${target.process.uid}. That shell needs node on PATH. Keep the provider session running. Review the profile and type yes when prompted.\n\n${handoff.command}`},'Copy setup command');
+      if(choice!=='Copy setup command')return false;
+      if(!await revalidate())throw safeError('TERMINAL_CHANGED','The selected terminal changed. Select its session and connect again.');
+      await vscode.env.clipboard.writeText(handoff.command);
+      let cancellation;
+      const result=await vscode.window.withProgress({location:vscode.ProgressLocation.Notification,cancellable:true,title:'Waiting for target-user setup (up to two minutes)'},async(_progress,token)=>{
+        cancellation=token;const deadline=Date.now()+120000;
+        while(!token.isCancellationRequested && Date.now()<deadline) {
+          const value=await handoff.readResult();
+          if(token.isCancellationRequested)return null;
+          if(value)return value;
+          await new Promise(resolve=>{const timer=setTimeout(()=>{listener?.dispose();resolve();},250);
+            const listener=token.onCancellationRequested(()=>{clearTimeout(timer);resolve();});});
+        }
+        return null;
+      });
+      if(!result?.ok)return false;
+      const value=result.connection;
+      if(!validatePublicConnection(value)||value.provider!==target.provider||value.uid!==target.process.uid||
+        value.connected!==(action==='connect')||(connection&&value.id!==connection.id)||
+        (action==='connect'&&value.runtimeVersion!==runtimeVersion)||!await revalidate())throw safeError('UNVERIFIED_SETUP_RESULT','The target-user setup result could not be verified.');
+      const managed=new Set(managedDirectories());
+      if(action==='connect') {
+        const probe=await readFeeds([value.reportDir]);
+        if(probe.rejected)throw safeError('SHARED_FEED_UNREADABLE','The target-user report feed is not safely readable by this VS Code host. Configure a shared Linux group directory and connect again.');
+        const descriptors=await readConnectionFeeds([value.reportDir]);
+        if(descriptors.rejected || descriptors.connections.length!==1 ||
+          !Object.keys(value).every(key=>descriptors.connections[0][key]===value[key]))
+          throw safeError('CONNECTION_FEED_UNREADABLE','The target-user connection descriptor could not be verified.');
+        managed.add(value.reportDir);
+      } else managed.delete(connection.reportDir);
+      if(cancellation.isCancellationRequested || !await revalidate())return false;
+      await context.globalState.update('managedFeedDirectories',[...managed]);
+      if(action==='connect')pendingCrossUser.set(value.id,{...target.process});else pendingCrossUser.delete(value.id);
+      return true;
+    } finally {await handoff.dispose();}
+  };
   const connect=async(fromCard=false)=>{
     if(process.platform!=='linux') {
       await vscode.window.showInformationMessage('Provider connections currently support Linux terminal hosts.');return;
@@ -92,6 +167,13 @@ function activate(context) {
       return setup.connectProvider(options);
     };
     try {
+      if(detected && detected.process.uid!==process.getuid()) {
+        if(await crossUser({selected,pid,target:detected,connection:controller.state.needsReconnect?controller.state.reconnectConnection:undefined})) {
+          await vscode.window.showInformationMessage(`${providerName(picked.provider)} connected. Finish a fresh turn to publish account usage.`);
+          await refresh();
+        }
+        return;
+      }
       let profilePath,cliPath=detected?.cliPath;
       while(true) {
         const options={...setupOptions,provider:picked.provider,...(profilePath?{profilePath}:{}),...(cliPath?{cliPath}:{}),
@@ -146,12 +228,21 @@ function activate(context) {
   const disconnect=async()=>{
     try {
       await setupReady;
-      const connections=await setup.listDisconnectConnections(setupOptions);
+      const connections=[...await setup.listDisconnectConnections(setupOptions),...await managedConnections()];
       const items=connections.map(connection=>({label:providerName(connection.provider),
         description:`UID ${connection.uid} · ${connection.profilePath}`,connection}));
       const picked=await vscode.window.showQuickPick(items,
         {title:'Disconnect account usage profile',placeHolder:'Removes Account Usage while preserving the provider configuration it does not own.'});
       if(!picked)return;
+      if(picked.connection.uid!==process.getuid()) {
+        const selected=vscode.window.activeTerminal,pid=selected?await selected.processId:null,target=pid?await detectProvider(pid):null;
+        if(!target || target.provider!==picked.connection.provider || target.process.uid!==picked.connection.uid)
+          throw safeError('TARGET_REQUIRED','Select a running terminal owned by this profile’s Linux user before disconnecting.');
+        if(await crossUser({selected,pid,target,action:'disconnect',connection:picked.connection})) {
+          await refresh();await vscode.window.showInformationMessage(`${providerName(picked.connection.provider)} disconnected.`);
+        }
+        return;
+      }
       if(await withRecovery(setup.disconnectProvider,{...setupOptions,connectionId:picked.connection.id})===false)return;
       await refresh();
       await vscode.window.showInformationMessage(`${providerName(picked.connection.provider)} disconnected.`);

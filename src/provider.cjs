@@ -59,7 +59,7 @@ function createProviderDetector({platform=process.platform,uid=process.getuid?.(
    for await(const pid of listProcesses()) {
     if(++inspected>MAX_PROCESSES)return null;
     const current=await getProcess(pid);
-    if(!current || current.uid!==uid)continue;
+    if(!current)continue;
     const executable=await readExecutable(pid);
     let provider=known.get(executable);
     if(!known.has(executable)) {

@@ -32,18 +32,36 @@ test('shells, unknown binaries and unsupported hosts produce no setup suggestion
   {getExecutable:async()=>'/usr/bin/node'}, {getExecutable:async()=>'/opt/releases/claude/2.0.0 (deleted)'}
  ]) assert.equal(await fixture(changes).detect(10),null);
 });
-test('background jobs, another terminal and another user cannot select a provider',async()=>{
- for(const candidate of [proc(20,1),proc(20,10,{pgrp:30}),proc(20,10,{tty_nr:2,tpgid:30}),proc(20,10,{uid:2000})]) {
+test('the exact foreground provider may run as another Linux user',async()=>{
+ const f=fixture();f.processes[1]=proc(20,10,{uid:2000});
+ assert.deepEqual(await f.detect(10),{
+  provider:'claude',cliPath:'/opt/tools/claude',
+  process:{pid:20,uid:2000,start_ticks:'20',boot_id:'boot'}
+ });
+});
+test('an unrelated other-user provider is never selected',async()=>{
+ const f=fixture({getExecutable:async pid=>pid===10?'/usr/bin/bash':'/opt/releases/claude/2.0.0'});
+ f.processes.push(proc(30,1,{uid:2000}));
+ assert.deepEqual(await f.detect(10),{provider:'claude',cliPath:'/opt/tools/claude',process:identity});
+ f.processes.splice(1,1);
+ assert.equal(await f.detect(10),null);
+});
+test('background jobs and another terminal cannot select a provider under either user',async()=>{
+ for(const uid of [1000,2000])for(const candidate of [proc(20,1,{uid}),proc(20,10,{uid,pgrp:30}),proc(20,10,{uid,tty_nr:2,tpgid:30})]) {
   const f=fixture();f.processes[1]=candidate;
   assert.equal(await f.detect(10),null);
  }
- const f=fixture();f.processes[0].uid=2000;
- assert.equal(await f.detect(10),null);
+});
+test('the selected terminal must remain owned by the extension host',async()=>{
+ for(const uid of [1000,2000]) {
+  const f=fixture();f.processes[0]=proc(10,1,{uid:2000});f.processes[1]=proc(20,10,{uid});
+  assert.equal(await f.detect(10),null);
+ }
 });
 test('several matching foreground providers are ambiguous, even for the same vendor',async()=>{
- for(const secondExecutable of ['/opt/releases/claude/2.0.0','/opt/releases/agy/1.0.0']) {
+ for(const uid of [1000,2000])for(const secondExecutable of ['/opt/releases/claude/2.0.0','/opt/releases/agy/1.0.0']) {
   const f=fixture({getExecutable:async pid=>pid===20?'/opt/releases/claude/2.0.0':pid===30?secondExecutable:'/usr/bin/bash'});
-  f.processes.push(proc(30,10));
+  f.processes.push(proc(30,10,{uid}));
   assert.equal(await f.detect(10),null);
  }
 });
@@ -78,23 +96,26 @@ test('unrelated provider processes cannot exhaust the selected terminal candidat
  assert.deepEqual(await f.detect(10),{provider:'claude',cliPath:'/opt/tools/claude',process:identity});
 });
 test('PID reuse, process exit and foreground movement during discovery invalidate the suggestion',async()=>{
- for(const change of ['birth','exit','foreground','terminal']) {
+ for(const uid of [1000,2000])for(const change of ['birth','boot','owner','exit','foreground','terminal','terminal-owner','terminal-boot','terminal-foreground']) {
   let scanned=false;
+  const candidateChanges={birth:{start_ticks:'999'},boot:{boot_id:'other'},owner:{uid:3000},foreground:{tpgid:10}};
+  const terminalChanges={terminal:{start_ticks:'999'},'terminal-owner':{uid:2000},'terminal-boot':{boot_id:'other'},'terminal-foreground':{tpgid:10}};
   const f=fixture({
    processIds:async function*(){yield 20;scanned=true;},
-   getProcess:async pid=>pid===10?proc(10,1,scanned&&change==='terminal'?{start_ticks:'999'}:{}):
-    scanned&&change==='exit'?null:proc(20,10,scanned&&change==='birth'?{start_ticks:'999'}:scanned&&change==='foreground'?{tpgid:10}:{})
+   getProcess:async pid=>pid===10?proc(10,1,scanned?terminalChanges[change]:{}):
+    scanned&&change==='exit'?null:proc(20,10,{uid,...(scanned?candidateChanges[change]:{})})
   });
   assert.equal(await f.detect(10),null,change);
  }
 });
 test('an executable or stable CLI link changed during discovery invalidates the suggestion',async()=>{
- for(const change of ['exe','lookup']) {
+ for(const uid of [1000,2000])for(const change of ['exe','lookup']) {
   let scanned=false;
   const f=fixture({processIds:async function*(){yield 20;scanned=true;},
    getExecutable:async()=>scanned&&change==='exe'?'/opt/other/binary':'/opt/releases/claude/2.0.0',
    resolveExecutable:async lookup=>lookup==='/opt/tools/claude'?(scanned&&change==='lookup'?'/opt/releases/claude/2.0.1':'/opt/releases/claude/2.0.0'):null
   });
+  f.processes[1]=proc(20,10,{uid});
   assert.equal(await f.detect(10),null,change);
  }
 });

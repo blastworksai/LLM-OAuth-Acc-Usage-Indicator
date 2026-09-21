@@ -78,7 +78,7 @@ async function prepareHandoff({extensionPath,provider,target,action='connect',co
     const resultPath=path.join(dropPath,filename);
     const args=action==='connect'?['--provider',provider,...(target.cliPath?['--cli',target.cliPath]:[]),'--result',resultPath,'--runtime-version',runtimeVersion,
       ...(profilePath?['--profile',profilePath]:[]),...(reportDir?['--report-dir',reportDir]:[])]:['--connection-id',connectionId,'--result',resultPath];
-    if(target.cliPath===null)args.push('--target',JSON.stringify({provider,process:target.process}));
+    if(action==='connect'||target.cliPath===null)args.push('--target',JSON.stringify({provider,process:target.process}));
     const command=`node ${quote(path.join(root,'src/setup-cli.cjs'))} ${action} `+args.map((value,index)=>index%2?quote(value):value).join(' ');
     async function readResult() {
       if(disposed)throw invalid();

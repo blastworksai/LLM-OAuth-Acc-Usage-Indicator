@@ -39,6 +39,39 @@ test('handoff stages exactly immutable readable code and a nonce result dropbox'
   await h.dispose();await h.dispose();await assert.rejects(fs.stat(h.root),{code:'ENOENT'});
   await assert.rejects(h.readResult(),/setup result could not be verified/i);
 });
+test('readable native handoffs carry the captured process identity beside the expected CLI path',async t=>{
+ const f=await fixture(t),decoded=execFileSync('/bin/sh',['-c',f.handoff.command.replace(/^node /,'printf \'%s\\n\' ')],{encoding:'utf8'}).trim().split('\n');
+ assert.equal(decoded.includes('--target'),true);
+ assert.deepEqual(JSON.parse(decoded[decoded.indexOf('--target')+1]),{provider:'claude',process:f.target.process});
+ assert.equal(decoded[decoded.indexOf('--cli')+1],f.target.cliPath);
+});
+test('a readable staged reconnect whose process exits during consent leaves profile receipt and feed untouched',async t=>{
+ const home=await fs.mkdtemp(path.join(os.tmpdir(),'readable-handoff-'));t.after(()=>fs.rm(home,{recursive:true,force:true}));
+ const bin=path.join(home,'bin'),profile=path.join(home,'.claude');await fs.mkdir(bin);await fs.mkdir(profile,{mode:0o700});
+ const cliPath=path.join(bin,'claude');await fs.symlink(process.execPath,cliPath);await fs.writeFile(path.join(profile,'settings.json'),'{}',{mode:0o600});
+ const setup=require('../src/setup.cjs').createSetup({systemUid:(await fs.stat('/')).uid});
+ const dependencies={setup,home:()=>home,uid:()=>process.getuid(),env:{PATH:bin},print:()=>{},readConsent:async()=>'yes'};
+ const seedResult=path.join(home,'seed.json');
+ assert.equal((await require('../src/setup-cli.cjs').run(['connect','--provider','claude','--cli',cliPath,'--runtime-version','0.3.0','--result',seedResult],dependencies)).code,0);
+ const connection=JSON.parse(await fs.readFile(seedResult,'utf8')).connection;
+ const target={provider:'claude',cliPath,process:{pid:20,uid:process.getuid(),start_ticks:'20',boot_id:'boot'}};
+ const handoff=await prepareHandoff({extensionPath,provider:'claude',target,tempRoot:home,runtimeVersion:'0.4.0',
+  profilePath:connection.profilePath,reportDir:connection.reportDir,revalidate:async()=>target});t.after(()=>handoff.dispose());
+ const decoded=execFileSync('/bin/sh',['-c',handoff.command.replace(/^node /,'printf \'%s\\n\' ')],{encoding:'utf8'}).trim().split('\n');
+ const files=[connection.settingsPath,path.join(path.dirname(connection.launcherPath),'connection.json'),path.join(connection.reportDir,'.connection.json')];
+ const before=await Promise.all(files.map(file=>fs.readFile(file)));let live=true,mutationCalls=0;
+ const verifier=require(path.join(handoff.root,'src/provider.cjs')).verifyTargetProcess;
+ const result=await require(decoded[0]).run(decoded.slice(1),{...dependencies,
+  verifyTargetProcess:(value,options)=>verifier(value,{...options,getProcess:async()=>live?{...target.process,ppid:10,tty_nr:1,pgrp:20,tpgid:20}:null,
+   getExecutable:async()=>fs.realpath(process.execPath)}),
+  readConsent:async()=>{live=false;return 'yes';},
+  ensureReportDirectory:async(...args)=>{mutationCalls++;return setup.ensureReportDirectory(...args);},
+  setup:{...setup,connectProvider:async options=>{mutationCalls++;return setup.connectProvider(options);}}});
+ assert.equal(live,false,'the real matching native process must reach consent before the simulated exit');
+ assert.equal(result.code,1);assert.equal(mutationCalls,0);
+ assert.deepEqual(await Promise.all(files.map(file=>fs.readFile(file))),before);
+ assert.equal(JSON.parse(await fs.readFile(handoff.resultPath,'utf8')).ok,false);
+});
 test('unresolved handoff stages process proof and accepts only the same foreign topology and selected provider',async t=>{
  for(const mutation of ['valid','reuse','provider','ambiguous','executable']) {
   const target={provider:'claude',cliPath:null,process:{pid:20,uid:process.getuid(),start_ticks:'20',boot_id:'boot'}};
@@ -85,6 +118,7 @@ test('disconnect accepts only the named disconnected profile and verifies the se
   const base=connectionIdentity({provider:'claude',uid:process.getuid(),settingsPath:'/home/target/.claude/settings.json'});
   const f=await fixture(t,{action:'disconnect',connectionId:base.id});
   assert.match(f.handoff.command,/ disconnect --connection-id '/);
+  assert.doesNotMatch(f.handoff.command,/--target/,'readable disconnect retains its existing protocol');
   await publish(f.handoff,{ok:true,connection:{...f.connection,connected:false}});
   assert.equal((await f.handoff.readResult()).connection.connected,false);
 });

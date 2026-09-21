@@ -27,7 +27,7 @@ function parse(argv) {
   }
   if(action==='connect') {
     if(!['claude','codex','antigravity'].includes(values.provider)||
-      (values.target?(values.target.provider!==values.provider||Object.hasOwn(values,'cli')):!absolute(values.cli))||!version(values['runtime-version']))throw new Error('arguments');
+      (values.target?(values.target.provider!==values.provider||(Object.hasOwn(values,'cli')&&!absolute(values.cli))):!absolute(values.cli))||!version(values['runtime-version']))throw new Error('arguments');
     for(const key of ['profile','report-dir'])if(Object.hasOwn(values,key)&&!absolute(values[key]))throw new Error('arguments');
   } else if(!/^v2-[a-f0-9]{32}$/.test(values['connection-id']||''))throw new Error('arguments');
   return values;
@@ -72,8 +72,9 @@ async function run(argv,dependencies={}) {
     const verify=async()=>{
       if(!args.target)return null;
       if(args.target.process.uid!==uid)throw new Error('wrong-target-user');
-      const value=await (dependencies.verifyTargetProcess||require('./provider.cjs').verifyTargetProcess)(args.target,{uid,env:options.env,home:homeDir});
-      if(!value||value.provider!==args.target.provider||!absolute(value.cliPath)||
+      const target={...args.target,...(args.cli?{cliPath:args.cli}:{})};
+      const value=await (dependencies.verifyTargetProcess||require('./provider.cjs').verifyTargetProcess)(target,{uid,env:options.env,home:homeDir});
+      if(!value||value.provider!==args.target.provider||!absolute(value.cliPath)||(args.cli&&value.cliPath!==args.cli)||
         !require('./connection.cjs').sameProcess(value.process,args.target.process))throw new Error('unverified-target-process');
       return value;
     };

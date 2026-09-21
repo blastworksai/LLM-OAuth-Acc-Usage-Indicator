@@ -42,6 +42,46 @@ test('foreign target verification precedes preview and repeats after consent bef
   if(drift)assert.equal(d.directories.length,0);
  }
 });
+test('readable target CLI accepts and verifies both process identity and the exact expected path',async()=>{
+ const d=deps(),order=[];
+ d.verifyTargetProcess=async target=>{order.push('verify');assert.deepEqual(target,{...foreignTarget,cliPath:'/opt/claude'});return target;};
+ const preview=d.setup.discoverProvider;d.setup.discoverProvider=async options=>{order.push('preview');return preview(options);};
+ d.readConsent=async()=>{order.push('yes');return 'yes';};
+ assert.equal((await run([...argv,'--target',JSON.stringify(foreignTarget)],d)).code,0);
+ assert.deepEqual(order,['verify','preview','yes','verify']);assert.equal(d.calls[0].cliPath,'/opt/claude');
+});
+test('readable target identity provider or expected path drift yields zero mutation before preview or after yes',async t=>{
+ const fs=require('node:fs/promises'),os=require('node:os'),path=require('node:path'),{verifyTargetProcess}=require('../src/provider.cjs');
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),'readable-target-proof-'));t.after(()=>fs.rm(root,{recursive:true,force:true}));
+ const bin=path.join(root,'bin'),alternate=path.join(root,'alternate');await fs.mkdir(bin);await fs.mkdir(alternate);
+ const native=await fs.realpath(process.execPath),otherNative=path.join(root,'codex-native');await fs.copyFile(native,otherNative);await fs.chmod(otherNative,0o755);
+ const cliPath=path.join(bin,'claude');await fs.symlink(native,cliPath);await fs.symlink(otherNative,path.join(bin,'codex'));
+ await fs.symlink(native,path.join(alternate,'claude'));
+ for(const phase of ['before-preview','after-yes'])for(const mutation of ['exit','pid','uid','start','boot','provider','path']) {
+  const d=deps();let changed=false,previews=0,consents=0;
+  d.env={PATH:bin+path.delimiter+alternate};
+  const change=async()=>{changed=true;if(mutation==='path'){await fs.unlink(cliPath);await fs.symlink(otherNative,cliPath);}};
+  d.verifyTargetProcess=(target,options)=>verifyTargetProcess(target,{...options,
+   getProcess:async()=>changed&&mutation==='exit'?null:{...foreignTarget.process,ppid:10,tty_nr:1,pgrp:30,tpgid:30,
+    ...(changed?({pid:{pid:31},uid:{uid:1000},start:{start_ticks:'31'},boot:{boot_id:'other'}}[mutation]||{}):{})},
+   getExecutable:async()=>changed&&mutation==='provider'?otherNative:native});
+  d.setup.discoverProvider=async()=>{previews++;return d.preview;};
+  d.readConsent=async()=>{consents++;if(phase==='after-yes')await change();return 'yes';};
+  if(phase==='before-preview')await change();
+  const args=[...argv.map(value=>value==='/opt/claude'?cliPath:value),'--target',JSON.stringify(foreignTarget)];
+  assert.equal((await run(args,d)).code,1,phase+' '+mutation);
+  assert.equal(previews,phase==='after-yes'?1:0);assert.equal(consents,phase==='after-yes'?1:0);
+  assert.equal(d.calls.length,0);assert.equal(d.directories.length,0);assert.equal(d.feeds.length,0);
+  assert.equal(d.results[0][1].ok,false);
+  if(mutation==='path'){await fs.unlink(cliPath);await fs.symlink(native,cliPath);}
+ }
+});
+test('a readable target cannot replace its expected CLI path with another verifier result',async()=>{
+ const d=deps();d.verifyTargetProcess=async()=>({...foreignTarget,cliPath:'/other/claude'});
+ d.setup.discoverProvider=async()=>assert.fail('a different path reached preview');
+ assert.equal((await run([...argv,'--target',JSON.stringify(foreignTarget)],d)).code,1);
+ assert.equal(d.calls.length,0);assert.equal(d.directories.length,0);assert.equal(d.feeds.length,0);
+});
 test('a foreign target UID or provider mismatch cannot preview a host profile',async()=>{
  for(const target of [{...foreignTarget,provider:'codex'},{...foreignTarget,process:{...foreignTarget.process,uid:1000}}]) {
   const d=deps();d.setup.discoverProvider=async()=>assert.fail('unverified target reached preview');
@@ -54,7 +94,8 @@ test('invalid, duplicate, relative, unknown, oversized and malformed version arg
   for(const args of [[],[...argv,'--provider','codex'],[...argv,'--unknown','x'],argv.map(s=>s==='/opt/claude'?'relative':s),
     argv.map(s=>s==='claude'?'unknown':s),argv.map(s=>s==='0.4.0'?'x'.repeat(5000):s),
     argv.map(s=>s==='0.4.0'?'not-semver':s),argv.slice(0,-1),[...argv,'--runtime-version','0.5.0'],
-    argv.map(s=>s==='/opt/claude'?'/opt/\ncli':s)]) {
+    argv.map(s=>s==='/opt/claude'?'/opt/\ncli':s),
+    ...['relative','/opt/../claude','/opt/\ncli'].map(cli=>[...foreignArgv,'--cli',cli])]) {
     const d=deps();d.setup.discoverProvider=async()=>assert.fail('invalid input reached discovery');
     assert.equal((await run(args,d)).code,2);assert.equal(d.calls.length,0);assert.equal(d.results.length,0);
   }

@@ -225,7 +225,22 @@ function createSetup(dependencies = {}) {
     o.sharedDirectoryReview = new Map();
     const {bytes, config, ...preview} = await inspect(o);
     await safeDirectories(o.storagePath, o, {allowMissing:true});
-    await safeDirectories(locations(o, preview.identity).root, o, {allowMissing:true});
+    let loc=locations(o,preview.identity);
+    const legacy=legacyLocations(o,o.provider);
+    const legacyOptions={...o,sharedDirectoryReview:new Map()};
+    try {
+      if(await stat(legacy.root)) {
+        await safeDirectories(legacy.root,legacyOptions,{privateLeaf:true});
+        const data=await receipt(legacyOptions,legacy);
+        if(data?.id===preview.id) {
+          loc=legacy;
+          // Review the runtime that connect will reuse, without asking for
+          // trust in an unrelated profile's legacy storage.
+          for(const [key,item] of legacyOptions.sharedDirectoryReview)o.sharedDirectoryReview.set(key,item);
+        }
+      }
+    } catch { /* An unverifiable legacy neighbor cannot select this profile's runtime. */ }
+    await safeDirectories(loc.root, o, {allowMissing:true});
     await nativeExecutable(o.nodePath, o, 'UNSUPPORTED_RUNTIME');
     return {...preview, sharedDirectories:[...o.sharedDirectoryReview.values()]};
   }
@@ -281,6 +296,12 @@ function createSetup(dependencies = {}) {
       entries.push({loc,data});
     }
     return entries;
+  }
+  async function savedLocation(o,id) {
+    const entries=await savedConnections(o);
+    // An interrupted v2 attempt may have left an empty directory beside the
+    // valid legacy receipt. Only a validated receipt can choose its location.
+    return entries.find(entry=>entry.data?.id===id)?.loc || entries.find(entry=>entry.loc.id===id)?.loc;
   }
   function pendingProcess(value, uid) {
     if(value === undefined || value === null)return null;
@@ -504,7 +525,7 @@ function createSetup(dependencies = {}) {
     const o = options(input);
     const found = await inspect(o, {validateStatusLine:false});
     const pending=pendingProcess(o.pendingProcess,o.uid);
-    const loc=(await savedConnections(o)).find(entry=>entry.loc.id===found.id)?.loc || locations(o,found.identity);
+    const loc=await savedLocation(o,found.id) || locations(o,found.identity);
     if(!await stat(loc.root)) {
       // Reserve capacity and create its directory under one cross-process lock.
       // Keep admission state outside the bounded connection-directory scan.
@@ -577,7 +598,7 @@ function createSetup(dependencies = {}) {
     let loc;
     if(o.connectionId !== undefined) {
       locations(o,{id:o.connectionId});
-      loc=(await savedConnections(o)).find(entry=>entry.loc.id===o.connectionId)?.loc;
+      loc=await savedLocation(o,o.connectionId);
       if(!loc)throw failure('INVALID_CONNECTION','The selected profile connection was not found.');
     } else {
       if(!o.provider)throw failure('UNSUPPORTED_PROVIDER','Choose a provider.');
@@ -586,7 +607,7 @@ function createSetup(dependencies = {}) {
       const profilePath=await io.realpath(selectedProfile);
       const identity=connectionIdentity({provider:o.provider,uid:o.uid,
         settingsPath:path.join(profilePath,o.provider==='codex'?'hooks.json':'settings.json')});
-      loc=(await savedConnections(o)).find(entry=>entry.loc.id===identity.id)?.loc || locations(o,identity);
+      loc=await savedLocation(o,identity.id) || locations(o,identity);
     }
     if(!await stat(loc.root)) return {provider:o.provider, connected:false};
     return locked(o, loc, async current => {

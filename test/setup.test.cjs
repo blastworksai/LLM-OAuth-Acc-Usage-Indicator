@@ -166,6 +166,64 @@ test('version-1 takeover retains the legacy backup and explicit ownership confir
   assert.deepEqual(await readJson(f.settingsPath),legacy.original);
 });
 
+test('legacy takeover discovery includes shared runtime ancestry before confirmation',async t=>{
+  const f=await fixture(t),legacy=await seedLegacyConnection(f);
+  const ancestor=path.dirname(legacy.root);
+  await fs.chmod(ancestor,0o2770);
+  await fs.rmdir(f.options.storagePath);
+  const other={...f.options,storagePath:path.join(f.homeDir,'other-editor')};
+  const files=[f.settingsPath,legacy.receiptPath,legacy.launcherPath,legacy.backupPath];
+  const before=await Promise.all(files.map(file=>fs.readFile(file)));
+  const preview=await f.setup.discoverProvider(other);
+  const info=await fs.stat(ancestor);
+  assert.deepEqual(preview.sharedDirectories,[{path:ancestor,kind:'directory',uid:info.uid,gid:info.gid,mode:0o2770}]);
+  assert.deepEqual(await Promise.all(files.map(file=>fs.readFile(file))),before);
+  await assert.rejects(fs.stat(other.storagePath),{code:'ENOENT'});
+  await assert.rejects(fs.stat(path.join(f.homeDir,'.local/state/llm-account-usage/connections')),{code:'ENOENT'});
+  await assert.rejects(f.setup.connectProvider({...other,confirmTakeover:true}));
+  assert.deepEqual(await Promise.all(files.map(file=>fs.readFile(file))),before);
+  const reviewed={...other,trustedDirectories:preview.sharedDirectories};
+  await assert.rejects(f.setup.connectProvider(reviewed),{code:'TAKEOVER_REQUIRED'});
+  const connected=await f.setup.connectProvider({...reviewed,confirmTakeover:true});
+  assert.equal(connected.legacy,true);
+  assert.equal(connected.launcherPath,legacy.launcherPath);
+  assert.deepEqual(await fs.readFile(f.settingsPath),before[0]);
+  assert.equal((await fs.stat(ancestor)).mode&0o7777,0o2770);
+  await f.setup.disconnectProvider({...reviewed,connectionId:connected.id});
+  assert.deepEqual(await readJson(f.settingsPath),legacy.original);
+});
+
+test('legacy discovery renews a changed runtime ancestor fingerprint',async t=>{
+  const f=await fixture(t),legacy=await seedLegacyConnection(f);
+  const ancestor=path.dirname(legacy.root);
+  await fs.chmod(ancestor,0o2770);
+  const initial=await f.setup.discoverProvider(f.options);
+  assert.equal(initial.sharedDirectories.length,1);
+  const previous={...f.options,trustedDirectories:initial.sharedDirectories};
+  await f.setup.connectProvider(previous);
+  await fs.chmod(ancestor,0o2750);
+  const renewed=await f.setup.discoverProvider(previous);
+  assert.deepEqual(renewed.sharedDirectories,[{...initial.sharedDirectories[0],mode:0o2750}]);
+  await assert.rejects(f.setup.connectProvider(previous));
+  const connected=await f.setup.connectProvider({...f.options,trustedDirectories:renewed.sharedDirectories});
+  assert.equal(connected.launcherPath,legacy.launcherPath);
+  assert.deepEqual((await f.setup.listConnections({...f.options,trustedDirectories:renewed.sharedDirectories})).map(value=>value.id),[connected.id]);
+  assert.equal((await fs.stat(ancestor)).mode&0o7777,0o2750);
+  await f.setup.disconnectProvider({...f.options,trustedDirectories:renewed.sharedDirectories});
+  assert.deepEqual(await readJson(f.settingsPath),legacy.original);
+});
+
+test('legacy discovery does not request trust for another profile runtime',async t=>{
+  const f=await fixture(t),legacy=await seedLegacyConnection(f);
+  await fs.chmod(path.dirname(legacy.root),0o2770);
+  const profilePath=await createProfile(f,'other-claude');
+  const preview=await f.setup.discoverProvider({...f.options,profilePath});
+  assert.deepEqual(preview.sharedDirectories,[]);
+  const connected=await f.setup.connectProvider({...f.options,profilePath});
+  assert.equal(connected.legacy,false);
+  assert.notEqual(connected.launcherPath,legacy.launcherPath);
+});
+
 test('refresh warnings identify the failed provider and profile without disabling its neighbor',async t=>{
   const f=await fixture(t),first=await f.setup.connectProvider(f.options);
   const second=await f.setup.connectProvider({...f.options,profilePath:await createProfile(f,'other-claude')});

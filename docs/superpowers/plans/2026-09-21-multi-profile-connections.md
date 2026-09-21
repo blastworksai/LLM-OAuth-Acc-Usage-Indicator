@@ -516,8 +516,11 @@ git -C /opt/glitch/workspaces/llm-oauth-acc-usage-indicator--more-bugfixing-of-b
 **Files:**
 - Create: `src/setup-cli.cjs`
 - Create: `src/handoff.cjs`
+- Create: `src/connection-feed.cjs`
 - Create: `test/setup-cli.test.cjs`
 - Create: `test/handoff.test.cjs`
+- Create: `test/connection-feed.test.cjs`
+- Modify: `src/connection.cjs`
 - Modify: `src/setup.cjs:82-105`
 - Modify: `src/setup.cjs:218-235`
 - Modify: `src/setup.cjs:378-427`
@@ -529,8 +532,9 @@ git -C /opt/glitch/workspaces/llm-oauth-acc-usage-indicator--more-bugfixing-of-b
 - Produces: `setup-cli.cjs connect --provider <name> --cli <absolute-native-path> --result <absolute-result-path> [--profile <absolute-profile>] [--report-dir <absolute-directory>]`; it previews the exact profile and trust boundary, then requires an interactive `yes` before writing.
 - Produces: `setup-cli.cjs disconnect --connection-id <v2-id> --result <absolute-result-path>`.
 - Produces: `prepareHandoff({extensionPath, provider, target, action, connectionId?}) -> {command, resultPath, readResult(), dispose()}`.
+- Produces: `readConnectionFeeds(directories) -> {connections, rejected}` and `writeConnectionFeed(directory, connection)` for one bounded target-owned `.connection.json` descriptor.
 - Changes: `connectProvider` accepts `reportDir`; when present it requires a target-owned directory no broader than mode `2750` and stores that exact path in the receipt.
-- Produces: extension global state `managedCrossUserConnections`, containing only public connection descriptors and report paths—never account identity or credentials.
+- Produces: extension global state `managedFeedDirectories`, containing only validated report-directory paths. Cross-user UID/profile metadata stays in the target-owned feed descriptor, never a VS Code mapping table.
 
 - [ ] **Step 1: Add failing setup CLI parsing and owner-context tests**
 
@@ -591,7 +595,7 @@ After discovery supplies the connection ID, default a cross-user feed to:
 path.join(os.homedir(),'.llm-account-usage-feeds',connectionId)
 ```
 
-Create only the missing feed root/leaf under the target-owned home, using mode `2750`; validate every existing component before use. Write a bounded JSON result containing `{ok:true,connection}` or `{ok:false,code,message}` to the exact result path with `wx`, `O_NOFOLLOW` and mode `0644`. The result never contains settings bytes, hook commands, environment values or native CLI output.
+Create only the missing feed root/leaf under the target-owned home, using mode `2750`; validate every existing component before use. Atomically write the public connection descriptor to `<reportDir>/.connection.json` with mode `0640`, then write a bounded handoff result containing `{ok:true,connection}` or `{ok:false,code,message}` to the exact result path with `wx`, `O_NOFOLLOW` and mode `0644`. Neither file contains settings bytes, hook commands, environment values, account identity or native CLI output.
 
 - [ ] **Step 4: Add failing shared-feed setup tests**
 
@@ -629,6 +633,27 @@ Do not weaken `safeDirectories` for receipts or provider settings. Add `safeRepo
 
 - [ ] **Step 6: Add failing handoff staging and result-boundary tests**
 
+First add descriptor tests:
+
+```js
+test('connection feed round-trips only bounded public connector metadata',async t=>{
+  const feed=await safeFeed(t,0o2750);
+  await writeConnectionFeed(feed,publicConnection);
+  const read=await readConnectionFeeds([feed]);
+  assert.deepEqual(read,{connections:[publicConnection],rejected:0});
+  assert.equal(JSON.stringify(read).includes('account'),false);
+});
+
+test('connection feed rejects links, wrong owners, writable files and extra sensitive fields',async t=>{
+  for(const mutation of ['symlink','uid','mode','extra-field'])
+    assert.deepEqual(await readMutatedConnectionFeed(mutation),{connections:[],rejected:1});
+});
+```
+
+Implement `connection-feed.cjs` with the same descriptor-anchored, `O_NOFOLLOW|O_NONBLOCK`, owner/mode/size and exact-key validation used by report feeds. The descriptor's owner must equal the report-directory owner, its `reportDir` must resolve to that exact directory, and its mode may be no broader than `0640`.
+
+Then add handoff staging tests:
+
 ```js
 test('handoff stages immutable readable code and accepts only the expected target result',async t=>{
   const handoff=await prepareHandoff({extensionPath:fixtureExtension,provider:'claude',
@@ -649,7 +674,7 @@ test('handoff rejects the wrong owner, symlink, writable result and changed targ
 
 - [ ] **Step 7: Implement the one-time local handoff**
 
-Create a random directory under `os.tmpdir()` with an owner-controlled `0755` bundle root and a sticky, non-listable `1733` result dropbox. Copy exactly `setup-cli.cjs`, `setup.cjs`, `connection.cjs` and `collectors/passive.cjs`; set code files to `0555` and the collector to `0444`. Build a single-quoted command beginning with `node`, never `sudo`.
+Create a random directory under `os.tmpdir()` with an owner-controlled `0755` bundle root and a sticky, non-listable `1733` result dropbox. Copy exactly `setup-cli.cjs`, `setup.cjs`, `connection.cjs`, `connection-feed.cjs` and `collectors/passive.cjs`; set code files to `0555` and the collector to `0444`. Build a single-quoted command beginning with `node`, never `sudo`.
 
 `readResult` opens only the nonce-named result with `O_NOFOLLOW|O_NONBLOCK`, requires a regular single-link file no larger than 32 KiB, owner UID equal to `target.process.uid`, mode no broader than `0644`, a matching provider/UID and a valid connection ID. Re-run provider detection before accepting the result so a changed selected terminal cannot bind it. `dispose` removes only the exact `mkdtemp` directory.
 
@@ -659,16 +684,18 @@ When `detected.process.uid!==process.getuid()`, do not call `discoverProvider` o
 
 ```js
 const safeError=(code,message)=>Object.assign(new Error(message),{code,message,safeToDisplay:true});
-const managed=context.globalState.get('managedCrossUserConnections',[])
-  .filter(value=>value.id!==result.connection.id);
-const connection={...result.connection,pendingProcess:target.process,runtimeVersion:context.extension.packageJSON.version};
+const managed=new Set(context.globalState.get('managedFeedDirectories',[]));
+const connection={...result.connection,runtimeVersion:context.extension.packageJSON.version};
 const probe=await readFeeds([connection.reportDir]);
 if(probe.rejected)throw safeError('SHARED_FEED_UNREADABLE','The target-user report feed is not safely readable by this VS Code host. Configure a shared Linux group directory and connect again.');
-managed.push(connection);
-await context.globalState.update('managedCrossUserConnections',managed);
+const descriptors=await readConnectionFeeds([connection.reportDir]);
+if(descriptors.rejected||descriptors.connections.length!==1)throw safeError('CONNECTION_FEED_UNREADABLE','The target-user connection descriptor could not be verified.');
+managed.add(connection.reportDir);
+pendingCrossUser.set(connection.id,target.process);
+await context.globalState.update('managedFeedDirectories',[...managed]);
 ```
 
-Merge these descriptors into the normal connection list and their report paths into the feed list. On cancellation or failure, dispose the bundle and do not update global state. Cross-user disconnect uses the same handoff with `disconnect --connection-id`, removing the descriptor only after a verified successful result.
+On every refresh, read public descriptors from `managedFeedDirectories`, attach an in-memory `pendingProcess` only when `pendingCrossUser` has that exact connection ID, then merge those descriptors into the normal connection list and their report paths into the feed list. On reload there is deliberately no persistent process claim; the first fresh turn is authoritative, and an early repeated Connect remains idempotent. On cancellation or failure, dispose the bundle and do not update global state. Cross-user disconnect uses the same handoff with `disconnect --connection-id`, removing only its feed path after a verified successful result.
 
 On activation, retain reports from an older `runtimeVersion` but mark that connection as needing an explicit reconnect before calling it current; a VS Code extension update cannot refresh files owned by another user. Add an extension test with a stored older version and assert that the selected profile receives a reconnect action while its last validated report remains readable.
 
@@ -683,28 +710,29 @@ test('cross-user Connect stages a command instead of reading the host profile',a
   await h.commands.get('llmAccountUsage.connect')();
   assert.equal(h.connected.length,0);
   assert.match(h.clipboard,/setup-cli\.cjs connect/);
-  assert.equal(h.storage.get('managedCrossUserConnections')[0].uid,2000);
+  assert.deepEqual(h.storage.get('managedFeedDirectories'),['/home/target/.llm-account-usage-feeds/example']);
+  assert.equal(JSON.stringify(h.storage).includes('"uid":2000'),false);
 });
 
 test('cancelled or wrong-owner cross-user setup stores no connection or feed',async()=>{
   for(const outcome of ['cancel','wrong-owner']) {
     const h=harness({terminal:terminal(),detect:async()=>target('claude',30,2000),handoff:failedHandoff(outcome)});
     await h.commands.get('llmAccountUsage.connect')();
-    assert.deepEqual(h.storage.get('managedCrossUserConnections',[]),[]);
+    assert.deepEqual(h.storage.get('managedFeedDirectories',[]),[]);
   }
 });
 ```
 
 - [ ] **Step 10: Run the setup, handoff, extension and passive suites**
 
-Run: `node --test test/setup-cli.test.cjs test/handoff.test.cjs test/setup.test.cjs test/extension.test.cjs test/passive.test.cjs test/core.test.cjs`
+Run: `node --test test/setup-cli.test.cjs test/handoff.test.cjs test/connection-feed.test.cjs test/setup.test.cjs test/extension.test.cjs test/passive.test.cjs test/core.test.cjs`
 
 Expected: PASS. Existing collector tests prove `2750` directories and `0640` reports; new tests prove only the setup control path crosses users.
 
 - [ ] **Step 11: Commit the explicit cross-user setup slice**
 
 ```bash
-git -C /opt/glitch/workspaces/llm-oauth-acc-usage-indicator--more-bugfixing-of-blastworksai-llm-oauth add src/setup-cli.cjs src/handoff.cjs src/setup.cjs src/extension.cjs test/setup-cli.test.cjs test/handoff.test.cjs test/setup.test.cjs test/extension.test.cjs
+git -C /opt/glitch/workspaces/llm-oauth-acc-usage-indicator--more-bugfixing-of-blastworksai-llm-oauth add src/setup-cli.cjs src/handoff.cjs src/connection-feed.cjs src/connection.cjs src/setup.cjs src/extension.cjs test/setup-cli.test.cjs test/handoff.test.cjs test/connection-feed.test.cjs test/connection.test.cjs test/setup.test.cjs test/extension.test.cjs
 git -C /opt/glitch/workspaces/llm-oauth-acc-usage-indicator--more-bugfixing-of-blastworksai-llm-oauth commit -m "feat: add explicit cross-user profile setup"
 ```
 
@@ -757,7 +785,7 @@ Expected: `artifacts/llm-oauth-acc-usage-indicator-0.3.5.vsix` is created.
 
 Run: `unzip -l artifacts/llm-oauth-acc-usage-indicator-0.3.5.vsix`
 
-Expected: the archive includes `extension/src/setup-cli.cjs`, `extension/src/handoff.cjs`, `extension/src/connection.cjs`, `extension/src/setup.cjs`, `extension/collectors/passive.cjs`, the extension runtime/media/docs required by `.vscodeignore`, and no `test/`, `.git/`, `.env`, fixture or local configuration files.
+Expected: the archive includes `extension/src/setup-cli.cjs`, `extension/src/handoff.cjs`, `extension/src/connection.cjs`, `extension/src/connection-feed.cjs`, `extension/src/setup.cjs`, `extension/collectors/passive.cjs`, the extension runtime/media/docs required by `.vscodeignore`, and no `test/`, `.git/`, `.env`, fixture or local configuration files.
 
 - [ ] **Step 5: Install and exercise the exact VSIX on Odin at an approved safe moment**
 

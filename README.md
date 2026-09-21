@@ -12,17 +12,24 @@ Account emails are hidden in these screenshots.
 
 ## Install
 
-1. Install [Account Usage from the VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=BlastworksAI.llm-oauth-acc-usage-indicator). For Remote-SSH, install it on the Linux SSH host.
+> **0.3.5 release candidate:** The multi-profile and cross-user setup described below is candidate behavior.
+> Installed Remote-SSH acceptance checks are deferred and have not been run; this candidate is not live-accepted.
+> Marketplace still carries the prior stable release, without these 0.3.5 changes.
+> To evaluate the candidate, use the 0.3.5 VSIX from a GitHub prerelease when available.
+
+1. For the stable release, install [Account Usage from the VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=BlastworksAI.llm-oauth-acc-usage-indicator).
+   For the 0.3.5 candidate, use **Extensions: Install from VSIX…** as described below.
+   For Remote-SSH, install it on the Linux SSH host.
 2. Run **Account Usage: Open Card** and select your AI terminal.
 3. For an unconnected supported terminal, click **Connect Codex**, **Connect Claude** or **Connect Antigravity** on the card.
    If safe process detection cannot name the provider, click **Connect Provider** and choose it.
    Check the profile and approve the connection.
-   If the CLI runs as another Linux user, copy the setup command and run it in a separate shell already owned by that user, as described in [setup](docs/SETUP.md#another-linux-user).
+   In 0.3.5, if the CLI runs as another Linux user, copy the setup command and run it in a separate shell already owned by that user, as described in [setup](docs/SETUP.md#another-linux-user).
 4. Finish one fresh turn in that CLI. Its local adapter publishes the account and quota reading, and the card follows that session.
 
 For manual installation, download the `.vsix` from [GitHub Releases](https://github.com/blastworksai/LLM-OAuth-Acc-Usage-Indicator/releases), then run **Extensions: Install from VSIX…** in VS Code.
 
-Connect each provider profile independently, in any order, including multiple profiles of the same provider.
+In 0.3.5, connect each provider profile independently, in any order, including multiple profiles of the same provider.
 Use an existing CLI login; the extension does not ask for passwords, API keys or tokens.
 Same-user setup uses VS Code's Node runtime and needs one confirmation.
 Cross-user setup requires `node` on the target user's shell PATH for its setup command.

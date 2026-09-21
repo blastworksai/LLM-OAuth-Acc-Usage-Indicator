@@ -1,5 +1,10 @@
 # Setup and troubleshooting
 
+> **0.3.5 release candidate:** The multi-profile and cross-user setup in this guide is candidate behavior.
+> Installed Remote-SSH acceptance checks are deferred and have not been run; this candidate is not live-accepted.
+> Marketplace still carries the prior stable release, without these 0.3.5 changes.
+> To evaluate the candidate, use the 0.3.5 VSIX from a GitHub prerelease when available.
+
 ## Remote-SSH
 
 Connect desktop VS Code to your Linux host, then install the VSIX into that SSH environment. Open a supported CLI in VS Code's integrated terminal and run **Account Usage: Open Card**. The selected terminal determines the account card.

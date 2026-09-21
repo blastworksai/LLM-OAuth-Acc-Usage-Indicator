@@ -226,6 +226,9 @@ function createSetup(dependencies = {}) {
     const {bytes, config, ...preview} = await inspect(o);
     await safeDirectories(o.storagePath, o, {allowMissing:true});
     let loc=locations(o,preview.identity);
+    // Connect scans this parent even when it ultimately reuses legacy storage.
+    const scanParent=path.dirname(loc.root);
+    if(await stat(scanParent))await safeDirectories(scanParent,o);
     const legacy=legacyLocations(o,o.provider);
     const legacyOptions={...o,sharedDirectoryReview:new Map()};
     try {

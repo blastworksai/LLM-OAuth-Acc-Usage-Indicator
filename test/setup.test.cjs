@@ -224,6 +224,47 @@ test('legacy discovery does not request trust for another profile runtime',async
   assert.notEqual(connected.launcherPath,legacy.launcherPath);
 });
 
+for(const stale of [false,true]) {
+  test(`legacy discovery previews ${stale?'stale':'missing'} scan-parent trust without inspecting siblings`,async t=>{
+    const f=await fixture(t),legacy=await seedLegacyConnection(f);
+    const profilePath=await createProfile(f,'sibling-claude');
+    const sibling=await f.setup.connectProvider({...f.options,profilePath});
+    const siblingRoot=path.dirname(sibling.launcherPath),parent=path.dirname(siblingRoot);
+    await fs.chmod(parent,0o2770);
+    const info=await fs.stat(parent);
+    const previous={path:parent,kind:'directory',uid:info.uid,gid:info.gid,mode:0o2770};
+    const mode=stale?0o2750:0o2770;
+    if(stale)await fs.chmod(parent,mode);
+    await fs.chmod(siblingRoot,0o2770);
+    const options={...f.options,trustedDirectories:stale?[previous]:[]};
+    const files=[f.settingsPath,legacy.receiptPath,legacy.launcherPath,sibling.settingsPath,sibling.launcherPath];
+    const before=await Promise.all(files.map(file=>fs.readFile(file)));
+    const siblingReads=[];
+    const io=new Proxy(fs,{get(target,key){
+      if(['lstat','open','opendir','readFile','realpath'].includes(key))return async(file,...args)=>{
+        if([siblingRoot,profilePath].some(root=>file===root||String(file).startsWith(root+path.sep)))siblingReads.push(file);
+        return target[key](file,...args);
+      };
+      return target[key];
+    }});
+    const preview=await createSetup({fs:io}).discoverProvider(options);
+    assert.deepEqual(preview.sharedDirectories,[{...previous,mode}]);
+    assert.deepEqual(siblingReads,[]);
+    assert.deepEqual(await Promise.all(files.map(file=>fs.readFile(file))),before);
+    await assert.rejects(f.setup.connectProvider(options),{code:'DIRECTORY_TRUST_REQUIRED'});
+    const approved={...f.options,trustedDirectories:preview.sharedDirectories};
+    const connected=await f.setup.connectProvider(approved);
+    assert.equal(connected.legacy,true);
+    assert.equal(connected.launcherPath,legacy.launcherPath);
+    await f.setup.disconnectProvider({...approved,connectionId:connected.id});
+    assert.deepEqual(await readJson(f.settingsPath),legacy.original);
+    assert.deepEqual(await fs.readFile(sibling.settingsPath),before[3]);
+    assert.deepEqual(await fs.readFile(sibling.launcherPath),before[4]);
+    assert.equal((await fs.stat(parent)).mode&0o7777,mode);
+    assert.equal((await fs.stat(siblingRoot)).mode&0o7777,0o2770);
+  });
+}
+
 test('refresh warnings identify the failed provider and profile without disabling its neighbor',async t=>{
   const f=await fixture(t),first=await f.setup.connectProvider(f.options);
   const second=await f.setup.connectProvider({...f.options,profilePath:await createProfile(f,'other-claude')});

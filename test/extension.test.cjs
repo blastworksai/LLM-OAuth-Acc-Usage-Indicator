@@ -5,19 +5,19 @@ const fs=require('node:fs');
 const path=require('node:path');
 const vm=require('node:vm');
 
-function harness({discover,connect,disconnect,recover='Recover connection',confirm='Connect',pickPath='/example/profile',pickProvider='claude',savedTrust=[],terminal,detect=async()=>null,connections=[],reports=[],match,collect}={}) {
-  const commands=new Map(),connected=[],errors=[],warnings=[],confirmations=[],storage=new Map([['trustedDirectories',savedTrust]]);
+function harness({discover,connect,disconnect,recover='Recover connection',confirm='Connect',pickPath='/example/profile',pickProvider='claude',pickConnection,savedTrust=[],terminal,detect=async()=>null,connections=[],reports=[],match,collect}={}) {
+  const commands=new Map(),connected=[],discovered=[],errors=[],warnings=[],confirmations=[],storage=new Map([['trustedDirectories',savedTrust]]);
   let provider,receive,picks=0,lastPickItems=[],collectionCalls=0,feedDirectories=[];
   const disposable=()=>({dispose(){}});
   const vscode={Uri:{file:value=>({fsPath:value}),joinPath:(_base,...parts)=>({fsPath:parts.join('/')})},workspace:{getConfiguration:()=>({get:()=>[]}),onDidChangeConfiguration:disposable},
     window:{activeTerminal:terminal,registerWebviewViewProvider:(_id,value)=>{provider=value;return disposable();},onDidChangeActiveTerminal:disposable,onDidCloseTerminal:disposable,
-      showQuickPick:async items=>{picks++;lastPickItems=items;return items.find(item=>item.provider===pickProvider);},showOpenDialog:async()=>pickPath?[{fsPath:pickPath}]:undefined,
-      showInformationMessage:async(message,options,...actions)=>{if(options?.modal){confirmations.push({message,options,actions});return confirm;}},
-      showWarningMessage:async(message,action)=>{warnings.push(message);return action?.modal?recover:action;},
+      showQuickPick:async items=>{picks++;lastPickItems=items;return items.find(item=>pickConnection?item.connection?.id===pickConnection:(item.provider??item.connection?.provider)===pickProvider);},showOpenDialog:async()=>pickPath?[{fsPath:pickPath}]:undefined,
+      showInformationMessage:async(message,options,...actions)=>{if(options?.modal){confirmations.push({message,options,actions});return typeof confirm==='function'?confirm():confirm;}},
+      showWarningMessage:async(message,action)=>{warnings.push(message);return action?.modal?(typeof recover==='function'?recover():recover):action;},
       showErrorMessage:async message=>{errors.push(message);}},
     commands:{registerCommand:(name,callback)=>{commands.set(name,callback);return disposable();},executeCommand:async()=>{}}};
-  const setup={refreshRuntime:async()=>({warnings:[]}),listConnections:async()=>connections,discoverProvider:discover||
-    (async()=>({profilePath:'/example/profile',hasExistingStatusLine:true})),
+  const setup={refreshRuntime:async()=>({warnings:[]}),listConnections:async()=>connections,
+    discoverProvider:async options=>{discovered.push({...options});return discover?discover(options):{profilePath:'/example/profile',hasExistingStatusLine:true};},
     connectProvider:async options=>{connected.push(options);return connect?.(options);},
     disconnectProvider:async options=>{connected.push(options);return disconnect?.(options);}};
   const core={SelectionController:require('../src/core.cjs').SelectionController,buildRows:()=>[],
@@ -25,7 +25,7 @@ function harness({discover,connect,disconnect,recover='Recover connection',confi
   const exports={};
   const sandbox={module:{exports},exports,process:{platform:'linux',execPath:'/example/editor-node'},setInterval:()=>1,clearInterval(){},
     require:name=>name==='vscode'?vscode:name==='./setup.cjs'?setup:name==='./core.cjs'?core:name==='./collect.cjs'?{collectTerminal:async pid=>{collectionCalls++;return collect?.(pid)??null;}}:name==='./provider.cjs'?{detectProvider:detect}:
-      name==='./panel.cjs'?{buildViewModel:()=>({}),renderContent:()=>'',renderDocument:()=>''}:require(name)};
+      name==='./connection.cjs'?require('../src/connection.cjs'):name==='./panel.cjs'?{buildViewModel:()=>({}),renderContent:()=>'',renderDocument:()=>''}:require(name)};
   vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../src/extension.cjs'),'utf8'),sandbox);
   const api=sandbox.module.exports.activate({globalStorageUri:{fsPath:'/example/editor-storage'},extensionPath:'/example/extension',subscriptions:[],
     globalState:{get:(key,fallback)=>storage.get(key)??fallback,update:async(key,value)=>{storage.set(key,value);}}});
@@ -34,7 +34,7 @@ function harness({discover,connect,disconnect,recover='Recover connection',confi
       onDidReceiveMessage:callback=>{receive=callback;return disposable();}},onDidChangeVisibility:disposable,onDidDispose:disposable});
     return async message=>{receive(message);await new Promise(setImmediate);};
   };
-  return {commands,connected,errors,warnings,confirmations,storage,openCard,api,vscode,get picks(){return picks;},get lastPickItems(){return lastPickItems;},get collectionCalls(){return collectionCalls;},get feedDirectories(){return feedDirectories;}};
+  return {commands,connected,discovered,errors,warnings,confirmations,storage,openCard,api,vscode,get picks(){return picks;},get lastPickItems(){return lastPickItems;},get collectionCalls(){return collectionCalls;},get feedDirectories(){return feedDirectories;}};
 }
 const problem=code=>Object.assign(new Error('Choose the required local resource.'),{code,safeToDisplay:true});
 
@@ -70,7 +70,9 @@ test('unexpected setup errors never display raw command or credential text',asyn
 test('missing editor ownership is recovered only after explicit confirmation for connect and disconnect',async()=>{
   for(const command of ['connect','disconnect'])for(const consent of [true,false]) {
     const operation=async options=>{if(!options.confirmTakeover)throw problem('TAKEOVER_REQUIRED');};
-    const h=harness({[command]:operation,recover:consent?'Recover connection':'Cancel'});
+    const h=harness({[command]:operation,recover:consent?'Recover connection':'Cancel',connections:[{
+      id:'example',provider:'claude',uid:1000,profilePath:'/example/profile',reportDir:'/example/reports'
+    }]});
     await h.commands.get(`llmAccountUsage.${command}`)();
     assert.equal(h.connected.length,consent?2:1);
     assert.equal(h.connected[0].confirmTakeover,undefined);
@@ -108,7 +110,7 @@ test('a previously approved exact directory is passed to later setup operations'
   assert.deepEqual(JSON.parse(JSON.stringify(h.connected[0].trustedDirectories)),savedTrust);
 });
 
-const target=provider=>({provider,cliPath:`/example/native/${{claude:'claude',codex:'codex',antigravity:'agy'}[provider]}`,process:{pid:20,uid:1000,start_ticks:'20',boot_id:'boot'}});
+const target=(provider,pid=20,uid=1000)=>({provider,cliPath:`/example/native/${{claude:'claude',codex:'codex',antigravity:'agy'}[provider]}`,process:{pid,uid,start_ticks:String(pid),boot_id:'boot'}});
 const terminal=()=>({name:'Example terminal',processId:Promise.resolve(10)});
 test('card connects the detected provider without a picker and retains permission confirmation',async()=>{
  for(const provider of ['claude','codex','antigravity']) {
@@ -121,16 +123,21 @@ test('card connects the detected provider without a picker and retains permissio
   assert.equal(h.confirmations.length,1);
   assert.equal(h.connected[0].provider,provider);
   assert.equal(h.connected[0].cliPath,target(provider).cliPath);
+  assert.ok(h.discovered[0].pendingProcess);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.discovered[0].pendingProcess)),target(provider).process);
+  assert.ok(h.connected[0].pendingProcess);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.connected[0].pendingProcess)),target(provider).process);
   assert.equal(h.picks,0);
   assert.match(h.confirmations[0].message,new RegExp(provider==='claude'?'Claude Code':provider==='codex'?'Codex':'Antigravity'));
  }
   const cancelled=harness({confirm:'Cancel',terminal:terminal(),detect:async()=>target('claude')});
+  const sendCancelled=cancelled.openCard();
   await cancelled.api.refresh();
-  await cancelled.openCard()({type:'connect'});
+  await sendCancelled({type:'connect'});
   assert.equal(cancelled.connected.length,0);
 });
 
-test('an unknown unavailable session offers only unconnected providers through the generic picker',async()=>{
+test('an unknown unavailable session offers every provider through the generic picker',async()=>{
  const h=harness({terminal:terminal(),pickProvider:'codex',connections:[{provider:'claude',reportDir:'/example/claude'}]});
  const send=h.openCard();
  await h.api.refresh();
@@ -138,20 +145,27 @@ test('an unknown unavailable session offers only unconnected providers through t
  await send({type:'connect'});
  assert.equal(h.connected.length,1);
  assert.equal(h.connected[0].provider,'codex');
- assert.deepEqual(JSON.parse(JSON.stringify(h.lastPickItems.map(item=>item.provider))),['codex','antigravity']);
+ assert.deepEqual(JSON.parse(JSON.stringify(h.lastPickItems.map(item=>item.provider))),['codex','claude','antigravity']);
+ assert.equal(h.discovered[0].pendingProcess,undefined);
+ assert.equal(h.connected[0].pendingProcess,undefined);
 });
 
-test('unknown sessions stop offering setup when all providers are connected',async()=>{
+test('unknown sessions can connect another profile when all providers are already connected',async()=>{
  const connections=['claude','codex','antigravity'].map(provider=>({provider,reportDir:`/example/${provider}`}));
- const h=harness({terminal:terminal(),connections});await h.api.refresh();
- assert.equal(h.api.getState().setupTarget,undefined);
- await h.openCard()({type:'connect'});
- assert.equal(h.connected.length,0);assert.equal(h.picks,0);
+ const h=harness({terminal:terminal(),connections}),send=h.openCard();
+ await h.api.refresh();
+ assert.ok(h.api.getState().setupTarget);
+ assert.deepEqual(JSON.parse(JSON.stringify(h.api.getState().setupTarget)),{provider:null});
+ await send({type:'connect'});
+ assert.equal(h.connected.length,1);assert.equal(h.picks,1);
+ assert.equal(h.connected[0].provider,'claude');
+ assert.deepEqual(JSON.parse(JSON.stringify(h.lastPickItems.map(item=>item.provider))),['codex','claude','antigravity']);
 });
 
-test('a detected connected provider waits for a fresh report without setup',async()=>{
+test('a detected exact pending connection waits for a fresh report without setup',async()=>{
  const detected=target('claude');
- const h=harness({terminal:terminal(),detect:async()=>detected,connections:[{provider:'claude',reportDir:'/example/reports',cliLookupPath:detected.cliPath}]});
+ const h=harness({terminal:terminal(),detect:async()=>detected,connections:[{id:'example',provider:'claude',uid:1000,
+  reportDir:'/example/reports',cliLookupPath:detected.cliPath,pendingProcess:detected.process}]});
  await h.api.refresh();
  assert.equal(h.api.getState().setupTarget,undefined);
  assert.match(h.api.getState().reason,/connected.*fresh/i);
@@ -177,29 +191,119 @@ test('Codex selection reads its connected report and never invokes direct collec
  await h.api.refresh();assert.equal(h.collectionCalls,0);assert.deepEqual(JSON.parse(JSON.stringify(h.feedDirectories)),['/example/codex']);assert.equal(h.api.getState().status,'ready');assert.equal(h.api.getState().report.session_id,'codex-session');
 });
 
-test('each connected provider without a fresh report is pending without a setup action',async()=>{
+test('each exact pending connection without a fresh report waits without a setup action',async()=>{
  for(const provider of ['codex','claude','antigravity']) {
-  const h=harness({terminal:terminal(),detect:async()=>target(provider),connections:[{provider,reportDir:`/example/${provider}`}],collect:async()=>{throw new Error('direct collection must not run');}});
+  const h=harness({terminal:terminal(),detect:async()=>target(provider),connections:[{id:provider,provider,uid:1000,
+   pendingProcess:target(provider).process,reportDir:`/example/${provider}`}],collect:async()=>{throw new Error('direct collection must not run');}});
   await h.api.refresh();assert.equal(h.collectionCalls,0,provider);assert.equal(h.api.getState().setupTarget,undefined,provider);assert.match(h.api.getState().reason,/connected.*fresh turn/i,provider);
  }
 });
 
+test('the first Claude connection does not suppress Connect Claude for a second process',async()=>{
+ const first=target('claude',20,1000),second=target('claude',30,2000);
+ const h=harness({terminal:terminal(),detect:async()=>second,connections:[{
+  id:'first',provider:'claude',uid:1000,reportDir:'/feeds/first',pendingProcess:first.process
+ }]});
+ const send=h.openCard();
+ await h.api.refresh();
+ assert.ok(h.api.getState().setupTarget);
+ assert.deepEqual(JSON.parse(JSON.stringify(h.api.getState().setupTarget)),second);
+ await send({type:'connect'});
+ assert.equal(h.connected.length,1);
+ assert.equal(h.connected[0].pendingProcess.pid,30);
+ assert.equal(h.discovered[0].pendingProcess.pid,30);
+ assert.equal(h.picks,0);
+});
+
+test('two same-provider feeds are both read and exact pending state hides setup only for its process',async()=>{
+ const first=target('claude',20,1000),second=target('claude',30,2000);
+ const connections=[
+  {id:'first',provider:'claude',uid:1000,reportDir:'/feeds/first',pendingProcess:first.process},
+  {id:'second',provider:'claude',uid:2000,reportDir:'/feeds/second',pendingProcess:second.process}
+ ];
+ let detected=second;
+ const h=harness({terminal:terminal(),detect:async()=>detected,connections});
+ await h.api.refresh();
+ assert.deepEqual(JSON.parse(JSON.stringify(h.feedDirectories)),['/feeds/first','/feeds/second']);
+ assert.equal(h.api.getState().setupTarget,undefined);
+ assert.match(h.api.getState().reason,/connected.*fresh turn/i);
+ detected=target('claude',40,2000);
+ await h.api.refresh();
+ assert.ok(h.api.getState().setupTarget);
+ assert.deepEqual(JSON.parse(JSON.stringify(h.api.getState().setupTarget)),detected);
+});
+
+test('a saved connection without an exact pending process still offers profile setup',async()=>{
+ const detected=target('claude');
+ const h=harness({terminal:terminal(),detect:async()=>detected,connections:[{
+  id:'first',provider:'claude',uid:1000,reportDir:'/feeds/first',cliLookupPath:detected.cliPath
+ }]});
+ await h.api.refresh();
+ assert.ok(h.api.getState().setupTarget);
+ assert.deepEqual(JSON.parse(JSON.stringify(h.api.getState().setupTarget)),detected);
+});
+
+test('disconnect addresses one profile connection by ID',async()=>{
+ const connections=[
+  {id:'first',provider:'claude',uid:1000,profilePath:'/home/one/.claude',reportDir:'/feeds/first'},
+  {id:'second',provider:'claude',uid:2000,profilePath:'/home/two/.claude',reportDir:'/feeds/second'}
+ ];
+ const h=harness({connections,pickConnection:'second'});
+ await h.commands.get('llmAccountUsage.disconnect')();
+ assert.equal(h.connected.length,1);
+ assert.equal(h.connected[0].connectionId,'second');
+ assert.equal(h.connected[0].provider,undefined);
+ assert.deepEqual(JSON.parse(JSON.stringify(h.lastPickItems.map(item=>({label:item.label,description:item.description})))),[
+  {label:'Claude Code',description:'UID 1000 · /home/one/.claude'},
+  {label:'Claude Code',description:'UID 2000 · /home/two/.claude'}
+ ]);
+});
+
+test('a changed provider process during recovery confirmation cannot write a pending connection',async()=>{
+ let detected=target('claude');
+ const h=harness({terminal:terminal(),detect:async()=>detected,
+  connect:async options=>{if(!options.confirmTakeover)throw problem('TAKEOVER_REQUIRED');},
+  recover:()=>{detected=target('claude',30);return 'Recover connection';}
+ });
+ await h.commands.get('llmAccountUsage.connect')();
+ assert.equal(h.connected.length,1);
+ assert.equal(h.connected[0].confirmTakeover,undefined);
+ assert.equal(h.errors.length,0);
+});
+
+test('a terminal switch during final process revalidation prevents profile setup',async()=>{
+ let revalidating=false,h;
+ h=harness({terminal:terminal(),detect:async()=>{
+  if(revalidating)h.vscode.window.activeTerminal=terminal();
+  return target('claude');
+ },confirm:()=>{revalidating=true;return 'Connect';}});
+ await h.api.refresh();
+ await h.commands.get('llmAccountUsage.connect')();
+ assert.equal(h.confirmations.length,1);
+ assert.equal(h.connected.length,0);
+ assert.equal(h.errors.length,0);
+});
+
 test('stale card actions and a terminal change during confirmation cannot connect a different session',async()=>{
  let detected=target('claude');
- const h=harness({terminal:terminal(),detect:async()=>detected});
+ const h=harness({terminal:terminal(),detect:async()=>detected}),send=h.openCard();
  await h.api.refresh();detected=target('antigravity');
- await h.openCard()({type:'connect'});
+ await send({type:'connect'});
  assert.equal(h.connected.length,0);assert.equal(h.confirmations.length,0);
  let active;
  active=harness({terminal:terminal(),detect:async()=>target('claude'),discover:async()=>{
   active.vscode.window.activeTerminal=terminal();return {profilePath:'/example/profile'};
  }});
- await active.api.refresh();await active.openCard()({type:'connect'});
+ const sendActive=active.openCard();
+ await active.api.refresh();await sendActive({type:'connect'});
+ assert.equal(active.confirmations.length,1);
  assert.equal(active.connected.length,0);
  let generic;
  generic=harness({terminal:terminal(),pickProvider:'codex',discover:async()=>{
   generic.vscode.window.activeTerminal=terminal();return {profilePath:'/example/profile'};
  }});
- await generic.api.refresh();await generic.openCard()({type:'connect'});
+ const sendGeneric=generic.openCard();
+ await generic.api.refresh();await sendGeneric({type:'connect'});
+ assert.equal(generic.confirmations.length,1);
  assert.equal(generic.connected.length,0);
 });

@@ -1,7 +1,7 @@
 'use strict';
 const test=require('node:test');
 const assert=require('node:assert/strict');
-const {connectionIdentity,sameProcess}=require('../src/connection.cjs');
+const {connectionIdentity,sameProcess,connectionForTarget}=require('../src/connection.cjs');
 
 test('connection identity is stable per provider UID and canonical settings path',()=>{
   const base={provider:'claude',uid:1000,settingsPath:'/home/a/.claude/settings.json'};
@@ -22,4 +22,27 @@ test('process equality includes Linux owner and birth identity',()=>{
   for(const change of [{pid:21},{uid:1001},{start_ticks:'21'},{boot_id:'other'}])
     assert.equal(sameProcess(process,{...process,...change}),false);
   assert.equal(sameProcess(process,null),false);
+});
+
+test('connectionForTarget never treats provider equality as profile equality',()=>{
+  const first={id:'first',provider:'claude',uid:1000,pendingProcess:{pid:20,uid:1000,start_ticks:'20',boot_id:'boot'}};
+  const second={id:'second',provider:'claude',uid:2000,pendingProcess:{pid:30,uid:2000,start_ticks:'30',boot_id:'boot'}};
+  assert.equal(connectionForTarget([first,second],{provider:'claude',process:{...second.pendingProcess}}).id,'second');
+  assert.equal(connectionForTarget([first,second],{provider:'claude',process:{...second.pendingProcess,pid:31}}),null);
+  assert.equal(connectionForTarget([first],{provider:'codex',process:{...first.pendingProcess}}),null);
+});
+
+test('connectionForTarget requires one exact pending owner and process birth identity',()=>{
+  const connection={id:'first',provider:'claude',uid:1000,pendingProcess:{pid:20,uid:1000,start_ticks:'20',boot_id:'boot'}};
+  const target={provider:'claude',process:{...connection.pendingProcess}};
+  for(const change of [{pid:21},{uid:1001},{start_ticks:'21'},{boot_id:'other'}])
+    assert.equal(connectionForTarget([connection],{...target,process:{...target.process,...change}}),null);
+  assert.equal(connectionForTarget([{...connection,uid:2000}],target),null);
+  assert.equal(connectionForTarget([{...connection,pendingProcess:undefined}],target),null);
+  assert.equal(connectionForTarget([connection,{...connection,id:'second'}],target),null);
+  assert.equal(connectionForTarget([null,connection],target),connection);
+  assert.equal(connectionForTarget([],target),null);
+  assert.equal(connectionForTarget(null,target),null);
+  assert.equal(connectionForTarget([connection],null),null);
+  assert.equal(connectionForTarget([connection],{provider:'claude'}),null);
 });

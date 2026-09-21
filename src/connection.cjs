@@ -13,4 +13,10 @@ function connectionIdentity({provider,uid,settingsPath}) {
 function sameProcess(a,b) {
   return !!a&&!!b&&['pid','uid','start_ticks','boot_id'].every(key=>a[key]===b[key]);
 }
-module.exports={connectionIdentity,sameProcess};
+function connectionForTarget(connections,target) {
+  if(!target || !Array.isArray(connections))return null;
+  const matches=connections.filter(value=>value?.provider===target.provider &&
+    value.uid===target.process?.uid && sameProcess(value.pendingProcess,target.process));
+  return matches.length===1?matches[0]:null;
+}
+module.exports={connectionIdentity,sameProcess,connectionForTarget};

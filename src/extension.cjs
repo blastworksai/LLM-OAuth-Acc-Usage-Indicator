@@ -4,6 +4,7 @@ const path=require('node:path');
 const os=require('node:os');
 const {readFeeds,matchReports,buildRows,SelectionController}=require('./core.cjs');
 const {detectProvider}=require('./provider.cjs');
+const {connectionForTarget,sameProcess}=require('./connection.cjs');
 const {buildViewModel,renderContent,renderDocument}=require('./panel.cjs');
 const setup=require('./setup.cjs');
 
@@ -15,10 +16,6 @@ function activate(context) {
   const setupReady=process.platform==='linux'
     ? setup.refreshRuntime(setupOptions).catch(()=>({warnings:['Saved provider connections need attention. Run Account Usage: Connect Provider.']}))
     : Promise.resolve({warnings:[]});
-  const changedTarget=(connections,target)=> {
-    const connection=target&&connections.find(value=>value.provider===target.provider);
-    return !!connection && typeof connection.cliLookupPath==='string' && connection.cliLookupPath!==target.cliPath;
-  };
   const getViewModel=()=>buildViewModel(controller.state);
   const getHtml=()=>renderContent(getViewModel(),assets);
   const render=()=> {
@@ -41,10 +38,10 @@ function activate(context) {
     if(result.status==='unavailable' && rejected)result.reason='No matching readable report. A report directory is missing, unreadable or unsafe.';
     if(result.status==='unavailable') {
       const target=await detectProvider(pid);
-      const connected=new Set(connections.map(connection=>connection.provider));
-      if(target && (!connected.has(target.provider) || changedTarget(connections,target)))result.setupTarget=target;
-      else if(target)result.reason='This provider is connected. Waiting for this session to finish a fresh turn.';
-      else if(connected.size<3)result.setupTarget={provider:null};
+      const connection=connectionForTarget(connections,target);
+      if(target&&!connection)result.setupTarget=target;
+      else if(connection)result.reason='This profile is connected. Waiting for this session to finish a fresh turn.';
+      else result.setupTarget={provider:null};
     }
     return result;
   },render);
@@ -63,7 +60,7 @@ function activate(context) {
     }
   };
   const sameTarget=(a,b)=>a && b && a.provider===b.provider && a.cliPath===b.cliPath &&
-    ['pid','uid','start_ticks','boot_id'].every(key=>a.process[key]===b.process[key]);
+    sameProcess(a.process,b.process);
   const connect=async(fromCard=false)=>{
     if(process.platform!=='linux') {
       await vscode.window.showInformationMessage('Provider connections currently support Linux terminal hosts.');return;
@@ -76,21 +73,29 @@ function activate(context) {
     if(fromCard && (selected!==vscode.window.activeTerminal ||
       (offered.provider!==null && !sameTarget(offered,detected)))) {await refresh();return;}
     await setupReady;
-    const connections=await setup.listConnections(setupOptions).catch(()=>[]);
-    const connected=new Set(connections.map(connection=>connection.provider));
-    const reconnect=changedTarget(connections,detected);
     const choices=[
       {label:'Codex',provider:'codex'},
       {label:'Claude Code',provider:'claude'},
       {label:'Antigravity',provider:'antigravity'}
-    ].filter(choice=>!connected.has(choice.provider) || (reconnect && choice.provider===detected.provider));
-    const picked=detected && (!connected.has(detected.provider) || reconnect) ? detected : await vscode.window.showQuickPick(
+    ];
+    const picked=detected || await vscode.window.showQuickPick(
       choices,{title:'Connect an account usage provider',placeHolder:'Choose the CLI running in this terminal.'});
     if(!picked)return;
+    const connectCurrent=async options=>{
+      const currentTarget=detected?await detectProvider(pid):null;
+      const currentPid=selected?await selected.processId:null;
+      if(selected!==vscode.window.activeTerminal || currentPid!==pid ||
+        (detected && !sameTarget(detected,currentTarget))) {
+        await vscode.window.showInformationMessage('The selected terminal changed. Select its session and connect again.');
+        await refresh();return false;
+      }
+      return setup.connectProvider(options);
+    };
     try {
       let profilePath,cliPath=detected?.cliPath;
       while(true) {
-        const options={...setupOptions,provider:picked.provider,...(profilePath?{profilePath}:{}),...(cliPath?{cliPath}:{})};
+        const options={...setupOptions,provider:picked.provider,...(profilePath?{profilePath}:{}),...(cliPath?{cliPath}:{}),
+          ...(detected?{pendingProcess:detected.process}:{})};
         let found;
         try {found=await setup.discoverProvider(options);}
         catch(error) {
@@ -127,16 +132,10 @@ function activate(context) {
           profilePath=selected[0].fsPath;continue;
         }
         if(action!==connectAction)return;
-        const currentPid=selected?await selected.processId:null;
-        if(selected!==vscode.window.activeTerminal || currentPid!==pid ||
-          (detected && !sameTarget(detected,await detectProvider(pid)))) {
-          await vscode.window.showInformationMessage('The selected terminal changed. Select its session and connect again.');
-          await refresh();return;
-        }
         const approved=new Map((Array.isArray(setupOptions.trustedDirectories)?setupOptions.trustedDirectories:[]).map(item=>[item.path,item]));
         for(const item of shared)approved.set(item.path,item);
         options.trustedDirectories=[...approved.values()];
-        if(await withRecovery(setup.connectProvider,options)===false)return;
+        if(await withRecovery(connectCurrent,options)===false)return;
         await context.globalState.update('trustedDirectories',options.trustedDirectories);
         setupOptions.trustedDirectories=options.trustedDirectories;
         await vscode.window.showInformationMessage(`${providerName(picked.provider)} connected. Select its terminal and finish a fresh turn to publish account usage.`);
@@ -147,15 +146,15 @@ function activate(context) {
   const disconnect=async()=>{
     try {
       await setupReady;
-      const picked=await vscode.window.showQuickPick([
-        {label:'Codex',provider:'codex'},
-        {label:'Claude Code',provider:'claude'},
-        {label:'Antigravity',provider:'antigravity'}
-      ],{title:'Disconnect account usage',placeHolder:'Removes Account Usage while preserving the provider configuration it does not own.'});
+      const connections=await setup.listConnections(setupOptions);
+      const items=connections.map(connection=>({label:providerName(connection.provider),
+        description:`UID ${connection.uid} · ${connection.profilePath}`,connection}));
+      const picked=await vscode.window.showQuickPick(items,
+        {title:'Disconnect account usage profile',placeHolder:'Removes Account Usage while preserving the provider configuration it does not own.'});
       if(!picked)return;
-      if(await withRecovery(setup.disconnectProvider,{...setupOptions,provider:picked.provider})===false)return;
+      if(await withRecovery(setup.disconnectProvider,{...setupOptions,connectionId:picked.connection.id})===false)return;
       await refresh();
-      await vscode.window.showInformationMessage(`${providerName(picked.provider)} disconnected.`);
+      await vscode.window.showInformationMessage(`${providerName(picked.connection.provider)} disconnected.`);
     } catch(error) {await showSetupError(error);}
   };
   const provider={resolveWebviewView(resolved) {

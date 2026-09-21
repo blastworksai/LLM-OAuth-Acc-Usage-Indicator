@@ -9,6 +9,7 @@ const {randomUUID, createHash} = require('node:crypto');
 const {isDeepStrictEqual} = require('node:util');
 const {promisify} = require('node:util');
 const {execFile} = require('node:child_process');
+const {connectionIdentity, sameProcess} = require('./connection.cjs');
 const PROVIDERS = ['claude', 'codex', 'antigravity'];
 const MARKER = 'llm-account-usage-managed-v1';
 const MAX_SETTINGS = 1024 * 1024;
@@ -206,13 +207,15 @@ function createSetup(dependencies = {}) {
   }
   async function inspect(o, {validateStatusLine = true} = {}) {
     if(!o.provider) throw failure('UNSUPPORTED_PROVIDER', 'Choose a provider.');
-    const profilePath = profile(o);
-    await safeDirectories(profilePath, o);
+    const selectedProfile = profile(o);
+    await safeDirectories(selectedProfile, o);
+    const profilePath = await io.realpath(selectedProfile);
     const settingsPath = path.join(profilePath, o.provider === 'codex' ? 'hooks.json' : 'settings.json');
     const bytes = await readSafe(settingsPath, o);
     const config = parse(bytes);
     if(o.provider === 'codex') checkCodexHooks(config);else if(validateStatusLine) checkStatusLine(config);
-    return {provider:o.provider, profilePath, settingsPath, ...await findCli(o),
+    const identity = connectionIdentity({provider:o.provider, uid:o.uid, settingsPath});
+    return {identity, id:identity.id, provider:o.provider, profilePath, settingsPath, ...await findCli(o),
       hasExistingStatusLine:o.provider !== 'codex' && own(config, 'statusLine'), hasExistingHooks:o.provider === 'codex' && own(config, 'hooks'), bytes, config};
   }
   async function discoverProvider(input) {
@@ -222,24 +225,50 @@ function createSetup(dependencies = {}) {
     o.sharedDirectoryReview = new Map();
     const {bytes, config, ...preview} = await inspect(o);
     await safeDirectories(o.storagePath, o, {allowMissing:true});
-    await safeDirectories(locations(o).root, o, {allowMissing:true});
+    await safeDirectories(locations(o, preview.identity).root, o, {allowMissing:true});
     await nativeExecutable(o.nodePath, o, 'UNSUPPORTED_RUNTIME');
     return {...preview, sharedDirectories:[...o.sharedDirectoryReview.values()]};
   }
-  function locations(o, provider = o.provider) {
-    absolute(o.storagePath);
+  function locations(o, identity) {
+    if(!identity || typeof identity.id !== 'string' || !/^v2-[a-f0-9]{32}$/.test(identity.id))
+      throw failure('INVALID_CONNECTION', 'A valid profile connection is required.');
     // The provider still invokes this hook after an editor uninstall. Its
     // launcher and original-command recovery must outlive editor-owned storage.
-    const root = path.join(absolute(o.homeDir), '.local/state/llm-account-usage/providers', provider);
-    return {root, receiptPath:path.join(root, 'connection.json'), launcherPath:path.join(root, 'run.sh'),
+    const root = path.join(absolute(o.homeDir), '.local/state/llm-account-usage/connections', identity.id);
+    return {id:identity.id, root, receiptPath:path.join(root, 'connection.json'), launcherPath:path.join(root, 'run.sh'),
       collectorPath:path.join(root, 'passive.cjs'), reportDir:path.join(root, 'reports')};
+  }
+  async function connectionLocations(o) {
+    const parent=path.join(absolute(o.homeDir),'.local/state/llm-account-usage/connections');
+    if(!await stat(parent))return [];
+    await safeDirectories(parent,o);
+    const names=[];
+    let count=0;
+    for await(const entry of await io.opendir(parent)) {
+      if(++count>128)throw failure('TOO_MANY_CONNECTIONS','Too many saved profile connections were found.');
+      if(entry.isDirectory()&&/^v2-[a-f0-9]{32}$/.test(entry.name))names.push(entry.name);
+    }
+    return names.sort().map(id=>locations(o,{id}));
+  }
+  function pendingProcess(value, uid) {
+    if(value === undefined || value === null)return null;
+    if(!object(value) || !Number.isSafeInteger(value.pid) || value.pid<=0 || value.uid!==uid ||
+      typeof value.start_ticks!=='string' || !/^\d{1,30}$/.test(value.start_ticks) ||
+      typeof value.boot_id!=='string' || !value.boot_id.length || value.boot_id.length>128 || /[\0\r\n]/.test(value.boot_id))
+      throw failure('INVALID_PROCESS','The pending process must identify a process owned by this connection.');
+    return {pid:value.pid,uid:value.uid,start_ticks:value.start_ticks,boot_id:value.boot_id};
   }
   async function receipt(o, loc) {
     const bytes = await readSafe(loc.receiptPath, o, {privateFile:true});
     if(bytes === null) return null;
     const data = parse(bytes);
     const kind = data.kind || (data.provider === 'codex' ? null : 'statusline');
-    const common = data.version === 1 && data.provider === o.provider && data.uid === o.uid &&
+    let identity;
+    try { identity=connectionIdentity(data); } catch { /* Rejected below. */ }
+    const common = data.version === 2 && data.id === loc.id && identity?.id === loc.id &&
+      (!o.provider || data.provider === o.provider) && data.uid === o.uid &&
+      data.settingsPath === identity?.settingsPath && typeof data.profilePath === 'string' &&
+      data.settingsPath === path.join(data.profilePath, data.provider === 'codex' ? 'hooks.json' : 'settings.json') &&
       ['connected', 'disconnected'].includes(data.status) && typeof data.cliPath === 'string' &&
       typeof data.cliLookupPath === 'string' && typeof data.ownerStoragePath === 'string';
     const statusline = kind === 'statusline' && object(data.installedStatusLine) &&
@@ -252,6 +281,8 @@ function createSetup(dependencies = {}) {
     if(!common || (!statusline && !codex))
       throw failure('INVALID_RECEIPT', 'The saved connection cannot be verified. Provider settings were left unchanged.');
     absolute(data.settingsPath);
+    absolute(data.profilePath);
+    data.pendingProcess=pendingProcess(data.pendingProcess,data.uid);
     data.kind = kind;
     return data;
   }
@@ -266,7 +297,7 @@ function createSetup(dependencies = {}) {
     return {pid, uid:info.uid, start_ticks, boot_id};
   }
   function sameOwner(a, b) {
-    return ['pid', 'uid', 'start_ticks', 'boot_id'].every(key => a[key] === b[key]);
+    return sameProcess(a,b);
   }
   function invalidLock(loc) {
     return recoverable('SETUP_LOCK_UNVERIFIABLE',
@@ -309,8 +340,7 @@ function createSetup(dependencies = {}) {
       throw invalidLock(loc);
     } finally { await ownerFile?.close(); await directory?.close(); }
   }
-  async function locked(o, action) {
-    const loc = locations(o);
+  async function locked(o, loc, action) {
     await safeDirectories(loc.root, o, {create:true, privateLeaf:true});
     const root = await io.open(loc.root, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
     const anchor = `/proc/self/fd/${root.fd}`, unique = randomUUID();
@@ -375,7 +405,8 @@ function createSetup(dependencies = {}) {
     await put(loc.receiptPath, json(data), o, 0o600);
   }
   function publicConnection(data, loc) {
-    return {provider:data.provider, connected:data.status === 'connected', settingsPath:data.settingsPath,
+    return {id:data.id, provider:data.provider, uid:data.uid, profilePath:data.profilePath,
+      pendingProcess:data.pendingProcess, connected:data.status === 'connected', settingsPath:data.settingsPath,
       cliLookupPath:data.cliLookupPath, reportDir:loc.reportDir, launcherPath:loc.launcherPath,
       backupPath:path.join(loc.root, data.backupName)};
   }
@@ -435,10 +466,10 @@ function createSetup(dependencies = {}) {
   async function connectProvider(input) {
     const o = options(input);
     const found = await inspect(o, {validateStatusLine:false});
-    return locked(o, async loc => {
+    const pending=pendingProcess(o.pendingProcess,o.uid);
+    return locked(o, locations(o,found.identity), async loc => {
       let data = await retireMissingHook(o, loc, await receipt(o, loc));
       if(data?.status === 'connected') {
-        if(data.settingsPath !== found.settingsPath) throw failure('PROFILE_CONFLICT', 'Disconnect the existing provider profile before selecting another.');
         await claimConnection(o, loc, data);
         if(data.kind === 'codex-hook') {
           const state = codexHookState(found.config, data.installedHook);
@@ -446,7 +477,8 @@ function createSetup(dependencies = {}) {
             throw failure('SETTINGS_CHANGED', 'The installed Codex hook was edited. Review it before reconnecting or disconnecting.');
         } else if(!isDeepStrictEqual(found.config.statusLine, data.installedStatusLine))
           throw failure('SETTINGS_CHANGED', 'The installed status line was edited. Review it before reconnecting or disconnecting.');
-        const nextData={...data,cliPath:found.cliPath,cliLookupPath:found.cliLookupPath};
+        const nextData={...data,cliPath:found.cliPath,cliLookupPath:found.cliLookupPath,
+          pendingProcess:o.pendingProcess === undefined ? data.pendingProcess : pending};
         const runtime=await writeRuntime(o, loc, nextData);nextData.cliPath=runtime.cliPath;
         await put(loc.receiptPath, json(nextData), o, 0o600);
         return publicConnection(nextData, loc);
@@ -461,7 +493,8 @@ function createSetup(dependencies = {}) {
       }
       await safeDirectories(o.storagePath, o, {create:true});
       let next;
-      const common = {version:1, status:'connected', provider:o.provider, uid:o.uid, settingsPath:found.settingsPath,
+      const common = {version:2, id:found.id, profilePath:found.profilePath, pendingProcess:pending,
+        status:'connected', provider:o.provider, uid:o.uid, settingsPath:found.settingsPath,
         ownerStoragePath:absolute(o.storagePath), cliPath:found.cliPath, cliLookupPath:found.cliLookupPath,
         settingsExisted:found.bytes !== null};
       if(o.provider === 'codex') {
@@ -493,11 +526,25 @@ function createSetup(dependencies = {}) {
   }
   async function disconnectProvider(input) {
     const o = options(input);
-    const loc = locations(o);
+    let loc;
+    if(o.connectionId !== undefined) {
+      locations(o,{id:o.connectionId});
+      loc=(await connectionLocations(o)).find(value=>value.id===o.connectionId);
+      if(!loc)throw failure('INVALID_CONNECTION','The selected profile connection was not found.');
+    } else {
+      if(!o.provider)throw failure('UNSUPPORTED_PROVIDER','Choose a provider.');
+      const selectedProfile=profile(o);
+      await safeDirectories(selectedProfile,o);
+      const profilePath=await io.realpath(selectedProfile);
+      loc=locations(o,connectionIdentity({provider:o.provider,uid:o.uid,
+        settingsPath:path.join(profilePath,o.provider==='codex'?'hooks.json':'settings.json')}));
+    }
     if(!await stat(loc.root)) return {provider:o.provider, connected:false};
-    return locked(o, async current => {
+    return locked(o, loc, async current => {
       const data = await retireMissingHook(o, current, await receipt(o, current));
-      if(!data || data.status === 'disconnected') return {provider:o.provider, connected:false};
+      if(!data && o.connectionId !== undefined)throw failure('INVALID_CONNECTION','The selected profile connection was not found.');
+      if(!data) return {provider:o.provider, connected:false};
+      if(data.status === 'disconnected')return publicConnection(data,current);
       await claimConnection(o, current, data);
       const bytes = await readSafe(data.settingsPath, o);
       const config = parse(bytes);
@@ -524,9 +571,8 @@ function createSetup(dependencies = {}) {
   async function listConnections(input) {
     const base = options(input);
     const results = [];
-    for(const provider of PROVIDERS) {
-      const o = {...base, provider}, loc = locations(o);
-      if(!await stat(loc.root)) continue;
+    for(const loc of await connectionLocations(base)) {
+      const o = {...base, provider:undefined};
       try {
         await safeDirectories(loc.root, o, {privateLeaf:true});
         const data = await receipt(o, loc);
@@ -538,19 +584,19 @@ function createSetup(dependencies = {}) {
           const state=codexHookState(config,data.installedHook);
           if(state.exact.length===1 && state.managed.length===1)results.push(publicConnection(data,loc));
         } else if(isDeepStrictEqual(config.statusLine, data.installedStatusLine)) results.push(publicConnection(data, loc));
-      } catch { /* A damaged provider receipt cannot suppress another provider. */ }
+      } catch { /* A damaged connection cannot suppress another profile. */ }
     }
     return results;
   }
   async function refreshRuntime(input) {
     const base = options(input), warnings = [], refreshed = [];
-    for(const provider of PROVIDERS) {
-      const o = {...base, provider}, loc = locations(o);
-      if(!await stat(loc.root)) continue;
+    for(const loc of await connectionLocations(base)) {
+      const o = {...base, provider:undefined};
       try {
-        await locked(o, async current => {
+        await locked(o, loc, async current => {
           const data = await receipt(o, current);
           if(data?.status === 'connected' && data.ownerStoragePath === absolute(o.storagePath)) {
+            o.provider=data.provider;
             if(data.kind === 'codex-hook') {
               const config=parse(await readSafe(data.settingsPath,o)),state=codexHookState(config,data.installedHook);
               if(state.exact.length!==1 || state.managed.length!==1)
@@ -559,11 +605,11 @@ function createSetup(dependencies = {}) {
             try {
               const runtime=await writeRuntime(o, current, data);
               if(data.cliPath!==runtime.cliPath) {data.cliPath=runtime.cliPath;await put(current.receiptPath,json(data),o,0o600);}
-              refreshed.push(provider);
+              refreshed.push(data.provider);
             } catch(error) {await disableRuntime(o,current,data);throw error;}
           }
         });
-      } catch(error) { if(error.code !== 'SETUP_BUSY') warnings.push(`${provider}: saved collector runtime could not be refreshed; reconnect after reviewing setup.`); }
+      } catch(error) { if(error.code !== 'SETUP_BUSY') warnings.push(`${loc.id}: saved collector runtime could not be refreshed; reconnect after reviewing setup.`); }
     }
     return {refreshed, warnings};
   }

@@ -23,6 +23,85 @@ async function fixture(t, provider = 'claude') {
 const readJson = async file => JSON.parse(await fs.readFile(file, 'utf8'));
 const writeJson = (file, value) => fs.writeFile(file, JSON.stringify(value), {mode:0o600});
 
+async function createProfile(f,name) {
+  const profilePath=path.join(f.homeDir,name);
+  await fs.mkdir(profilePath,{mode:0o700});
+  await writeJson(path.join(profilePath,f.options.provider==='codex'?'hooks.json':'settings.json'),{profile:name});
+  return profilePath;
+}
+
+test('two profiles of one provider connect and disconnect independently in either order',async t=>{
+  for(const reverse of [false,true]) {
+    const f=await fixture(t);
+    const secondProfile=await createProfile(f,'second-claude');
+    const second=await f.setup.connectProvider({...f.options,profilePath:secondProfile,
+      pendingProcess:{pid:22,uid:process.getuid(),start_ticks:'22',boot_id:'boot'}});
+    const first=await f.setup.connectProvider({...f.options,
+      pendingProcess:{pid:11,uid:process.getuid(),start_ticks:'11',boot_id:'boot'}});
+    assert.notEqual(first.id,second.id);
+    assert.notEqual(path.dirname(first.launcherPath),path.dirname(second.launcherPath));
+    assert.deepEqual(new Set((await f.setup.listConnections(f.options)).map(value=>value.id)),new Set([first.id,second.id]));
+    assert.equal(first.uid,process.getuid());
+    assert.equal(first.profilePath,f.profilePath);
+    assert.equal(first.pendingProcess.pid,11);
+    const [removed,kept]=reverse?[first,second]:[second,first];
+    await f.setup.disconnectProvider({...f.options,connectionId:removed.id});
+    assert.deepEqual((await f.setup.listConnections(f.options)).map(value=>value.id),[kept.id]);
+    assert.match((await readJson(kept.settingsPath)).statusLine.command,/llm-account-usage-managed-v1/);
+    assert.deepEqual(await readJson(removed.settingsPath),reverse?{}:{profile:'second-claude'});
+  }
+});
+
+test('every provider keeps two profile receipts independent in both connection orders',async t=>{
+  for(const provider of ['claude','codex','antigravity'])for(const reverse of [false,true]) {
+    const f=await fixture(t,provider);
+    const other=await createProfile(f,`${provider}-${reverse?'reverse':'forward'}`);
+    const profiles=reverse?[other,f.profilePath]:[f.profilePath,other];
+    const connected=[];
+    for(const profilePath of profiles)connected.push(await f.setup.connectProvider({...f.options,profilePath}));
+    assert.equal(new Set(connected.map(value=>value.id)).size,2);
+    assert.equal(new Set(connected.map(value=>value.launcherPath)).size,2);
+    await f.setup.disconnectProvider({...f.options,profilePath:profiles[0]});
+    assert.deepEqual((await f.setup.listConnections(f.options)).map(value=>value.id),[connected[1].id]);
+    assert.equal((await f.setup.refreshRuntime(f.options)).refreshed.length,1);
+  }
+});
+
+test('connection rejects mismatched pending owner and unknown disconnect identities',async t=>{
+  const f=await fixture(t);
+  await assert.rejects(f.setup.connectProvider({...f.options,pendingProcess:{pid:20,uid:process.getuid()+1,start_ticks:'20',boot_id:'boot'}}),{code:'INVALID_PROCESS'});
+  for(const connectionId of ['bad','v2-'+'0'.repeat(32),['v2-'+'0'.repeat(32)]])
+    await assert.rejects(f.setup.disconnectProvider({...f.options,connectionId}),{code:'INVALID_CONNECTION'});
+});
+
+test('a damaged profile receipt or unsafe runtime cannot suppress a sibling profile',async t=>{
+  const f=await fixture(t);
+  const first=await f.setup.connectProvider(f.options);
+  const second=await f.setup.connectProvider({...f.options,profilePath:await createProfile(f,'sibling')});
+  const receiptPath=path.join(path.dirname(first.launcherPath),'connection.json');
+  const saved=await readJson(receiptPath);
+  for(const change of [{id:second.id},{settingsPath:second.settingsPath}]) {
+    await writeJson(receiptPath,{...saved,...change});
+    assert.deepEqual((await f.setup.listConnections(f.options)).map(value=>value.id),[second.id]);
+    const refresh=await f.setup.refreshRuntime(f.options);
+    assert.equal(refresh.warnings.length,1);
+    assert.equal(refresh.refreshed.length,1);
+  }
+  await writeJson(receiptPath,saved);
+  await fs.chmod(path.dirname(first.launcherPath),0o755);
+  assert.deepEqual((await f.setup.listConnections(f.options)).map(value=>value.id),[second.id]);
+  assert.equal((await f.setup.refreshRuntime(f.options)).warnings.length,1);
+});
+
+test('connection directory enumeration refuses more than 128 entries',async t=>{
+  const f=await fixture(t);
+  const first=await f.setup.connectProvider(f.options);
+  const parent=path.dirname(path.dirname(first.launcherPath));
+  for(let i=0;i<128;i++)await fs.mkdir(path.join(parent,`ignored-${i}`),{mode:0o700});
+  await assert.rejects(f.setup.listConnections(f.options),{code:'TOO_MANY_CONNECTIONS'});
+  await assert.rejects(f.setup.refreshRuntime(f.options),{code:'TOO_MANY_CONNECTIONS'});
+});
+
 test('fresh connect installs stable private runtime and preserves unrelated config', async t => {
   const f = await fixture(t);
   await writeJson(f.settingsPath, {theme:'dark', permissions:{deny:['example']}});

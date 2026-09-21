@@ -660,6 +660,19 @@ function createSetup(dependencies = {}) {
     }
     return results;
   }
+  async function listDisconnectConnections(input) {
+    const base=options(input),storagePath=absolute(base.storagePath),results=[];
+    for(const {loc,data,error} of await savedConnections(base)) {
+      if(error || data?.status!=='connected')continue;
+      try {
+        // Recovery needs the validated receipt even when its CLI or report
+        // feed is unavailable. Only disconnectProvider may claim an orphan.
+        if(data.ownerStoragePath!==storagePath && await stat(absolute(data.ownerStoragePath)))continue;
+        results.push(publicConnection(data,loc));
+      } catch { /* An unverifiable owner cannot suppress a sibling receipt. */ }
+    }
+    return results;
+  }
   async function refreshRuntime(input) {
     const base = options(input), warnings = [], refreshed = [];
     for(const entry of await savedConnections(base)) {
@@ -693,7 +706,7 @@ function createSetup(dependencies = {}) {
     }
     return {refreshed, warnings};
   }
-  return {discoverProvider, connectProvider, disconnectProvider, listConnections, refreshRuntime};
+  return {discoverProvider, connectProvider, disconnectProvider, listConnections, listDisconnectConnections, refreshRuntime};
 }
 
 module.exports = {createSetup, ...createSetup()};

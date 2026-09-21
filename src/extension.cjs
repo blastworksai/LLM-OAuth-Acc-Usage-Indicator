@@ -146,7 +146,7 @@ function activate(context) {
   const disconnect=async()=>{
     try {
       await setupReady;
-      const connections=await setup.listConnections(setupOptions);
+      const connections=await setup.listDisconnectConnections(setupOptions);
       const items=connections.map(connection=>({label:providerName(connection.provider),
         description:`UID ${connection.uid} · ${connection.profilePath}`,connection}));
       const picked=await vscode.window.showQuickPick(items,

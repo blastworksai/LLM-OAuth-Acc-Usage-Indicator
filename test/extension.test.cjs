@@ -2,10 +2,13 @@
 const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const fs=require('node:fs');
+const os=require('node:os');
 const path=require('node:path');
 const vm=require('node:vm');
+const {createSetup}=require('../src/setup.cjs');
 
-function harness({discover,connect,disconnect,recover='Recover connection',confirm='Connect',pickPath='/example/profile',pickProvider='claude',pickConnection,savedTrust=[],terminal,detect=async()=>null,connections=[],reports=[],match,collect}={}) {
+function harness({discover,connect,disconnect,recover='Recover connection',confirm='Connect',pickPath='/example/profile',pickProvider='claude',pickConnection,savedTrust=[],terminal,detect=async()=>null,connections=[],reports=[],match,collect,
+  setupApi,storagePath='/example/editor-storage',nodePath='/example/editor-node',extensionPath='/example/extension'}={}) {
   const commands=new Map(),connected=[],discovered=[],errors=[],warnings=[],confirmations=[],storage=new Map([['trustedDirectories',savedTrust]]);
   let provider,receive,picks=0,lastPickItems=[],collectionCalls=0,feedDirectories=[];
   const disposable=()=>({dispose(){}});
@@ -16,18 +19,18 @@ function harness({discover,connect,disconnect,recover='Recover connection',confi
       showWarningMessage:async(message,action)=>{warnings.push(message);return action?.modal?(typeof recover==='function'?recover():recover):action;},
       showErrorMessage:async message=>{errors.push(message);}},
     commands:{registerCommand:(name,callback)=>{commands.set(name,callback);return disposable();},executeCommand:async()=>{}}};
-  const setup={refreshRuntime:async()=>({warnings:[]}),listConnections:async()=>connections,
+  const setup=setupApi||{refreshRuntime:async()=>({warnings:[]}),listConnections:async()=>connections,listDisconnectConnections:async()=>connections,
     discoverProvider:async options=>{discovered.push({...options});return discover?discover(options):{profilePath:'/example/profile',hasExistingStatusLine:true};},
     connectProvider:async options=>{connected.push(options);return connect?.(options);},
     disconnectProvider:async options=>{connected.push(options);return disconnect?.(options);}};
   const core={SelectionController:require('../src/core.cjs').SelectionController,buildRows:()=>[],
     readFeeds:async directories=>{feedDirectories=directories;return {reports,rejected:0};},matchReports:match|| (async()=>({status:'unavailable'}))};
   const exports={};
-  const sandbox={module:{exports},exports,process:{platform:'linux',execPath:'/example/editor-node'},setInterval:()=>1,clearInterval(){},
+  const sandbox={module:{exports},exports,process:{platform:'linux',execPath:nodePath},setInterval:()=>1,clearInterval(){},
     require:name=>name==='vscode'?vscode:name==='./setup.cjs'?setup:name==='./core.cjs'?core:name==='./collect.cjs'?{collectTerminal:async pid=>{collectionCalls++;return collect?.(pid)??null;}}:name==='./provider.cjs'?{detectProvider:detect}:
       name==='./connection.cjs'?require('../src/connection.cjs'):name==='./panel.cjs'?{buildViewModel:()=>({}),renderContent:()=>'',renderDocument:()=>''}:require(name)};
   vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../src/extension.cjs'),'utf8'),sandbox);
-  const api=sandbox.module.exports.activate({globalStorageUri:{fsPath:'/example/editor-storage'},extensionPath:'/example/extension',subscriptions:[],
+  const api=sandbox.module.exports.activate({globalStorageUri:{fsPath:storagePath},extensionPath,subscriptions:[],
     globalState:{get:(key,fallback)=>storage.get(key)??fallback,update:async(key,value)=>{storage.set(key,value);}}});
   const openCard=()=>{
     provider.resolveWebviewView({webview:{asWebviewUri:uri=>uri.fsPath,postMessage:async()=>{},
@@ -67,18 +70,81 @@ test('unexpected setup errors never display raw command or credential text',asyn
   await h.commands.get('llmAccountUsage.connect')();
   assert.equal(h.connected.length,0);assert.equal(h.errors.length,1);assert.doesNotMatch(h.errors[0],/SENSITIVE_FIXTURE_VALUE/);
 });
-test('missing editor ownership is recovered only after explicit confirmation for connect and disconnect',async()=>{
-  for(const command of ['connect','disconnect'])for(const consent of [true,false]) {
+test('connect retries missing editor ownership only after explicit confirmation',async()=>{
+  for(const consent of [true,false]) {
     const operation=async options=>{if(!options.confirmTakeover)throw problem('TAKEOVER_REQUIRED');};
-    const h=harness({[command]:operation,recover:consent?'Recover connection':'Cancel',connections:[{
-      id:'example',provider:'claude',uid:1000,profilePath:'/example/profile',reportDir:'/example/reports'
-    }]});
-    await h.commands.get(`llmAccountUsage.${command}`)();
+    const h=harness({connect:operation,recover:consent?'Recover connection':'Cancel'});
+    await h.commands.get('llmAccountUsage.connect')();
     assert.equal(h.connected.length,consent?2:1);
     assert.equal(h.connected[0].confirmTakeover,undefined);
     if(consent)assert.equal(h.connected[1].confirmTakeover,true);
     assert.equal(h.errors.length,0);
   }
+});
+
+async function disconnectFixture(t,{orphan=false,missingCli=false}={}) {
+  const io=fs.promises;
+  const homeDir=await io.mkdtemp(path.join(os.tmpdir(),'account-usage-extension-'));
+  t.after(()=>io.rm(homeDir,{recursive:true,force:true}));
+  const extensionPath=path.resolve(__dirname,'..'),storagePath=path.join(homeDir,'original-editor');
+  const cliPath=path.join(homeDir,'native-cli');
+  await io.symlink(process.execPath,cliPath);
+  const setup=createSetup({homeDir,systemUid:(await io.stat('/')).uid,env:{PATH:''}});
+  const options={provider:'claude',storagePath,nodePath:process.execPath,cliPath,
+    collectorPath:path.join(extensionPath,'collectors/passive.cjs')};
+  const installed=[],originals=[];
+  for(const name of ['first','second']) {
+    const profilePath=path.join(homeDir,name);
+    await io.mkdir(profilePath,{mode:0o700});
+    const original={theme:name,statusLine:{type:'command',command:`printf ${name}`}};
+    await io.writeFile(path.join(profilePath,'settings.json'),JSON.stringify(original),{mode:0o600});
+    installed.push(await setup.connectProvider({...options,profilePath}));
+    originals.push(original);
+  }
+  if(orphan)await io.rmdir(storagePath);
+  if(missingCli)await io.unlink(cliPath);
+  return {setup,installed,originals,extensionPath,nodePath:process.execPath,
+    storagePath:orphan?path.join(homeDir,'replacement-editor'):storagePath};
+}
+
+test('disconnect command finds actual orphaned receipts and restores only the selected profile after consent',async t=>{
+  for(const consent of [false,true]) {
+    const f=await disconnectFixture(t,{orphan:true});
+    assert.deepEqual(await f.setup.listConnections({storagePath:f.storagePath}),[]);
+    const files=f.installed.flatMap(connection=>[connection.settingsPath,
+      path.join(path.dirname(connection.launcherPath),'connection.json')]);
+    const before=await Promise.all(files.map(file=>fs.promises.readFile(file)));
+    const h=harness({...f,setupApi:f.setup,pickConnection:f.installed[1].id,recover:consent?'Recover connection':'Cancel'});
+    await h.commands.get('llmAccountUsage.disconnect')();
+    assert.equal(h.lastPickItems.length,2);
+    assert.equal(h.warnings.length,1);
+    assert.equal(h.errors.length,0);
+    const picked=h.lastPickItems.find(item=>item.connection.id===f.installed[1].id);
+    assert.equal(picked.description,`UID ${process.getuid()} · ${f.installed[1].profilePath}`);
+    assert.deepEqual(await Promise.all(files.slice(0,2).map(file=>fs.promises.readFile(file))),before.slice(0,2));
+    if(consent) {
+      assert.deepEqual(JSON.parse(await fs.promises.readFile(files[2],'utf8')),f.originals[1]);
+      const saved=JSON.parse(await fs.promises.readFile(files[3],'utf8'));
+      assert.equal(saved.status,'disconnected');
+      assert.equal(saved.ownerStoragePath,f.storagePath);
+    } else {
+      assert.deepEqual(await Promise.all(files.map(file=>fs.promises.readFile(file))),before);
+      await assert.rejects(fs.promises.stat(f.storagePath),{code:'ENOENT'});
+    }
+  }
+});
+
+test('disconnect command finds actual receipts after their CLI disappears',async t=>{
+  const f=await disconnectFixture(t,{missingCli:true});
+  assert.deepEqual(await f.setup.listConnections({storagePath:f.storagePath}),[]);
+  const before=await fs.promises.readFile(f.installed[0].settingsPath);
+  const h=harness({...f,setupApi:f.setup,pickConnection:f.installed[1].id});
+  await h.commands.get('llmAccountUsage.disconnect')();
+  assert.equal(h.lastPickItems.length,2);
+  assert.equal(h.errors.length,0);
+  assert.equal(h.warnings.length,0);
+  assert.deepEqual(await fs.promises.readFile(f.installed[0].settingsPath),before);
+  assert.deepEqual(JSON.parse(await fs.promises.readFile(f.installed[1].settingsPath,'utf8')),f.originals[1]);
 });
 
 test('shared-path trust explains the exact control boundary and is retained only after success',async()=>{

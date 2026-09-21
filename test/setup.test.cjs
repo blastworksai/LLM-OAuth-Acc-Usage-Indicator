@@ -144,6 +144,7 @@ test('a legacy and version-2 receipt claiming one identity fail closed',async t=
     path.join(path.dirname(current.launcherPath),'connection.json')];
   const before=await Promise.all(files.map(file=>fs.readFile(file)));
   await assert.rejects(f.setup.listConnections(f.options),{code:'DUPLICATE_CONNECTION'});
+  await assert.rejects(f.setup.listDisconnectConnections(f.options),{code:'DUPLICATE_CONNECTION'});
   await assert.rejects(f.setup.refreshRuntime(f.options),{code:'DUPLICATE_CONNECTION'});
   await assert.rejects(f.setup.connectProvider(f.options),{code:'DUPLICATE_CONNECTION'});
   await assert.rejects(f.setup.disconnectProvider({...f.options,connectionId:current.id}),{code:'DUPLICATE_CONNECTION'});
@@ -732,6 +733,63 @@ test('missing editor ownership requires explicit takeover confirmation', async t
   assert.deepEqual(await fs.readFile(f.settingsPath), original);
   await f.setup.disconnectProvider(other);
   assert.deepEqual(await readJson(f.settingsPath), {});
+});
+
+test('disconnect recovery listing retains orphaned receipts without changing live report eligibility or files',async t=>{
+  for(const provider of ['claude','codex','antigravity'])for(const legacy of [false,true]) {
+    const f=await fixture(t,provider);
+    if(legacy)await seedLegacyConnection(f);
+    else await f.setup.connectProvider(f.options);
+    const [installed]=await f.setup.listConnections(f.options);
+    const original=await fs.readFile(installed.backupPath);
+    const receiptPath=path.join(path.dirname(installed.launcherPath),'connection.json');
+    const files=[installed.settingsPath,receiptPath,installed.launcherPath,installed.backupPath];
+    const before=await Promise.all(files.map(file=>fs.readFile(file)));
+    await fs.rmdir(f.options.storagePath);
+    const other={...f.options,storagePath:path.join(f.homeDir,'other-editor')};
+    assert.deepEqual(await f.setup.listConnections(other),[]);
+    const listed=await f.setup.listDisconnectConnections(other);
+    assert.deepEqual(listed,[installed]);
+    assert.deepEqual(await Promise.all(files.map(file=>fs.readFile(file))),before);
+    await assert.rejects(fs.stat(other.storagePath),{code:'ENOENT'});
+    await assert.rejects(f.setup.disconnectProvider({...other,connectionId:listed[0].id}),{code:'TAKEOVER_REQUIRED'});
+    assert.deepEqual(await Promise.all(files.map(file=>fs.readFile(file))),before);
+    await f.setup.disconnectProvider({...other,connectionId:listed[0].id,confirmTakeover:true});
+    assert.deepEqual(await readJson(installed.settingsPath),JSON.parse(original));
+    assert.deepEqual(await f.setup.listDisconnectConnections(other),[]);
+  }
+});
+
+test('disconnect recovery listing retains a connection whose CLI disappeared',async t=>{
+  const f=await fixture(t);
+  const cliPath=path.join(f.homeDir,'native-cli');
+  await fs.symlink(process.execPath,cliPath);
+  const installed=await f.setup.connectProvider({...f.options,cliPath});
+  await fs.unlink(cliPath);
+  const receiptPath=path.join(path.dirname(installed.launcherPath),'connection.json');
+  const files=[installed.settingsPath,receiptPath,installed.launcherPath,installed.backupPath];
+  const before=await Promise.all(files.map(file=>fs.readFile(file)));
+  assert.deepEqual(await f.setup.listConnections(f.options),[]);
+  assert.deepEqual(await f.setup.listDisconnectConnections(f.options),[installed]);
+  assert.deepEqual(await Promise.all(files.map(file=>fs.readFile(file))),before);
+  await f.setup.disconnectProvider({...f.options,connectionId:installed.id});
+  assert.deepEqual(await readJson(installed.settingsPath),{});
+  assert.deepEqual(await f.setup.listDisconnectConnections(f.options),[]);
+});
+
+test('disconnect recovery listing isolates corrupt receipts and excludes another live editor',async t=>{
+  const f=await fixture(t);
+  const current=await f.setup.connectProvider(f.options);
+  const corrupt=await f.setup.connectProvider({...f.options,profilePath:await createProfile(f,'corrupt-profile')});
+  const other=await f.setup.connectProvider({...f.options,profilePath:await createProfile(f,'other-editor-profile'),
+    storagePath:path.join(f.homeDir,'other-editor')});
+  const corruptReceipt=path.join(path.dirname(corrupt.launcherPath),'connection.json');
+  await fs.writeFile(corruptReceipt,'{bad',{mode:0o600});
+  const files=[current.settingsPath,other.settingsPath,corruptReceipt,current.launcherPath,other.launcherPath];
+  const before=await Promise.all(files.map(file=>fs.readFile(file)));
+  assert.deepEqual(await f.setup.listDisconnectConnections(f.options),[current]);
+  assert.deepEqual(await Promise.all(files.map(file=>fs.readFile(file))),before);
+  await assert.rejects(f.setup.disconnectProvider({...f.options,connectionId:other.id,confirmTakeover:true}),{code:'ALREADY_CONNECTED'});
 });
 
 test('interrupted install and manual hook removal recover without overwriting replacement settings', async t => {

@@ -5,6 +5,8 @@ const os=require('node:os');
 const path=require('node:path');
 const {readProcess,matchReports}=require('./core.cjs');
 const MAX_PROCESSES=8192,MAX_CANDIDATES=32;
+// Kernel process names of the tools that switch user and run a command below them.
+const USER_SWITCHERS=new Set(['sudo','sudo-rs','su','doas','runuser']);
 const same=(a,b)=>!!a&&!!b&&['pid','uid','start_ticks','boot_id'].every(key=>a[key]===b[key]);
 const sameForeground=(a,b)=>same(a,b)&&['pgrp','tty_nr','tpgid'].every(key=>a[key]===b[key]);
 async function* processIds() {
@@ -142,9 +144,10 @@ function createProviderDetector({platform=process.platform,uid=process.getuid?.(
    }
    // A user-switching wrapper (`sudo -u`, `su`, `runuser`) keeps its own process in
    // the terminal's foreground group while the CLI runs below it on a pty of its own;
-   // both match. Switching user needs root, so drop a candidate only when it is
-   // root-owned AND another candidate's ancestor. A non-root ancestor may itself be
-   // a CLI that launched another, and stays: that, like siblings, is ambiguous.
+   // both match. Drop a candidate only when it is established as such a wrapper:
+   // root-owned (switching user needs root), named as a known user switcher, AND
+   // another candidate's ancestor. Any other ancestor may itself be a CLI that
+   // launched another, even as root, and stays: that, like siblings, is ambiguous.
    const ancestors=[];
    for(const candidate of candidates) {
     let current=await checked(candidate.process.ppid);
@@ -154,7 +157,8 @@ function createProviderDetector({platform=process.platform,uid=process.getuid?.(
      current=await checked(current.ppid);
     }
    }
-   const innermost=candidates.filter(c=>c.process.uid!==0 || !ancestors.some(a=>same(a,c.process)));
+   const wrapper=c=>c.process.uid===0 && USER_SWITCHERS.has(c.process.comm) && ancestors.some(a=>same(a,c.process));
+   const innermost=candidates.filter(c=>!wrapper(c));
    if(innermost.length>1)return unavailable;
    if(!sameForeground(terminal,await checked(terminalPid)))return unavailable;
    if(!innermost.length)return null;

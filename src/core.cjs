@@ -81,7 +81,7 @@ async function readProcess(pid) {
     const [raw,st,boot] = await Promise.all([fs.readFile(`${dir}/stat`,'utf8'),fs.stat(dir),fs.readFile('/proc/sys/kernel/random/boot_id','utf8')]);
     const fields=raw.slice(raw.lastIndexOf(')')+2).trim().split(/\s+/);
     if(fields[0]==='Z' || !fields[19]) return null;
-    return {pid, ppid:Number(fields[1]),uid:st.uid,start_ticks:fields[19],boot_id:boot.trim(),pgrp:Number(fields[2]),tty_nr:Number(fields[4]),tpgid:Number(fields[5])};
+    return {pid, comm:raw.slice(raw.indexOf('(')+1,raw.lastIndexOf(')')), ppid:Number(fields[1]),uid:st.uid,start_ticks:fields[19],boot_id:boot.trim(),pgrp:Number(fields[2]),tty_nr:Number(fields[4]),tpgid:Number(fields[5])};
   } catch { return null; }
 }
 const same = (a,b) => !!a && !!b && ['pid','uid','start_ticks','boot_id'].every(k=>a[k]===b[k]);

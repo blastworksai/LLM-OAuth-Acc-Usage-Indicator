@@ -87,8 +87,8 @@ test('stable unrelated, background and host-owned processes do not become foreig
 // terminal's tty, and sudo gives the CLI a pty of its own.
 const sudoPane=()=>[
  proc(10,1,{pgrp:10,tpgid:10}),
- proc(11,10,{uid:0,pgrp:10,tpgid:10}),
- proc(12,11,{uid:0,tty_nr:2,pgrp:12,tpgid:13}),
+ proc(11,10,{uid:0,comm:'sudo',pgrp:10,tpgid:10}),
+ proc(12,11,{uid:0,comm:'sudo',tty_nr:2,pgrp:12,tpgid:13}),
  proc(13,12,{uid:2000,tty_nr:2,pgrp:13,tpgid:13})
 ];
 const denied=async()=>{throw Object.assign(new Error('denied'),{code:'EACCES'});};
@@ -114,6 +114,16 @@ test('a non-root CLI that launches another user\'s CLI below it stays ambiguous'
  const f=fixture({getExecutable:denied,processIds:async function*(){for(const p of processes)yield p.pid;},
   getProcess:async pid=>processes.find(p=>p.pid===pid)||null});
  assert.deepEqual(await f.detect(10,{allowForeign:true,topologyOnly:true}),{provider:null,unavailable:true});
+});
+test('a root-owned CLI that is not a known user switcher is never treated as a wrapper',async()=>{
+ // A Codex running as root runs `sudo -u` into another user's Codex on a nested pty.
+ for(const comm of ['codex','claude','sudoers-helper',undefined]) {
+  const processes=[proc(10,1,{pgrp:10,tpgid:10}),proc(11,10,{uid:0,comm,pgrp:10,tpgid:10}),
+   proc(12,11,{uid:0,comm:'sudo',tty_nr:2,pgrp:12,tpgid:13}),proc(13,12,{uid:2000,tty_nr:2,pgrp:13,tpgid:13})];
+  const f=fixture({getExecutable:denied,processIds:async function*(){for(const p of processes)yield p.pid;},
+   getProcess:async pid=>processes.find(p=>p.pid===pid)||null});
+  assert.deepEqual(await f.detect(10,{allowForeign:true,topologyOnly:true}),{provider:null,unavailable:true},String(comm));
+ }
 });
 test('only an exited or zombie pid counts as gone; live states and read errors do not',async()=>{
  const {processGone}=require('../src/provider.cjs');

@@ -14,7 +14,7 @@ function fixture(changes={}) {
   processIds:async function*(){for(const p of processes)yield p.pid;},
   getProcess:async pid=>processes.find(p=>p.pid===pid)||null,
   getExecutable:async pid=>pid===20?'/opt/releases/claude/2.0.0':'/usr/bin/bash',
-  resolveExecutable:async lookup=>paths.get(lookup)||null,...changes};
+  resolveExecutable:async lookup=>paths.get(lookup)||null,processGone:async()=>false,...changes};
  return {detect:createProviderDetector(dependencies),processes,paths};
 }
 
@@ -81,6 +81,46 @@ test('stable unrelated, background and host-owned processes do not become foreig
   const f=fixture({processIds:async function*(){yield 20;},getProcess:async pid=>pid===10?proc(10,1):candidate});
   assert.equal(await f.detect(10,{allowForeign:true,topologyOnly:true}),null);
  }
+});
+// Shape measured on a Remote-SSH host whose window user starts each CLI through
+// `sudo -u <user>`: the outer sudo stays in the terminal's foreground group on the
+// terminal's tty, and sudo gives the CLI a pty of its own.
+const sudoPane=()=>[
+ proc(10,1,{pgrp:10,tpgid:10}),
+ proc(11,10,{uid:0,pgrp:10,tpgid:10}),
+ proc(12,11,{uid:0,tty_nr:2,pgrp:12,tpgid:13}),
+ proc(13,12,{uid:2000,tty_nr:2,pgrp:13,tpgid:13})
+];
+const denied=async()=>{throw Object.assign(new Error('denied'),{code:'EACCES'});};
+test('a wrapper around the foreign CLI yields the innermost foreground process, not ambiguity',async()=>{
+ const processes=sudoPane();
+ const f=fixture({getExecutable:denied,processIds:async function*(){for(const p of processes)yield p.pid;},
+  getProcess:async pid=>processes.find(p=>p.pid===pid)||null});
+ assert.deepEqual(await f.detect(10,{allowForeign:true,topologyOnly:true}),{
+  provider:null,cliPath:null,process:{pid:13,uid:2000,start_ticks:'13',boot_id:'boot'}
+ });
+});
+test('two foreign foreground processes that do not nest stay ambiguous',async()=>{
+ const processes=[...sudoPane(),proc(14,10,{uid:3000,pgrp:10,tpgid:10})];
+ const f=fixture({getExecutable:denied,processIds:async function*(){for(const p of processes)yield p.pid;},
+  getProcess:async pid=>processes.find(p=>p.pid===pid)||null});
+ assert.deepEqual(await f.detect(10,{allowForeign:true,topologyOnly:true}),{provider:null,unavailable:true});
+});
+test('an exited or zombie process elsewhere on the host does not fail foreign discovery',async()=>{
+ const processes=sudoPane();
+ const f=fixture({getExecutable:denied,processGone:async pid=>pid===99,
+  processIds:async function*(){yield 99;for(const p of processes)yield p.pid;},
+  getProcess:async pid=>processes.find(p=>p.pid===pid)||null});
+ assert.deepEqual(await f.detect(10,{allowForeign:true,topologyOnly:true}),{
+  provider:null,cliPath:null,process:{pid:13,uid:2000,start_ticks:'13',boot_id:'boot'}
+ });
+});
+test('a live process that cannot be read still fails foreign discovery closed',async()=>{
+ const processes=sudoPane();
+ const f=fixture({getExecutable:denied,processGone:async()=>false,
+  processIds:async function*(){yield 99;for(const p of processes)yield p.pid;},
+  getProcess:async pid=>processes.find(p=>p.pid===pid)||null});
+ assert.deepEqual(await f.detect(10,{allowForeign:true,topologyOnly:true}),{provider:null,unavailable:true});
 });
 test('target-user verification resolves only the same live native selected provider',async t=>{
  const {verifyTargetProcess}=require('../src/provider.cjs');

@@ -11,6 +11,14 @@ async function* processIds() {
  const directory=await fs.opendir('/proc');
  for await(const entry of directory)if(/^\d+$/.test(entry.name))yield Number(entry.name);
 }
+// A pid listed but no longer readable is only skippable when it provably holds no
+// live process: it exited, or it is a zombie. Anything else fails closed.
+async function processGone(pid) {
+ try {
+  const raw=await fs.readFile(`/proc/${pid}/stat`,'utf8');
+  return /^[ZX]$/.test(raw.slice(raw.lastIndexOf(')')+2).split(' ',1)[0]);
+ } catch(error) {return error?.code==='ENOENT'||error?.code==='ESRCH';}
+}
 async function getExecutable(pid) {
  try{return await fs.readlink(`/proc/${pid}/exe`);}catch{return null;}
 }
@@ -72,7 +80,8 @@ async function verifyTargetProcess(target,{uid=process.getuid?.(),env=process.en
 function createProviderDetector({platform=process.platform,uid=process.getuid?.(),
  env=process.env,home=os.homedir(),processIds:listProcesses=processIds,
  getProcess=readProcess,getExecutable:readExecutable=getExecutable,
- resolveExecutable:resolveNative=resolveExecutable,resolveCommand:resolveInstalled=resolveCommand}={}) {
+ resolveExecutable:resolveNative=resolveExecutable,resolveCommand:resolveInstalled=resolveCommand,
+ processGone:isGone=processGone}={}) {
  const automatic=async function(terminalPid) {
   if(platform!=='linux')return null;
   try {
@@ -118,7 +127,8 @@ function createProviderDetector({platform=process.platform,uid=process.getuid?.(
    const candidates=[];let inspected=0;
    for await(const pid of listProcesses()) {
     if(++inspected>MAX_PROCESSES)return unavailable;
-    const current=await checked(pid);
+    const current=await getProcess(pid);
+    if(!current) {if(await isGone(pid))continue;throw new Error('unreadable-topology');}
     if(current.uid===uid || !current.tty_nr || current.tpgid<=0 || current.pgrp!==current.tpgid)continue;
     const stableCandidate=async observedPid=>{
      const next=await checked(observedPid);
@@ -127,12 +137,26 @@ function createProviderDetector({platform=process.platform,uid=process.getuid?.(
      return next;
     };
     if((await matchReports(terminalPid,[{process:current}],stableCandidate)).status==='ready') {
-     candidates.push({process:current});if(candidates.length>1)return unavailable;
+     candidates.push({process:current});if(candidates.length>MAX_CANDIDATES)return unavailable;
     }
    }
+   // A wrapper such as `sudo -u` keeps its own process in the terminal's foreground
+   // group while the CLI runs below it on a pty of its own; both match. Keep only
+   // candidates that are no other candidate's ancestor. Siblings stay ambiguous.
+   const ancestors=[];
+   for(const candidate of candidates) {
+    let current=await checked(candidate.process.ppid);
+    for(let depth=0;depth<64 && !same(current,terminal);depth++) {
+     ancestors.push(current);
+     if(current.ppid<=1)break;
+     current=await checked(current.ppid);
+    }
+   }
+   const innermost=candidates.filter(c=>!ancestors.some(a=>same(a,c.process)));
+   if(innermost.length>1)return unavailable;
    if(!sameForeground(terminal,await checked(terminalPid)))return unavailable;
-   if(!candidates.length)return null;
-   const matched=await matchReports(terminalPid,candidates,checked);
+   if(!innermost.length)return null;
+   const matched=await matchReports(terminalPid,innermost,checked);
    if(matched.status!=='ready'||!sameForeground(terminal,await checked(terminalPid)))return unavailable;
    const {pid,uid:owner,start_ticks,boot_id}=matched.report.process;
    return {provider:null,cliPath:null,process:{pid,uid:owner,start_ticks,boot_id}};

@@ -4,6 +4,7 @@
   "description": "Account quota cards and reset times, following your active terminal.",
   "version": "0.3.5",
   "publisher": "blastworksai",
+  "icon": "media/icon.png",
   "license": "MIT",
   "engines": {
     "vscode": "^1.106.0"

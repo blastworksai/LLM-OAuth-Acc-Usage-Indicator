@@ -13,9 +13,9 @@ async function* processIds() {
 }
 // A pid listed but no longer readable is only skippable when it provably holds no
 // live process: it exited, or it is a zombie. Anything else fails closed.
-async function processGone(pid) {
+async function processGone(pid,readFile=fs.readFile) {
  try {
-  const raw=await fs.readFile(`/proc/${pid}/stat`,'utf8');
+  const raw=await readFile(`/proc/${pid}/stat`,'utf8');
   return /^[ZX]$/.test(raw.slice(raw.lastIndexOf(')')+2).split(' ',1)[0]);
  } catch(error) {return error?.code==='ENOENT'||error?.code==='ESRCH';}
 }
@@ -140,9 +140,11 @@ function createProviderDetector({platform=process.platform,uid=process.getuid?.(
      candidates.push({process:current});if(candidates.length>MAX_CANDIDATES)return unavailable;
     }
    }
-   // A wrapper such as `sudo -u` keeps its own process in the terminal's foreground
-   // group while the CLI runs below it on a pty of its own; both match. Keep only
-   // candidates that are no other candidate's ancestor. Siblings stay ambiguous.
+   // A user-switching wrapper (`sudo -u`, `su`, `runuser`) keeps its own process in
+   // the terminal's foreground group while the CLI runs below it on a pty of its own;
+   // both match. Switching user needs root, so drop a candidate only when it is
+   // root-owned AND another candidate's ancestor. A non-root ancestor may itself be
+   // a CLI that launched another, and stays: that, like siblings, is ambiguous.
    const ancestors=[];
    for(const candidate of candidates) {
     let current=await checked(candidate.process.ppid);
@@ -152,7 +154,7 @@ function createProviderDetector({platform=process.platform,uid=process.getuid?.(
      current=await checked(current.ppid);
     }
    }
-   const innermost=candidates.filter(c=>!ancestors.some(a=>same(a,c.process)));
+   const innermost=candidates.filter(c=>c.process.uid!==0 || !ancestors.some(a=>same(a,c.process)));
    if(innermost.length>1)return unavailable;
    if(!sameForeground(terminal,await checked(terminalPid)))return unavailable;
    if(!innermost.length)return null;
@@ -163,4 +165,4 @@ function createProviderDetector({platform=process.platform,uid=process.getuid?.(
   } catch {return unavailable;}
  };
 }
-module.exports={detectProvider:createProviderDetector(),createProviderDetector,verifyTargetProcess};
+module.exports={detectProvider:createProviderDetector(),createProviderDetector,verifyTargetProcess,processGone};

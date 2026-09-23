@@ -106,6 +106,25 @@ test('two foreign foreground processes that do not nest stay ambiguous',async()=
   getProcess:async pid=>processes.find(p=>p.pid===pid)||null});
  assert.deepEqual(await f.detect(10,{allowForeign:true,topologyOnly:true}),{provider:null,unavailable:true});
 });
+test('a non-root CLI that launches another user\'s CLI below it stays ambiguous',async()=>{
+ // Claude as UID 2000 runs `sudo -u` into Claude as UID 3000 on a nested pty.
+ const processes=[...sudoPane(),
+  proc(15,13,{uid:0,tty_nr:3,pgrp:15,tpgid:16}),
+  proc(16,15,{uid:3000,tty_nr:3,pgrp:16,tpgid:16})];
+ const f=fixture({getExecutable:denied,processIds:async function*(){for(const p of processes)yield p.pid;},
+  getProcess:async pid=>processes.find(p=>p.pid===pid)||null});
+ assert.deepEqual(await f.detect(10,{allowForeign:true,topologyOnly:true}),{provider:null,unavailable:true});
+});
+test('only an exited or zombie pid counts as gone; live states and read errors do not',async()=>{
+ const {processGone}=require('../src/provider.cjs');
+ const stat=state=>async()=>`42 (odd ) name) ${state} 1 42 42 34816 42 4194560`;
+ const error=code=>async()=>{throw Object.assign(new Error(code),{code});};
+ for(const state of ['Z','X'])assert.equal(await processGone(42,stat(state)),true,state);
+ for(const state of ['R','S','D','T','t','I'])assert.equal(await processGone(42,stat(state)),false,state);
+ for(const code of ['ENOENT','ESRCH'])assert.equal(await processGone(42,error(code)),true,code);
+ for(const code of ['EACCES','EPERM','EIO',undefined])assert.equal(await processGone(42,error(code)),false,String(code));
+ assert.equal(await processGone(process.pid),false,'this live process');
+});
 test('an exited or zombie process elsewhere on the host does not fail foreign discovery',async()=>{
  const processes=sudoPane();
  const f=fixture({getExecutable:denied,processGone:async pid=>pid===99,

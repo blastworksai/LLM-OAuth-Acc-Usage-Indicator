@@ -679,6 +679,8 @@ function createSetup(dependencies = {}) {
         await put(loc.receiptPath, json(data), o, 0o600);
         throw error;
       }
+      // The one place provider settings change. A reconnect never gets here, and a failed replace undid itself above.
+      if(typeof o.onSettingsChanged === 'function') o.onSettingsChanged();
       return publicConnection(data, loc);
     });
   }

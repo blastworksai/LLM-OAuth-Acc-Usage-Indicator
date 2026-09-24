@@ -1242,3 +1242,14 @@ test('compare-before-write refuses a concurrent provider settings edit', async t
   assert.equal(changed, true);
   assert.deepEqual(await readJson(f.settingsPath), {new:true});
 });
+
+test('onSettingsChanged fires once, right after a fresh connect replaces the settings; a reconnect never fires it',async t=>{
+  const f=await fixture(t);let fired=0;const onSettingsChanged=()=>{fired++;};
+  const before=await fs.readFile(f.settingsPath,'utf8').catch(()=>null);
+  await f.setup.connectProvider({...f.options,onSettingsChanged});
+  assert.equal(fired,1);assert.notEqual(await fs.readFile(f.settingsPath,'utf8'),before);
+  const settled=await fs.readFile(f.settingsPath,'utf8');
+  await f.setup.connectProvider({...f.options,onSettingsChanged});
+  assert.equal(fired,1,'a reconnect leaves the settings alone and does not signal');
+  assert.equal(await fs.readFile(f.settingsPath,'utf8'),settled);
+});

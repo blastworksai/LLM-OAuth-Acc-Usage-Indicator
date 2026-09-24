@@ -150,8 +150,9 @@ async function run(argv,dependencies={}) {
   const options={homeDir,uid,env:dependencies.env||process.env,nodePath:dependencies.nodePath||process.execPath,
     collectorPath:dependencies.collectorPath||path.join(__dirname,'../collectors/passive.cjs'),
     storagePath:path.join(homeDir,'.local/state/llm-account-usage/target-setup')};
-  // Set just before the provider settings are touched: a failure after it reports SETUP_FAILED_CHANGED, so the host
-  // rolls the status line back; a failure before it (checks, consent, feed folder) left the profile as it was.
+  // Set by setup.cjs the moment it has replaced the provider settings (a fresh connect only): a failure after that
+  // reports SETUP_FAILED_CHANGED, so the host rolls the status line back. Any earlier failure, and every failure on a
+  // reconnect (settings are never rewritten there), left the profile as it was.
   let changing=false;
   try {
     const verify=async()=>{
@@ -207,8 +208,8 @@ async function run(argv,dependencies={}) {
       create:args.action==='connect'&&(preview.createReportDirectory??!args['report-dir'])});
     const connection=await (dependencies.withReportFeedClaim||setup.withReportFeedClaim)(options.reportDir,preview.id,options,async publication=>{
       await (dependencies.checkConnectionFeed||require('./connection-feed.cjs').checkConnectionFeed)(options.reportDir,preview.id);
-      changing=true;
-      const result=args.action==='connect'?await setup.connectProvider(options):await setup.disconnectProvider(options);
+      const result=args.action==='connect'?await setup.connectProvider({...options,onSettingsChanged:()=>{changing=true;}})
+        :await setup.disconnectProvider(options);
       const value={};
       for(const key of ['id','provider','uid','profilePath','settingsPath','connected','cliLookupPath','reportDir','launcherPath','backupPath'])value[key]=result[key];
       value.runtimeVersion=args['runtime-version']||preview.runtimeVersion||'0.0.0';

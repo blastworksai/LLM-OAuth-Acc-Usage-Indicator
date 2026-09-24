@@ -363,7 +363,7 @@ test('--result - publishes exactly one line even when setup fails after preview 
   const d=deps(),lines=capture(d);d.setup.connectProvider=async()=>{throw new Error('secret raw command output');};
   assert.equal((await run([...argv.slice(0,-4),'--result','-','--runtime-version','0.4.0','--consent','granted'],d)).code,1);
   assert.equal(lines.length,1);assert.deepEqual(Object.keys(JSON.parse(lines[0])),['ok','code','message']);
-  assert.equal(JSON.parse(lines[0]).code,'SETUP_FAILED_CHANGED','connectProvider was entered, so the settings may have changed');assert.equal(d.results.length,0);assert.doesNotMatch(lines[0],/secret raw/);
+  assert.equal(JSON.parse(lines[0]).code,'SETUP_FAILED','a throw from connectProvider means it undid itself or never wrote');assert.equal(d.results.length,0);assert.doesNotMatch(lines[0],/secret raw/);
   const failing=deps();let attempts=0;failing.writeStdout=async()=>{attempts++;throw new Error('EPIPE');};
   assert.equal((await run([...argv.slice(0,-4),'--result','-','--runtime-version','0.4.0','--consent','granted'],failing)).code,1);
   assert.equal(attempts,1,'a failed stdout write is never followed by a second JSON line');
@@ -514,4 +514,17 @@ test('a failure before the provider settings are touched reports SETUP_FAILED, n
   d.setup.connectProvider=async()=>{entered=true;throw new Error('must not be reached');};
   assert.equal((await run([...argv.slice(0,-4),'--result','-','--runtime-version','0.4.0','--consent','granted'],d)).code,1);
   assert.equal(entered,false);assert.equal(JSON.parse(lines[0]).code,'SETUP_FAILED');
+});
+
+test('SETUP_FAILED_CHANGED only when setup replaced the settings and a later step failed; a reconnect never is',async()=>{
+  const cli=[...argv.slice(0,-4),'--result','-','--runtime-version','0.4.0','--consent','granted'];
+  const fresh=deps(),freshLines=capture(fresh),real=fresh.setup.connectProvider;
+  fresh.setup.connectProvider=async options=>{const value=await real(options);options.onSettingsChanged();return value;};
+  fresh.writeConnectionFeed=async()=>{throw new Error('descriptor write failed');};
+  assert.equal((await run(cli,fresh)).code,1);
+  assert.equal(JSON.parse(freshLines[0]).code,'SETUP_FAILED_CHANGED');
+  const again=deps(),againLines=capture(again); // a reconnect: connectProvider returns without touching settings
+  again.writeConnectionFeed=async()=>{throw new Error('descriptor write failed');};
+  assert.equal((await run(cli,again)).code,1);
+  assert.equal(JSON.parse(againLines[0]).code,'SETUP_FAILED');
 });

@@ -102,7 +102,7 @@ test('a wrapper around the foreign CLI yields the innermost foreground process, 
 });
 // Shape measured 24 Sep on the glitchc pane: an npm Codex install runs
 // `node /usr/bin/codex`, which spawns the native CLI in its own foreground group.
-const npmPane=(child={})=>[...sudoPane(),proc(14,13,{uid:2000,tty_nr:2,pgrp:13,tpgid:13,...child})];
+const npmPane=(child={})=>[...sudoPane(),proc(14,13,{uid:2000,comm:'codex',tty_nr:2,pgrp:13,tpgid:13,...child})];
 const npmFixture=(processes,changes={})=>fixture({getExecutable:denied,
  processIds:async function*(){for(const p of processes)yield p.pid;},getProcess:async pid=>processes.find(p=>p.pid===pid)||null,
  resolveExecutable:async()=>null,resolveCommand:async lookup=>({'/opt/tools/codex':'/opt/pkg/codex/bin/codex.js',
@@ -119,7 +119,9 @@ test('a parent is dropped as a launcher only when its script is a provider launc
   ['command line unreadable',npmPane(),{getCommandLine:async()=>null}],
   ['relative script path',npmPane(),{getCommandLine:async pid=>pid===13?['node','codex']:null}],
   ['child runs as another user',npmPane({uid:3000}),{}],
-  ['child in another process group',npmPane({pgrp:14,tpgid:14}),{}]
+  ['child in another process group',npmPane({pgrp:14,tpgid:14}),{}],
+  ['child is a different program than the launcher runs',npmPane({comm:'claude'}),{}],
+  ['child name unknown',npmPane({comm:undefined}),{}]
  ];
  for(const [label,processes,changes] of cases) {
   const result=await npmFixture(processes,changes).detect(10,{allowForeign:true,topologyOnly:true});

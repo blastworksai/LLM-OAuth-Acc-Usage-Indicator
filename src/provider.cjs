@@ -167,18 +167,21 @@ function createProviderDetector({platform=process.platform,uid=process.getuid?.(
    // match. Drop the parent only when it is that: same UID, same group and tty,
    // parent of another kept candidate, and its script resolves to a provider
    // launcher on PATH. Any other parent/child pair stays ambiguous.
-   const launchers=new Set();
-   for(const {cliPath} of (await knownProviders(env,home,resolveNative,resolveInstalled)).wrapped.values()) {
-    const real=await resolveInstalled(cliPath);if(typeof real==='string')launchers.add(real);
+   // The child must carry the launcher's own command name, so a launcher running a
+   // different program below it stays ambiguous. Launchers only on the target
+   // user's PATH are not recognised and fail closed.
+   const launchers=new Map();
+   for(const [command,{cliPath}] of (await knownProviders(env,home,resolveNative,resolveInstalled)).wrapped) {
+    const real=await resolveInstalled(cliPath);if(typeof real==='string')launchers.set(real,command);
    }
    const launcher=async c=>{
-    const child=candidates.some(d=>!wrapper(d) && d.process.ppid===c.process.pid && d.process.uid===c.process.uid &&
-      d.process.pgrp===c.process.pgrp && d.process.tty_nr===c.process.tty_nr);
-    if(!child || !launchers.size)return false;
+    if(!launchers.size)return false;
     const argv=await readCommandLine(c.process.pid);
     if(!Array.isArray(argv) || argv.length<2 || !path.isAbsolute(argv[1]))return false;
-    const real=await resolveInstalled(argv[1]);
-    return typeof real==='string' && launchers.has(real) && sameForeground(c.process,await checked(c.process.pid));
+    const command=launchers.get(await resolveInstalled(argv[1]));
+    const child=!!command && candidates.some(d=>!wrapper(d) && d.process.ppid===c.process.pid && d.process.uid===c.process.uid &&
+      d.process.pgrp===c.process.pgrp && d.process.tty_nr===c.process.tty_nr && d.process.comm===command);
+    return child && sameForeground(c.process,await checked(c.process.pid));
    };
    const innermost=[];
    for(const c of candidates)if(!wrapper(c) && !await launcher(c))innermost.push(c);

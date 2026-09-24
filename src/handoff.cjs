@@ -6,6 +6,8 @@ const os=require('node:os');
 const {randomUUID}=require('node:crypto');
 const {sameProcess,validatePublicConnection,publicPath,runtimeVersion:validVersion}=require('./connection.cjs');
 const quote=value=>"'"+value.replace(/'/g,"'\\''")+"'";
+// The setup bundle: the files the target account runs. shared-feed.cjs stages the same list on the sudo road.
+const MANIFEST=Object.freeze(['src/setup-cli.cjs','src/setup.cjs','src/connection.cjs','src/connection-feed.cjs','src/provider.cjs','src/core.cjs','collectors/passive.cjs']);
 const invalid=()=>Object.assign(new Error('The target-user setup result could not be verified. Select its terminal and connect again.'),
   {code:'UNVERIFIED_SETUP_RESULT',safeToDisplay:true});
 async function prepareHandoff({extensionPath,provider,target,action='connect',connectionId,tempRoot=os.tmpdir(),fs:io=fs,
@@ -28,7 +30,6 @@ async function prepareHandoff({extensionPath,provider,target,action='connect',co
   const rootHandle=await io.open(root,constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
   const rootAnchor=`/proc/self/fd/${rootHandle.fd}`,directories=new Map();
   const filename=`${randomUUID()}.json`;
-  const manifest=['src/setup-cli.cjs','src/setup.cjs','src/connection.cjs','src/connection-feed.cjs','src/provider.cjs','src/core.cjs','collectors/passive.cjs'];
   const identity=await io.lstat(root);
   async function dispose() {
     if(disposed)return cleanupResult;disposed=true;
@@ -42,7 +43,7 @@ async function prepareHandoff({extensionPath,provider,target,action='connect',co
     });
     try {
       if(drop)await removeFile(drop,filename,expected.process.uid);
-      for(const name of manifest) {
+      for(const name of MANIFEST) {
         const [directory,file]=name.split('/'),handle=directories.get(directory);
         if(handle)await removeFile(handle,file,identity.uid);
       }
@@ -67,7 +68,7 @@ async function prepareHandoff({extensionPath,provider,target,action='connect',co
       const handle=await io.open(`${rootAnchor}/${name}`,constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
       directories.set(name,handle);await handle.chmod(0o755);
     }
-    for(const name of manifest) {
+    for(const name of MANIFEST) {
       const source=path.join(extensionPath,name),info=await io.lstat(source);
       if(!info.isFile()||info.size>1024*1024)throw invalid();
       await io.copyFile(source,path.join(root,name),constants.COPYFILE_EXCL);
@@ -113,4 +114,4 @@ async function prepareHandoff({extensionPath,provider,target,action='connect',co
     return {root,command,resultPath,readResult,dispose};
   } catch(error) {await dispose();throw error;}
 }
-module.exports={prepareHandoff};
+module.exports={prepareHandoff,MANIFEST};

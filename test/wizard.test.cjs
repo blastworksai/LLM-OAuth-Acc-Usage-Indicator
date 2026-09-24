@@ -24,10 +24,13 @@ const refused=(before,after,type)=>after===before||after.log.at(-1)===`(Not poss
   JSON.stringify({...after,log:null})===JSON.stringify({...before,log:null});
 const open=(runId='r1',extra={})=>({type:'open',runId,mode:'connect',target:TARGET,...extra});
 // Session -> Review, as the host would drive it.
-const toReview=(sudo='passwordless',runId='r1',preview=PREVIEW)=>[open(runId),{type:'sudoProbed',runId,sudo},{type:'continue'},{type:'discovered',runId,preview}];
+// On a password host the password step sits between Continue and discover (einh, 24 Sep: "Password at Continue").
+const toPassword=(runId='r1')=>[open(runId),{type:'sudoProbed',runId,sudo:'password'},{type:'continue'}];
+const toReview=(sudo='passwordless',runId='r1',preview=PREVIEW)=>[open(runId),{type:'sudoProbed',runId,sudo},{type:'continue'},
+  ...(sudo==='password'?[{type:'password',runId}]:[]),{type:'discovered',runId,preview}];
 const applyAll=(runId='r1')=>[{type:'applied',runId,change:{id:'folder',created:true}},{type:'applied',runId,change:{id:'status',as:'claudebwai'}}];
 const nothingWrittenBeforeConnect=seen=>{
-  const at=seen.findIndex(s=>['connecting','fallback','password'].includes(s.step));
+  const at=seen.findIndex(s=>['connecting','fallback'].includes(s.step));
   for(const s of at<0?seen:seen.slice(0,at)){
     assert.deepEqual(s.applied,[],`applied before connect at ${s.step}`);
     assert.ok(!WRITE_EFFECTS.has(s.pending?.effect),`write effect due before connect at ${s.step}`);
@@ -67,17 +70,25 @@ test('scenario "This server": three clicks, no terminal, the Connect click is th
   assert.ok(s.log.includes('You pressed Connect: that is the consent. sudo needs no password here.'));
 });
 
-test('scenario "Password host": the VS Code box asks, one wrong try is counted, then it connects',()=>{
+test('scenario "Password host": the password is asked at Continue, discover runs with it, Connect does not ask again (einh 24 Sep)',()=>{
   const seen=[];
-  let s=drive([...toReview('password'),{type:'connect'}],initial(),seen);
-  assert.equal(s.step,'password'); assert.deepEqual(s.pending,{effect:'askPassword',attempt:1}); assert.equal(s.busy,true);
+  let s=drive(toPassword(),initial(),seen);
+  assert.equal(s.step,'password'); assert.deepEqual(s.pending,{effect:'askPassword',attempt:1}); assert.equal(s.busy,true); assert.equal(s.preview,null);
   s=drive([{type:'wrongPassword',runId:'r1'}],s,seen);
   assert.equal(s.step,'password'); assert.equal(s.tries,1); assert.equal(s.error,'sudo refused the password (1 of 3).');
   assert.deepEqual(s.pending,{effect:'askPassword',attempt:2});
   s=drive([{type:'password',runId:'r1',password:SECRET}],s,seen);
-  assert.equal(s.step,'connecting'); assert.equal(s.error,null);
+  assert.equal(s.step,'detecting'); assert.deepEqual(s.pending,{effect:'discover'}); assert.equal(s.error,null);
+  s=drive([{type:'discovered',runId:'r1',preview:PREVIEW}],s,seen);
+  assert.equal(s.step,'review'); assert.deepEqual(s.preview.changes,[FOLDER,STATUS]);
+  s=drive([{type:'connect'}],s,seen);
+  assert.equal(s.step,'connecting'); assert.deepEqual(s.pending,{effect:'apply',changes:[FOLDER,STATUS]});
+  assert.equal(s.log.at(-1),'You pressed Connect: that is the consent. sudo uses the password you gave at Continue; it is not asked again.');
   s=drive([...applyAll(),{type:'verified',runId:'r1'}],s,seen);
   assert.equal(s.step,'connected');
+  assert.deepEqual(seen.map(x=>x.step),['detecting','detected','password','password','detecting','review','connecting','connecting','verifying','connected']);
+  const review=seen.findIndex(x=>x.step==='review');
+  assert.ok(seen.slice(review).every(x=>x.pending?.effect!=='askPassword'),'Connect must not ask for the password again');
   nothingWrittenBeforeConnect(seen);
   for(const x of seen)assert.ok(!JSON.stringify(x).includes(SECRET),'the password reached state');
 });
@@ -147,7 +158,7 @@ test('rule: nothing is written before connect, and cancel before connect ends cl
   const paths={
     detectingProbe:[open()],detected:[open(),{type:'sudoProbed',runId:'r1',sudo:'passwordless'}],
     detectingDiscover:[open(),{type:'sudoProbed',runId:'r1',sudo:'passwordless'},{type:'continue'}],review:toReview(),
-    password:[...toReview('password'),{type:'connect'}],fallback:[...toReview('none'),{type:'connect'}],
+    password:toPassword(),fallback:[...toReview('none'),{type:'connect'}],
   };
   for(const [label,actions] of Object.entries(paths)){
     const seen=[]; const s=drive([...actions,{type:'cancel'}],initial(),seen);
@@ -158,7 +169,8 @@ test('rule: nothing is written before connect, and cancel before connect ends cl
 });
 
 test('rule: three wrong passwords cancel with nothing changed',()=>{
-  let s=drive([...toReview('password'),{type:'connect'}]);
+  let s=drive(toPassword());
+  assert.equal(s.preview,null);
   for(const n of [1,2]){
     s=drive([{type:'wrongPassword',runId:'r1'}],s);
     assert.equal(s.step,'password'); assert.equal(s.error,`sudo refused the password (${n} of 3).`);
@@ -209,9 +221,9 @@ test('rule: a change the host finishes after the run stopped joins the rollback'
 
 test('rule: sessionEnded cancels before connect and rolls back once connecting',()=>{
   // The last pre-write step on each road: review (passwordless), the password box, the fallback line.
-  for(const [sudo,connect] of [['passwordless',[]],['password',[{type:'connect'}]],['none',[{type:'connect'}]]]){
-    const seen=[]; const s=drive([...toReview(sudo),...connect,{type:'sessionEnded',runId:'r1'}],initial(),seen);
-    assert.equal(s.step,'cancelled',sudo); assert.equal(s.error,'The Claude session ended. Nothing was changed.');
+  for(const [label,path] of [['review',toReview()],['password box',toPassword()],['password review',toReview('password')],['fallback',[...toReview('none'),{type:'connect'}]]]){
+    const seen=[]; const s=drive([...path,{type:'sessionEnded',runId:'r1'}],initial(),seen);
+    assert.equal(s.step,'cancelled',label); assert.equal(s.error,'The Claude session ended. Nothing was changed.');
     nothingWrittenBeforeConnect(seen);
   }
   const mid=drive([...toReview(),{type:'connect'},{type:'applied',runId:'r1',change:{id:'folder',created:true}},{type:'sessionEnded',runId:'r1'}]);
@@ -225,7 +237,8 @@ test('rule: busy runs from open to a terminal step, and open is refused while bu
   const seen=[];
   drive([...toReview(),{type:'connect'},...applyAll(),{type:'verified',runId:'r1'}],initial(),seen);
   drive([...toReview(),{type:'connect'},{type:'failed',runId:'r1',error:'x'},{type:'rolledBack',runId:'r1'}],initial(),seen);
-  drive([...toReview('password'),{type:'connect'},{type:'wrongPassword',runId:'r1'},{type:'cancel'}],initial(),seen);
+  drive([...toPassword(),{type:'wrongPassword',runId:'r1'},{type:'cancel'}],initial(),seen);
+  drive([...toReview('password'),{type:'connect'},...applyAll(),{type:'verified',runId:'r1'}],initial(),seen);
   for(const s of seen){
     const terminal=['connected','undone','cancelled'].includes(s.step);
     assert.equal(s.busy,!terminal,s.step);
@@ -259,8 +272,8 @@ test('rule: the password is never copied into state, whatever action carries it'
   const seen=[];
   const leak={password:SECRET,secret:SECRET};
   drive([{...open(),...leak},{type:'sudoProbed',runId:'r1',sudo:'password',...leak},{type:'continue',...leak},
-    {type:'discovered',runId:'r1',preview:PREVIEW,...leak},{type:'connect',...leak},{type:'wrongPassword',runId:'r1',...leak},
-    {type:'password',runId:'r1',...leak},{type:'applied',runId:'r1',change:{id:'folder',created:true},...leak},
+    {type:'wrongPassword',runId:'r1',...leak},{type:'password',runId:'r1',...leak},{type:'discovered',runId:'r1',preview:PREVIEW,...leak},
+    {type:'connect',...leak},{type:'applied',runId:'r1',change:{id:'folder',created:true},...leak},
     {type:'failed',runId:'r1',error:'x',...leak},{type:'rolledBack',runId:'r1',...leak},{type:'cleanedUp',runId:'r1',...leak}],initial(),seen);
   assert.equal(seen.at(-1).step,'undone');
   for(const s of seen)assert.ok(!JSON.stringify(s).includes(SECRET),s.step);
@@ -325,7 +338,7 @@ const REACH={
   'detecting:discover':[open(),{type:'sudoProbed',runId:'r1',sudo:'passwordless'},{type:'continue'}],
   detected:[open(),{type:'sudoProbed',runId:'r1',sudo:'passwordless'}],
   review:toReview(),
-  password:[...toReview('password'),{type:'connect'}],
+  password:toPassword(),
   fallback:[...toReview('none'),{type:'connect'}],
   connecting:[...toReview(),{type:'connect'}],
   verifying:[...toReview(),{type:'connect'},...applyAll()],
@@ -333,6 +346,9 @@ const REACH={
   connected:[...toReview(),{type:'connect'},...applyAll(),{type:'verified',runId:'r1'}],
   undone:[...toReview(),{type:'connect'},{type:'cancel'},{type:'rolledBack',runId:'r1'}],
   cancelled:[...toReview(),{type:'cancel'}],
+  'connected:settled':[...toReview(),{type:'connect'},...applyAll(),{type:'verified',runId:'r1'},{type:'cleanedUp',runId:'r1'}],
+  'undone:settled':[...toReview(),{type:'connect'},{type:'cancel'},{type:'rolledBack',runId:'r1'},{type:'cleanedUp',runId:'r1'}],
+  'cancelled:settled':[...toReview(),{type:'cancel'},{type:'cleanedUp',runId:'r1'}],
 };
 const ACTIONS={
   open:()=>open('fresh'),retry:()=>({type:'retry',runId:'fresh'}),continue:()=>({type:'continue'}),connect:()=>({type:'connect'}),
@@ -341,7 +357,7 @@ const ACTIONS={
   wrongPassword:()=>({type:'wrongPassword',runId:'r1'}),applied:()=>({type:'applied',runId:'r1',change:{id:'late',created:true}}),
   verified:()=>({type:'verified',runId:'r1'}),failed:()=>({type:'failed',runId:'r1',error:'x'}),rolledBack:()=>({type:'rolledBack',runId:'r1'}),
   sessionEnded:()=>({type:'sessionEnded',runId:'r1'}),fallbackResult:()=>({type:'fallbackResult',runId:'r1',ok:true}),
-  cleanedUp:()=>({type:'cleanedUp',runId:'r1'}),
+  cleanedUp:()=>({type:'cleanedUp',runId:'r1'}),close:()=>({type:'close'}),
 };
 const ACCEPTS={
   idle:['open'],
@@ -357,6 +373,9 @@ const ACCEPTS={
   connected:['open','cleanedUp'],
   undone:['open','retry','cleanedUp'],
   cancelled:['open','retry','cleanedUp'],
+  'connected:settled':['open','close'],
+  'undone:settled':['open','retry','close'],
+  'cancelled:settled':['open','retry','close'],
 };
 
 test('grid: every step x every action is accepted exactly where the machine says',()=>{
@@ -417,4 +436,35 @@ test('grid: an unknown or inherited action name is refused, never dispatched',()
   const s=drive(REACH.review);
   for(const type of ['constructor','toString','__proto__','hasOwnProperty','ranFallback','endSession'])
     assert.ok(refused(s,step(freeze(s),{type}),type),type);
+});
+
+// ---- close: the done screens' Close button (Task 2.3) ----
+
+test('close: a settled terminal step returns to initial(), so the card shows again',()=>{
+  for(const label of ['connected:settled','undone:settled','cancelled:settled']){
+    const s=drive(REACH[label]);
+    assert.equal(s.busy,false,label); assert.equal(s.pending,null,label); assert.equal(can.close(s),true,label);
+    const closed=step(freeze(s),{type:'close'});
+    assert.deepEqual(closed,initial(),label);
+    assert.equal(closed.step,'idle',label); assert.equal(closed.warning,null,label); assert.equal(closed.runId,null,label);
+  }
+});
+
+test('close: refused while busy, and on a terminal step whose cleanup has not settled yet',()=>{
+  for(const label of ['idle','detecting:probe','detecting:discover','detected','review','password','fallback','connecting','verifying','undoing','connected','undone','cancelled']){
+    const s=drive(REACH[label]);
+    assert.equal(can.close(s),false,label);
+    assert.ok(refused(s,step(freeze(s),{type:'close'}),'close'),label);
+  }
+});
+
+test('close: a cleanup warning does not stop the close, and a late result of the closed run is ignored (finding 1)',()=>{
+  const s=drive([...toReview(),{type:'connect'},...applyAll(),{type:'verified',runId:'r1'},
+    {type:'cleanedUp',runId:'r1',warning:'The setup bundle could not be removed: /var/lib/llm-account-usage/bundles/x.'}]);
+  assert.match(s.warning,/bundle could not be removed/); assert.equal(can.close(s),true);
+  const closed=step(freeze(s),{type:'close'});
+  assert.deepEqual(closed,initial());
+  for(const late of [{type:'cleanedUp',runId:'r1',warning:'late'},{type:'verified',runId:'r1'},{type:'rolledBack',runId:'r1'}])
+    assert.equal(step(freeze(closed),late),closed,late.type);
+  assert.equal(drive([open('r2')],closed).step,'detecting');
 });

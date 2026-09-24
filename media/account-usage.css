@@ -90,6 +90,42 @@ body {
 .empty-card p { margin: 0; color: var(--muted); }
 .empty-card .report-details { margin: 0; }
 .coverage-note { color: var(--vscode-descriptionForeground, var(--muted)); font-size: 11px; line-height: 1.5; padding: 0 3px; }
+/* Connect wizard (0.4): the board's crumbs, pills and banners on the card's own tokens and VS Code theme colours. */
+.wizard-card { gap: 12px; }
+.wizard-card h2 { margin: 0; font-size: 15px; line-height: 1.35; font-weight: 700; overflow-wrap: anywhere; }
+.wizard-crumbs { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.wizard-crumb { font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; padding: 2px 8px; border-radius: 99px; border: 1px solid var(--card-border); color: var(--muted); }
+.wizard-crumb.on { border-color: var(--vscode-focusBorder, var(--amber)); color: var(--card-text); }
+.wizard-crumb.done { border-color: var(--vscode-testing-iconPassed, var(--muted)); color: var(--vscode-testing-iconPassed, var(--muted)); }
+.wizard-kv { display: grid; grid-template-columns: max-content minmax(0,1fr); gap: 4px 12px; margin: 0; font-size: 12px; }
+.wizard-kv dt { color: var(--muted); }
+.wizard-kv dd { margin: 0; min-width: 0; font-family: var(--vscode-editor-font-family, monospace); overflow-wrap: anywhere; }
+.wizard-note { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.wizard-changes, .wizard-steps, .wizard-shared { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; font-size: 12px; }
+.wizard-changes li, .wizard-steps li { display: flex; gap: 8px; align-items: baseline; min-width: 0; }
+.wizard-changes li > span:last-child, .wizard-steps li > span:last-child { min-width: 0; overflow-wrap: anywhere; }
+.wizard-shared li { overflow-wrap: anywhere; color: var(--muted); }
+.wizard-pill { flex-shrink: 0; font-size: 10px; font-weight: 700; padding: 1px 7px; border-radius: 99px; white-space: nowrap; border: 1px solid transparent; }
+.wizard-pill.p-root, .wizard-pill.p-warn { color: var(--warning); border-color: var(--vscode-inputValidation-warningBorder, var(--warning)); background: var(--vscode-inputValidation-warningBackground, var(--track)); }
+.wizard-pill.p-user { color: var(--muted); background: var(--track); border-color: var(--card-border); }
+.wizard-pill.p-good { color: var(--vscode-testing-iconPassed, var(--card-text)); border-color: var(--vscode-testing-iconPassed, var(--card-border)); background: var(--track); }
+.wizard-pill.p-bad { color: var(--exhausted); border-color: var(--vscode-inputValidation-errorBorder, var(--exhausted)); background: var(--vscode-inputValidation-errorBackground, var(--track)); }
+.wizard-card code, .wizard-cmd { font-family: var(--vscode-editor-font-family, monospace); font-size: 11px; background: var(--vscode-textCodeBlock-background, var(--track)); border-radius: 4px; }
+.wizard-card code { padding: 1px 4px; overflow-wrap: anywhere; }
+.wizard-cmd { display: block; padding: 8px 10px; overflow-x: auto; white-space: pre; }
+.wizard-commands summary { cursor: pointer; width: fit-content; padding: 2px 0; color: var(--vscode-descriptionForeground, var(--muted)); font-size: 11px; }
+.wizard-commands summary:focus-visible { outline: 1px solid var(--vscode-focusBorder, var(--amber)); outline-offset: 3px; }
+.wizard-commands .wizard-cmd { margin-top: 6px; }
+.wizard-banner { padding: 8px 10px; border-radius: 6px; border-left: 3px solid var(--card-border); background: var(--track); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
+.wizard-banner.b-good { border-left-color: var(--vscode-testing-iconPassed, var(--card-text)); background: var(--vscode-inputValidation-infoBackground, var(--track)); }
+.wizard-banner.b-warn { border-left-color: var(--vscode-inputValidation-warningBorder, var(--warning)); background: var(--vscode-inputValidation-warningBackground, var(--track)); }
+.wizard-banner.b-bad { border-left-color: var(--vscode-inputValidation-errorBorder, var(--exhausted)); background: var(--vscode-inputValidation-errorBackground, var(--track)); }
+.wizard-row { display: flex; flex-wrap: wrap; gap: 8px; }
+.wizard-button { display: inline-flex; align-items: center; justify-content: center; min-height: 28px; max-width: 100%; padding: 4px 12px; border-radius: 4px; border: 1px solid var(--vscode-button-border, var(--muted)); background: var(--vscode-button-secondaryBackground, var(--track)); color: var(--vscode-button-secondaryForeground, var(--card-text)); font: inherit; font-weight: 600; cursor: pointer; }
+.wizard-button:hover { background: var(--vscode-button-secondaryHoverBackground, var(--track)); border-color: var(--vscode-button-border, var(--amber)); }
+.wizard-button.primary { background: var(--vscode-button-background, var(--amber)); border-color: var(--vscode-button-border, var(--vscode-button-background, var(--amber))); color: var(--vscode-button-foreground, var(--card)); }
+.wizard-button.primary:hover { background: var(--vscode-button-hoverBackground, var(--amber)); }
+.wizard-button:focus-visible { outline: 2px solid var(--vscode-focusBorder, var(--amber)); outline-offset: 2px; }
 @media (max-width: 330px) {
   body { padding: 10px; }
   .account-card { padding: 17px 16px; }

@@ -5,13 +5,24 @@ const os=require('node:os');
 const {readFeeds,readFeedBatches,matchReports,buildRows,SelectionController}=require('./core.cjs');
 const {detectProvider}=require('./provider.cjs');
 const {connectionForTarget,sameProcess,publicPath,validatePublicConnection}=require('./connection.cjs');
-const {prepareHandoff}=require('./handoff.cjs');
 const {readConnectionFeeds}=require('./connection-feed.cjs');
 const {buildViewModel,renderContent,renderDocument}=require('./panel.cjs');
 const setup=require('./setup.cjs');
+const wizard=require('./wizard.cjs');
+const {createWizardHost}=require('./wizard-host.cjs');
+const {renderWizard}=require('./wizard-view.cjs');
+const {createElevate,resolveUser}=require('./elevate.cjs');
+const sharedFeed=require('./shared-feed.cjs');
+// The intents the wizard's buttons may post (media/account-usage.js); anything else from the webview is ignored.
+const WIZARD_INTENTS=new Set(['continue','connect','cancel','retry','copy','close']);
+const WIZARD_DONE=new Set(['connected','undone','cancelled']);
+// Shell-style display of an argv array, the same quoting wizard-view.cjs shows. Display and clipboard only; never executed.
+const SAFE_WORD=/^[A-Za-z0-9_@%+=:,./-]+$/;
+const quoteWord=value=>{const word=typeof value==='string'?value:String(value??'');return SAFE_WORD.test(word)?word:`'${word.replace(/'/g,`'\\''`)}'`;};
+const argvLine=argv=>Array.isArray(argv)&&argv.length?argv.map(quoteWord).join(' '):null;
 
 function activate(context) {
-  let view, assets={}, lastContent='',handoffBusy=false;
+  let view, assets={}, lastContent='';
   const pendingCrossUser=new Map(),runtimeVersion=context.extension.packageJSON.version;
   const capacityError=()=>Object.assign(new Error('Too many report directories. Keep at most 128 local, 128 target-user and 128 configured feeds.'),{safeToDisplay:true});
   const bounded=(values)=>{if(!Array.isArray(values)||values.length>128)throw capacityError();return values;};
@@ -30,8 +41,16 @@ function activate(context) {
     ? setup.refreshRuntime(setupOptions).catch(()=>({warnings:['Saved provider connections need attention. Run Account Usage: Connect Provider.']}))
     : Promise.resolve({warnings:[]});
   const getViewModel=()=>({...buildViewModel(controller.state),...(controller.state.needsReconnect?{stale:true,needsReconnect:true}:{})});
-  const getHtml=()=>renderContent(getViewModel(),assets)+(controller.state.needsReconnect?
+  const cardHtml=()=>renderContent(getViewModel(),assets)+(controller.state.needsReconnect?
     '<p class="stale-notice">Last report retained. Reconnect this profile to update its target-user collector.</p><div class="card-actions"><button class="connect-provider" type="button" data-action="connect">Reconnect provider</button></div>':'');
+  // Another account's session is connected through the wizard (0.4). While it is not idle it replaces the card body;
+  // Close (or a fresh open) moves it on. Its state arrives through onState, never the password.
+  let wizardState=wizard.initial(),wizardHost=null,closeWanted=null;
+  const wizardActive=()=>wizardState.step!=='idle';
+  const wizardContext={};
+  try {wizardContext.user=os.userInfo().username;} catch {}
+  try {wizardContext.host=os.hostname();} catch {}
+  const getHtml=()=>(wizardActive()&&renderWizard(wizardState,wizardContext))||cardHtml();
   const render=()=> {
     if(!view)return;
     const html=getHtml();
@@ -93,65 +112,85 @@ function activate(context) {
   const sameTarget=(a,b)=>a && b && a.provider===b.provider && a.cliPath===b.cliPath &&
     sameProcess(a.process,b.process);
   const safeError=(code,message)=>Object.assign(new Error(message),{code,safeToDisplay:true});
-  const performCrossUser=async({selected,pid,target,action='connect',connection})=>{
-    if(connection && connection.provider!==target.provider)
-      throw safeError('PROVIDER_MISMATCH','Choose the same provider as the profile being reconnected.');
-    const revalidate=async()=>{
-      const current=await detectProvider(pid,{allowForeign:true,topologyOnly:target.cliPath===null}),currentPid=await selected.processId;
-      const matches=target.cliPath===null?current?.provider===null&&!current.unavailable&&sameProcess(target.process,current.process):sameTarget(target,current);
-      return selected===vscode.window.activeTerminal && currentPid===pid && matches?current:null;
-    };
-    if(action==='connect' && managedDirectories().length>=128 && !managedDirectories().includes(connection?.reportDir))throw capacityError();
-    const handoff=await prepareHandoff({extensionPath:context.extensionPath,provider:target.provider,target,action,
-      connectionId:connection?.id,runtimeVersion,revalidate,
-      ...(connection?{reportDir:connection.reportDir,...(action==='connect'?{profilePath:connection.profilePath}:{})}:{})});
-    try {
-      const choice=await vscode.window.showInformationMessage(`${action==='connect'?'Connect':'Disconnect'} ${providerName(target.provider)} as UID ${target.process.uid}?`,
-        {modal:true,detail:`Run this command in a separate shell already owned by UID ${target.process.uid}. That shell needs node on PATH. Keep the provider session running. Review the profile and type yes when prompted.\n\n${handoff.command}`},'Copy setup command');
-      if(choice!=='Copy setup command')return false;
-      if(!await revalidate())throw safeError('TERMINAL_CHANGED','The selected terminal changed. Select its session and connect again.');
-      await vscode.env.clipboard.writeText(handoff.command);
-      let cancellation;
-      const result=await vscode.window.withProgress({location:vscode.ProgressLocation.Notification,cancellable:true,title:'Waiting for target-user setup (up to two minutes)'},async(_progress,token)=>{
-        cancellation=token;const deadline=Date.now()+120000;
-        while(!token.isCancellationRequested && Date.now()<deadline) {
-          const value=await handoff.readResult();
-          if(token.isCancellationRequested)return null;
-          if(value)return value;
-          await new Promise(resolve=>{const timer=setTimeout(()=>{listener?.dispose();resolve();},250);
-            const listener=token.onCancellationRequested(()=>{clearTimeout(timer);resolve();});});
-        }
-        return null;
-      });
-      if(!result?.ok)return false;
-      const value=result.connection;
-      if(!validatePublicConnection(value)||value.provider!==target.provider||value.uid!==target.process.uid||
-        value.connected!==(action==='connect')||(connection&&value.id!==connection.id)||
-        (action==='disconnect'&&value.reportDir!==connection?.reportDir)||
-        (action==='connect'&&value.runtimeVersion!==runtimeVersion)||!await revalidate())throw safeError('UNVERIFIED_SETUP_RESULT','The target-user setup result could not be verified.');
-      const managed=new Set(managedDirectories());
-      if(action==='connect') {
-        const probe=await readFeeds([value.reportDir]);
-        if(probe.rejected)throw safeError('SHARED_FEED_UNREADABLE','The target-user report feed is not safely readable by this VS Code host. Configure a shared Linux group directory and connect again.');
-      }
-      const descriptors=await readConnectionFeeds([value.reportDir]);
-      if(descriptors.rejected || descriptors.connections.length!==1 || !validatePublicConnection(descriptors.connections[0]) ||
-        !Object.keys(value).every(key=>descriptors.connections[0][key]===value[key]))
-        throw safeError('CONNECTION_FEED_UNREADABLE','The target-user connection descriptor could not be verified.');
-      if(action==='connect') {
-        if(!managed.has(value.reportDir)&&managed.size>=128)throw capacityError();
-        managed.add(value.reportDir);
-      } else managed.delete(value.reportDir);
-      if(cancellation.isCancellationRequested || !await revalidate())return false;
-      await context.globalState.update('managedFeedDirectories',[...managed]);
-      if(action==='connect')pendingCrossUser.set(value.id,{...target.process});else pendingCrossUser.delete(value.id);
-      return true;
-    } finally {const cleanup=await handoff.dispose();if(cleanup?.warning)await vscode.window.showWarningMessage(cleanup.warning);}
+  // ---- the wizard: every cross-user connect and disconnect ----
+  // The run binds to the process identity chosen at open (wizard-host.cjs); focus is never read after that (finding 6).
+  // wizardState.busy is the only lock and clears on a done screen; cleanup problems are wizard state, never an awaited
+  // notification (finding 1).
+  const onConnected=async(reportDir,targetProcess,descriptor)=>{
+    const managed=new Set(managedDirectories());
+    if(!managed.has(reportDir)&&managed.size>=128)throw capacityError();
+    managed.add(reportDir);
+    await context.globalState.update('managedFeedDirectories',[...managed]);
+    pendingCrossUser.set(descriptor.id,{...targetProcess});
+    void refresh(true);
   };
-  const crossUser=async options=>{
-    if(handoffBusy)throw safeError('SETUP_IN_PROGRESS','Target-user setup is already in progress. Finish or cancel it before starting another.');
-    handoffBusy=true;
-    try {return await performCrossUser(options);}finally {handoffBusy=false;}
+  const onDisconnected=async(reportDir,connectionId)=>{
+    const managed=new Set(managedDirectories());
+    managed.delete(reportDir);
+    await context.globalState.update('managedFeedDirectories',[...managed]);
+    pendingCrossUser.delete(connectionId);
+    void refresh(true);
+  };
+  const askPassword=async({prompt,error,signal}={})=>{
+    if(signal?.aborted)return undefined;
+    // The box closes on its own when the run moves on (cancel, session ended) through the token.
+    const source=typeof vscode.CancellationTokenSource==='function'?new vscode.CancellationTokenSource():null;
+    const abort=()=>source?.cancel();
+    signal?.addEventListener?.('abort',abort,{once:true});
+    try {
+      return await vscode.window.showInputBox({password:true,prompt:error?`${error} ${prompt}`:prompt,ignoreFocusOut:true},source?.token);
+    } finally {signal?.removeEventListener?.('abort',abort);source?.dispose?.();}
+  };
+  const onWizardState=state=>{
+    wizardState=state;
+    if(closeWanted!==null&&closeWanted===state.runId&&wizard.can.close(state)) {
+      // Close was pressed before the bundle cleanup reported; finish it now that it has.
+      closeWanted=null;
+      void Promise.resolve().then(()=>closeWizard());
+    }
+    if(state.step==='idle')void refresh(true);
+    render();
+  };
+  try {
+    wizardHost=createWizardHost({elevate:createElevate(),sharedFeed,detectProvider,readConnectionFeeds,readFeeds,resolveUser,askPassword,
+      extensionPath:context.extensionPath,runtimeVersion,onState:onWizardState,onConnected,onDisconnected});
+  } catch {wizardHost=null;}
+  const openWizard=options=>{
+    if(!wizardHost)throw safeError('WIZARD_UNAVAILABLE','Connecting another account’s session is not available in this editor.');
+    if(wizardState.busy)throw safeError('SETUP_IN_PROGRESS','Target-user setup is already in progress in the Account Usage card. Finish or cancel it before starting another.');
+    closeWanted=null;
+    wizardHost.dispatch({type:'open',...options});
+    // The wizard lives in the card; bring it forward when the command came from the palette.
+    void Promise.resolve(vscode.commands.executeCommand('llmAccountUsage.usage.focus')).catch(()=>{});
+  };
+  const closeWizard=()=>{
+    if(!wizardHost||!WIZARD_DONE.has(wizardState.step)||wizardState.busy)return;
+    if(wizard.can.close(wizardState)){closeWanted=null;wizardHost.dispatch({type:'close'});}
+    else closeWanted=wizardState.runId; // cleanup still running: close as soon as it settles
+  };
+  const commandLines=state=>{
+    const preview=state?.preview&&typeof state.preview==='object'?state.preview:{};
+    const lines=[
+      ...(typeof state?.fallbackCommand==='string'&&state.fallbackCommand?[state.fallbackCommand]:[]),
+      ...(Array.isArray(preview.commands)?preview.commands:[]).map(command=>argvLine(command?.argv)),
+      ...(Array.isArray(preview.changes)?preview.changes:[]).map(change=>argvLine(change?.argv)||
+        (typeof change?.command==='string'&&change.command?change.command:null))];
+    return [...new Set(lines.filter(Boolean))];
+  };
+  const copyCommands=async()=>{
+    const lines=commandLines(wizardState);
+    if(!lines.length) {await vscode.window.showInformationMessage('There is no command to copy on this screen.');return;}
+    try {await vscode.env.clipboard.writeText(lines.join('\n'));}
+    catch {await vscode.window.showErrorMessage('The command could not be copied to the clipboard.');return;}
+    await vscode.window.showInformationMessage(lines.length===1?'Copied the command.':`Copied ${lines.length} commands.`);
+  };
+  const wizardIntent=async intent=>{
+    if(!WIZARD_INTENTS.has(intent)||!wizardHost)return;
+    try {
+      if(intent==='copy')return await copyCommands();
+      if(intent==='close')return closeWizard();
+      wizardHost.dispatch({type:intent});
+    } catch(error) {await showSetupError(error);}
   };
   const connect=async(fromCard=false)=>{
     if(process.platform!=='linux') {
@@ -166,11 +205,13 @@ function activate(context) {
     if(fromCard && !offered)return;
     const pid=selected?await selected.processId:null;
     const detected=pid?await detectProvider(pid,{allowForeign:true}):null;
+    // Another account's session: the process identity is the binding, never the focused terminal (finding 6).
+    const foreign=!!detected && !detected.unavailable && !!detected.process && detected.process.uid!==process.getuid();
     if(!matchesReconnect(detected)) {
       await vscode.window.showInformationMessage('The reconnect session changed. Select its original terminal and try again.');
       await refresh();return;
     }
-    if(fromCard && (selected!==vscode.window.activeTerminal ||
+    if(fromCard && ((!foreign && selected!==vscode.window.activeTerminal) ||
       ((offered.provider!==null || offered.process) && !sameTarget(offered,detected)))) {await refresh();return;}
     await setupReady;
     if(detected?.unavailable) {await showSetupError(safeError('TARGET_UNAVAILABLE','The selected terminal process cannot be verified. Select one live foreground session and connect again.'));return;}
@@ -194,11 +235,12 @@ function activate(context) {
     };
     try {
       if(!matchesReconnect(detected,picked.provider))throw safeError('PROVIDER_MISMATCH','Choose the same provider as the profile being reconnected.');
-      if(detected && detected.process.uid!==process.getuid()) {
-        if(await crossUser({selected,pid,target:{...detected,provider:picked.provider},connection:reconnect?.connection})) {
-          await vscode.window.showInformationMessage(`${providerName(picked.provider)} connected. Finish a fresh turn to publish account usage.`);
-          await refresh();
-        }
+      if(foreign) {
+        if(wizardState.busy)throw safeError('SETUP_IN_PROGRESS','Target-user setup is already in progress in the Account Usage card. Finish or cancel it before starting another.');
+        const reportDir=reconnect?.connection?.reportDir;
+        if(managedDirectories().length>=128 && !managedDirectories().includes(reportDir))throw capacityError();
+        openWizard({mode:'connect',target:{...detected,provider:picked.provider},terminalPid:pid,provider:picked.provider,
+          connection:reconnect?.connection??null});
         return;
       }
       let profilePath,cliPath=detected?.cliPath;
@@ -265,9 +307,8 @@ function activate(context) {
         const selected=vscode.window.activeTerminal,pid=selected?await selected.processId:null,target=pid?await detectProvider(pid,{allowForeign:true}):null;
         if(!target || target.unavailable || (target.provider!==null&&target.provider!==picked.connection.provider) || target.process?.uid!==picked.connection.uid)
           throw safeError('TARGET_REQUIRED','Select a running terminal owned by this profile’s Linux user before disconnecting.');
-        if(await crossUser({selected,pid,target:{...target,provider:picked.connection.provider},action:'disconnect',connection:picked.connection})) {
-          await refresh();await vscode.window.showInformationMessage(`${providerName(picked.connection.provider)} disconnected.`);
-        }
+        openWizard({mode:'disconnect',target:{...target,provider:picked.connection.provider},terminalPid:pid,provider:picked.connection.provider,
+          connection:picked.connection});
         return;
       }
       if(await withRecovery(setup.disconnectProvider,{...setupOptions,connectionId:picked.connection.id})===false)return;
@@ -284,7 +325,8 @@ function activate(context) {
     context.subscriptions.push(
       resolved.webview.onDidReceiveMessage(message=>{
         if(message?.type==='ready'){lastContent='';render();}
-        else if(message?.type==='connect')void connect(true);
+        else if(message?.type==='connect') {if(!wizardActive())void connect(true);}
+        else if(message?.type==='wizard' && typeof message.intent==='string' && WIZARD_INTENTS.has(message.intent))void wizardIntent(message.intent);
       }),
       resolved.onDidChangeVisibility(()=>{if(resolved.visible)void refresh();}),
       resolved.onDidDispose(()=>{if(view===resolved)view=undefined;})
@@ -309,12 +351,14 @@ function activate(context) {
   );
   // Read bounded local session data only while visible. Never poll a vendor or a login.
   let polling=false;
+  // The poll only reads the card's reports; it never opens or drives the wizard, and it rests while the wizard is shown.
   const timer=setInterval(async()=> {
-    if(!view?.visible || polling)return;
+    if(!view?.visible || polling || wizardActive())return;
     polling=true;try{await refresh(true);}finally{polling=false;}
   },2000);
   context.subscriptions.push({dispose(){clearInterval(timer);controller.dispose();}});
   void refresh();
-  return {getState:()=>controller.state,getRows:()=>buildRows(controller.state),getViewModel,getHtml,refresh:()=>refresh()};
+  return {getState:()=>controller.state,getRows:()=>buildRows(controller.state),getViewModel,getHtml,refresh:()=>refresh(),
+    getWizardState:()=>wizardState,wizardSettled:async()=>{await wizardHost?.settled();return wizardState;}};
 }
 module.exports={activate};

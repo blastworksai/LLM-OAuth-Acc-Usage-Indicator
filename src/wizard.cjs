@@ -6,6 +6,9 @@
 //   detecting  {effect:'probe'}                 probe sudo -> sudoProbed
 //   detecting  {effect:'discover'}              read-only discover as the target -> discovered
 //   password   {effect:'askPassword',attempt}   show the VS Code password box, check it -> password | wrongPassword
+//              (password host only, reached from Continue: the accepted password is held by the host for the whole run,
+//               so discover runs with it, Review lists the real changes and Connect writes without asking again;
+//               einh's ruling of 24 Sep 2026, "Password at Continue")
 //   fallback   {effect:'fallback'}              show the one line, poll the dropbox -> fallbackResult
 //   connecting {effect:'apply',changes}         apply the remaining changes in order, one applied per change
 //   verifying  {effect:'verify'}                read the connection descriptor, re-check the process -> verified | failed
@@ -15,6 +18,7 @@
 //   {type:'open',runId,mode:'connect'|'disconnect',target:{provider,uid,user,pid,process}|null,connection?}
 //   {type:'retry',runId}  (undone|cancelled: a fresh run on the same target)
 //   {type:'continue'} {type:'connect'} {type:'cancel'}
+//   {type:'close'}  (connected|undone|cancelled, once cleanup has settled: back to initial(), the card shows again)
 // Host results (all carry the current runId; a stale runId returns the state unchanged):
 //   {type:'detected',runId,target}            {type:'sudoProbed',runId,sudo:'passwordless'|'password'|'none',reason?}
 //   {type:'discovered',runId,preview:{profilePath,reportDir,changes:[{id,as,label,...}],sharedDirectories,hasExistingStatusLine}}
@@ -87,6 +91,7 @@ const can={
   continue:s=>s.step==='detected',
   connect:s=>s.step==='review'&&SUDO.has(s.sudo),
   cancel:s=>s.busy&&s.step!=='undoing'&&!(s.mode==='disconnect'&&APPLYING.has(s.step)),
+  close:s=>!s.busy&&TERMINAL.has(s.step)&&s.pending===null,
   detected:(s,a)=>s.step==='detecting'&&pending(s,'detect')&&(!a||!!target(a.target)),
   sudoProbed:(s,a)=>s.step==='detecting'&&(pending(s,'probe')||pending(s,'discover'))&&(!a||SUDO.has(a.sudo)),
   discovered:s=>s.step==='detecting'&&pending(s,'discover'),
@@ -116,7 +121,9 @@ function step(s,a) {
       const run={...s,sudo:a.sudo,sudoReason:text(a.reason,null)};
       return pending(s,'probe')?{...run,step:'detected',pending:null}:run;
     }
-    case 'continue':return {...s,step:'detecting',pending:{effect:'discover'}};
+    case 'continue':
+      if(s.sudo==='password')return log({...s,step:'password',error:null,pending:{effect:'askPassword',attempt:1}},'sudo needs a password: VS Code password box shown. Nothing is written until you press Connect.');
+      return {...s,step:'detecting',pending:{effect:'discover'}};
     case 'discovered':{
       const p=preview(a.preview);
       if(!p)return log(finish(s,'cancelled',{error:'The setup preview could not be read. Nothing was changed.'}),'Discover returned no usable preview.');
@@ -124,9 +131,9 @@ function step(s,a) {
     }
     case 'connect':
       if(s.sudo==='passwordless')return apply(log(s,'You pressed Connect: that is the consent. sudo needs no password here.'));
-      if(s.sudo==='password')return log({...s,step:'password',error:null,pending:{effect:'askPassword',attempt:1}},'sudo needs a password: VS Code password box shown.');
+      if(s.sudo==='password')return apply(log(s,'You pressed Connect: that is the consent. sudo uses the password you gave at Continue; it is not asked again.'));
       return log({...s,step:'fallback',pending:{effect:'fallback'}},'This VS Code account has no sudo: showing the one-line fallback.');
-    case 'password':return apply(log({...s,error:null},'Password accepted by sudo (VS Code never stores it).'));
+    case 'password':return log({...s,error:null,step:'detecting',pending:{effect:'discover'}},'Password accepted by sudo (VS Code never stores it). Reading what would change.');
     case 'wrongPassword':{
       const tries=s.tries+1;
       if(tries>=3)return log(finish(s,'cancelled',{tries,error:'Three wrong passwords. Nothing was changed.'}),'sudo refused three times; wizard closed, nothing changed.');
@@ -165,6 +172,7 @@ function step(s,a) {
       if(BEFORE_CONNECT.has(s.step))return log(finish(s,'cancelled',{error:null}),'Cancelled before anything was written. Ready to start again straight away.');
       return rollback(s,'You cancelled.');
     case 'cleanedUp':return {...s,pending:null,warning:warn(s,a.warning)};
+    case 'close':return initial();
   }
   return s;
 }

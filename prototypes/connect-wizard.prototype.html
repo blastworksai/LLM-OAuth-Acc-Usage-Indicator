@@ -1,0 +1,317 @@
+<title>Connect Wizard Prototype</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --bg:#f3f5f8;--panel:#ffffff;--chrome:#e6e9ef;--ink:#1d2330;--muted:#5d6678;--line:#d5dae3;
+  --accent:#2f6fb3;--accent-ink:#ffffff;--good:#23845a;--warn:#a86c12;--bad:#bb3b34;
+  --good-bg:#e5f4ec;--warn-bg:#fbf0dc;--bad-bg:#f8e3e1;--code:#eef1f6;
+  --sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,"SFMono-Regular",Consolas,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  color-scheme:dark;--bg:#16181d;--panel:#1f2229;--chrome:#262a32;--ink:#e3e7ee;--muted:#9aa3b3;--line:#343944;
+  --accent:#5b9be0;--accent-ink:#0d1520;--good:#4cc28a;--warn:#e0a743;--bad:#ec6f67;
+  --good-bg:#16302a;--warn-bg:#33291a;--bad-bg:#3a1f1f;--code:#262a33;}}
+:root[data-theme="dark"]{
+  color-scheme:dark;--bg:#16181d;--panel:#1f2229;--chrome:#262a32;--ink:#e3e7ee;--muted:#9aa3b3;--line:#343944;
+  --accent:#5b9be0;--accent-ink:#0d1520;--good:#4cc28a;--warn:#e0a743;--bad:#ec6f67;
+  --good-bg:#16302a;--warn-bg:#33291a;--bad-bg:#3a1f1f;--code:#262a33;}
+body{background:var(--bg);color:var(--ink);font:15px/1.5 var(--sans);padding-inline:16px;padding-block:24px 48px}
+.wrap{max-width:1180px;margin:0 auto;display:flex;flex-direction:column;gap:24px}
+h1{font-size:24px;font-weight:600;margin:0;text-wrap:balance}
+h2{font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:0;font-weight:600}
+p{margin:0;max-width:72ch}
+.intro{display:flex;flex-direction:column;gap:8px}
+.note{font-size:13px;color:var(--muted)}
+.grid{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr);gap:20px;align-items:start}
+@media (max-width:860px){.grid{grid-template-columns:1fr}}
+/* VS Code mock */
+.vsc{border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--panel)}
+.vsc-bar{background:var(--chrome);padding:8px 12px;font:12px var(--mono);color:var(--muted);display:flex;gap:12px;flex-wrap:wrap;border-bottom:1px solid var(--line)}
+.vsc-body{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.1fr);min-height:420px}
+@media (max-width:560px){.vsc-body{grid-template-columns:1fr}}
+.term{border-right:1px solid var(--line);display:flex;flex-direction:column}
+.tabs{display:flex;gap:2px;background:var(--chrome);padding:6px 6px 0;flex-wrap:wrap}
+.tab{font:12px var(--mono);padding:5px 10px;border-radius:5px 5px 0 0;color:var(--muted)}
+.tab.on{background:var(--panel);color:var(--ink)}
+.term pre{margin:0;padding:12px;font:12px/1.55 var(--mono);color:var(--muted);white-space:pre-wrap;flex:1}
+.wiz{padding:16px;display:flex;flex-direction:column;gap:12px}
+.wiz h3{margin:0;font-size:16px;font-weight:600}
+.crumbs{display:flex;gap:6px;flex-wrap:wrap}
+.crumb{font-size:11px;letter-spacing:.05em;text-transform:uppercase;padding:2px 8px;border-radius:99px;border:1px solid var(--line);color:var(--muted)}
+.crumb.on{border-color:var(--accent);color:var(--accent);font-weight:600}
+.crumb.done{color:var(--good);border-color:var(--good)}
+.kv{display:grid;grid-template-columns:auto minmax(0,1fr);gap:4px 12px;font-size:13px}
+.kv dt{color:var(--muted)}.kv dd{margin:0;font-family:var(--mono);font-size:12px;overflow-wrap:anywhere}
+.change{display:flex;flex-direction:column;gap:6px;font-size:13px}
+.change div{display:flex;gap:8px;align-items:baseline}
+.pill{font-size:11px;font-weight:600;padding:1px 7px;border-radius:99px;white-space:nowrap}
+.p-root{background:var(--warn-bg);color:var(--warn)}.p-user{background:var(--code);color:var(--muted)}
+.p-good{background:var(--good-bg);color:var(--good)}.p-bad{background:var(--bad-bg);color:var(--bad)}.p-warn{background:var(--warn-bg);color:var(--warn)}
+code,.cmd{font-family:var(--mono);font-size:12px;background:var(--code);border-radius:4px}
+code{padding:1px 4px}
+.cmd{display:block;padding:8px 10px;overflow-x:auto;white-space:pre}
+.row{display:flex;gap:8px;flex-wrap:wrap}
+button{font:500 13px var(--sans);padding:7px 14px;border-radius:5px;border:1px solid var(--line);background:var(--panel);color:var(--ink);cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+button:disabled{opacity:.4;cursor:not-allowed}
+button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+input[type=password]{font:13px var(--mono);padding:7px 10px;border:1px solid var(--line);border-radius:5px;background:var(--panel);color:var(--ink);width:100%;box-sizing:border-box}
+.banner{padding:10px 12px;border-radius:6px;font-size:13px}
+.b-good{background:var(--good-bg);color:var(--good)}.b-bad{background:var(--bad-bg);color:var(--bad)}.b-warn{background:var(--warn-bg);color:var(--warn)}
+.steps{display:flex;flex-direction:column;gap:6px;font-size:13px}
+.steps div{display:flex;gap:8px}
+/* state panel */
+.state{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;display:flex;flex-direction:column;gap:14px}
+.state .kv dd{font-family:var(--sans);font-size:13px}
+.changed{background:var(--warn-bg);border-radius:3px;padding:0 3px}
+.log{font:12px/1.5 var(--mono);color:var(--muted);max-height:180px;overflow:auto;background:var(--code);border-radius:6px;padding:8px 10px}
+.log div+div{margin-top:2px}
+section.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;display:flex;flex-direction:column;gap:12px}
+.world{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;font-size:13px}
+.world fieldset{border:1px solid var(--line);border-radius:6px;padding:8px 10px;margin:0;display:flex;flex-direction:column;gap:4px}
+.world legend{color:var(--muted);font-size:12px;padding:0 4px}
+.stabs{display:flex;gap:4px;flex-wrap:wrap;border-bottom:1px solid var(--line)}
+.stab{border:none;border-bottom:2px solid transparent;border-radius:0;background:none;color:var(--muted);padding:8px 10px}
+.stab.on{color:var(--ink);border-bottom-color:var(--accent)}
+.sdesc{font-size:14px}
+.sbtns{display:flex;gap:8px;flex-wrap:wrap}
+.sbtns button.next{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+.sbtns button.did{color:var(--good);border-color:var(--good)}
+@media (prefers-reduced-motion:no-preference){button{transition:background .12s}}
+</style>
+
+<div class="wrap">
+  <div class="intro">
+    <h1>Connect Wizard Prototype</h1>
+    <p>The question this page answers: <strong>does a connect wizard that runs entirely inside VS Code feel right?</strong> VS Code runs as <code>glitch</code> and the Claude session runs as <code>claudebwai</code>. The wizard reaches the other account through sudo, so nobody opens a second terminal. You pick the host's conditions below, then click through. Rule of thumb: nothing changes on disk until you press <em>Connect</em>, and anything that fails afterwards is undone.</p>
+    <p class="note">Throwaway prototype, 24 Sep 2026. Nothing here touches a real machine. The paths and the process ID are from this morning's attempt.</p>
+  </div>
+
+  <div class="grid">
+    <div class="vsc" aria-label="VS Code mock">
+      <div class="vsc-bar"><span>VS Code · Remote: dev-blastworks</span><span>running as glitch</span></div>
+      <div class="vsc-body">
+        <div class="term">
+          <div class="tabs" id="termTabs"></div>
+          <pre id="termBody"></pre>
+        </div>
+        <div class="wiz" id="wiz"></div>
+      </div>
+    </div>
+
+    <aside class="state" aria-live="polite">
+      <h2>What the wizard knows</h2>
+      <dl class="kv" id="stateKv"></dl>
+      <h2>Changes on disk</h2>
+      <div class="change" id="stateChanges"></div>
+      <h2>What just happened</h2>
+      <div class="log" id="log"></div>
+    </aside>
+  </div>
+
+  <section class="card">
+    <h2>Guided walkthroughs</h2>
+    <div class="stabs" role="tablist" id="stabs"></div>
+    <p class="sdesc" id="sdesc"></p>
+    <div class="sbtns" id="sbtns"></div>
+  </section>
+
+  <section class="card">
+    <h2>Free play</h2>
+    <div class="world" id="world"></div>
+    <div class="row" id="free"></div>
+  </section>
+</div>
+
+<script>
+/* ---- Portable logic: a pure state machine. No DOM in here. ---- */
+const Wizard = (() => {
+  const TARGET = {user:'claudebwai', uid:1053, provider:'Claude Code', pid:1954197, profile:'/home/claudebwai/.claude'};
+  const FEED_ROOT = '/var/lib/llm-account-usage/feeds';
+  const CHANGES = [
+    {id:'folder', label:`Shared feed folder ${FEED_ROOT}/claudebwai (group: usage-readers)`, as:'root', once:true},
+    {id:'status', label:'Claude status line reports usage to the feed', as:'claudebwai'},
+    {id:'feed', label:'First usage report written', as:'claudebwai'},
+  ];
+  const initial = (world = {}) => ({
+    step:'idle',                        // idle · detected · review · password · fallback · connecting · connected · undone · cancelled
+    world:{sudo:'passwordless', folderExists:false, feedReadable:true, sessionAlive:true, ...world},
+    activeTab:'claude', boundTo:null,  // the wizard binds to the session, never to the focused tab
+    busy:false, applied:[], undone:[], tries:0, error:null, log:[],
+  });
+  const log = (s, m) => ({...s, log:[...s.log, m]});
+  const plan = s => CHANGES.filter(c => !(c.id === 'folder' && s.world.folderExists));
+
+  function apply(s) {                  // runs the setup; any failure rolls back what was applied
+    let applied = [];
+    for (const c of plan(s)) {
+      if (!s.world.sessionAlive) return rollback({...s, applied}, 'The Claude session ended during setup.');
+      applied.push(c.id);
+      s = log(s, `${c.as === 'root' ? 'sudo' : 'sudo -u claudebwai'}: ${c.label}`);
+    }
+    s = {...s, applied};
+    if (!s.world.feedReadable) return rollback(s, 'VS Code could not read the feed folder.');
+    return log({...s, step:'connected', busy:false, error:null}, 'VS Code read the first report and checked it came from process 1954197.');
+  }
+  function rollback(s, why) {
+    const undone = [...s.applied].reverse().filter(id => id !== 'folder'); // the shared folder is harmless and reusable
+    return log({...s, step:'undone', busy:false, undone, applied:s.applied.filter(id => id === 'folder'), error:why},
+      `${why} Undid: ${undone.length ? undone.join(', ') : 'nothing'}.`);
+  }
+
+  const can = {
+    open:      s => ['idle','cancelled','undone','connected'].includes(s.step) && !s.busy,
+    continue:  s => s.step === 'detected',
+    connect:   s => s.step === 'review',
+    password:  s => s.step === 'password',
+    wrongPassword: s => s.step === 'password',
+    ranFallback: s => s.step === 'fallback',
+    cancel:    s => s.busy,
+    focusOther:s => true,
+    focusClaude:s => true,
+    endSession:s => s.world.sessionAlive,
+  };
+
+  function step(s, a) {
+    if (a.type === 'world') return {...s, world:{...s.world, ...a.patch}};
+    if (!can[a.type]?.(s)) return log(s, `(Not possible right now: ${a.type})`);
+    switch (a.type) {
+      case 'open':
+        if (s.activeTab !== 'claude') return log(s, 'The wizard asks which session to connect: the focused tab is not an AI session.');
+        if (!s.world.sessionAlive) return log(s, 'No running Claude session to connect.');
+        return log({...initial(s.world), activeTab:s.activeTab, log:s.log, step:'detected', busy:true, boundTo:TARGET.pid},
+          'Wizard opened on the Claude session (pid 1954197, runs as claudebwai).');
+      case 'continue':
+        return log({...s, step:'review'}, 'Showing exactly what will change. Nothing written yet.');
+      case 'connect':
+        if (s.world.sudo === 'passwordless') return apply(log({...s, step:'connecting'}, 'You pressed Connect: that is the consent. sudo needs no password here.'));
+        if (s.world.sudo === 'password') return log({...s, step:'password'}, 'sudo needs a password: VS Code password box shown.');
+        return log({...s, step:'fallback'}, 'This VS Code account has no sudo: showing the one-line fallback.');
+      case 'password':
+        return apply(log({...s, step:'connecting'}, 'Password accepted by sudo (VS Code never stores it).'));
+      case 'wrongPassword': {
+        const tries = s.tries + 1;
+        if (tries >= 3) return log({...s, step:'cancelled', busy:false, tries, error:'Three wrong passwords. Nothing was changed.'}, 'sudo refused three times; wizard closed, nothing changed.');
+        return log({...s, tries, error:`sudo refused the password (${tries} of 3).`}, `Wrong password, try ${tries} of 3.`);
+      }
+      case 'ranFallback':
+        return apply(log({...s, step:'connecting'}, 'The fallback command ran as claudebwai. Consent came from your Connect click, so it asked nothing.'));
+      case 'cancel':
+        if (s.applied.length) return rollback(s, 'You cancelled.');
+        return log({...s, step:'cancelled', busy:false, error:null}, 'Cancelled before anything was written. Ready to start again straight away.');
+      case 'focusOther':
+        return log({...s, activeTab:'bash'}, s.busy ? 'You clicked another terminal. The wizard stays on pid 1954197, so nothing breaks.' : 'Focused the bash terminal.');
+      case 'focusClaude':
+        return log({...s, activeTab:'claude'}, 'Focused the Claude terminal.');
+      case 'endSession': {
+        const t = {...s, world:{...s.world, sessionAlive:false}};
+        if (s.busy && !s.applied.length && s.step !== 'connecting') return log({...t, step:'cancelled', busy:false, error:'The Claude session ended. Nothing was changed.'}, 'Session ended before Connect: wizard closed.');
+        return log(t, 'The Claude session ended.');
+      }
+    }
+    return s;
+  }
+  return {TARGET, FEED_ROOT, CHANGES, initial, step, can, plan};
+})();
+
+/* ---- Throwaway page shell ---- */
+let S = Wizard.initial(), prev = S;
+const $ = id => document.getElementById(id);
+const esc = t => String(t).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function dispatch(a){ prev = S; S = Wizard.step(S, a); render(); }
+
+const LABELS = {
+  open:'Click “Connect Claude” on the card', continue:'Continue', connect:'Press Connect',
+  password:'Enter the right password', wrongPassword:'Enter a wrong password', ranFallback:'Run the fallback line as claudebwai',
+  cancel:'Cancel', focusOther:'Click another terminal tab', focusClaude:'Click the Claude terminal tab', endSession:'Quit the Claude session',
+};
+
+function wizScreen(s){
+  const T = Wizard.TARGET, crumbs = ['Session','Review','Connect','Done'];
+  const at = {detected:0, review:1, password:2, fallback:2, connecting:2, connected:3, undone:3, cancelled:3}[s.step] ?? -1;
+  const cr = `<div class="crumbs">${crumbs.map((c,i)=>`<span class="crumb ${i===at?'on':i<at?'done':''}">${c}</span>`).join('')}</div>`;
+  const err = s.error ? `<div class="banner b-bad">${esc(s.error)}</div>` : '';
+  const cancel = `<button onclick="dispatch({type:'cancel'})">Cancel</button>`;
+  switch (s.step) {
+    case 'idle': return `<h3>Account Usage</h3><p class="note">Claude Code · not connected</p><div class="row"><button class="primary" onclick="dispatch({type:'open'})">Connect Claude</button></div>`;
+    case 'detected': return `${cr}<h3>Connect this Claude session?</h3>
+      <dl class="kv"><dt>Session</dt><dd>Claude Code, pid ${T.pid}</dd><dt>Runs as</dt><dd>${T.user} (uid ${T.uid})</dd><dt>You are</dt><dd>glitch</dd></dl>
+      <p class="note">This session belongs to another account. The wizard will make the changes as that account, and asks you first.</p>
+      <div class="row"><button class="primary" onclick="dispatch({type:'continue'})">Continue</button>${cancel}</div>`;
+    case 'review': return `${cr}<h3>What will change</h3><div class="change">${Wizard.plan(s).map(c=>`<div><span class="pill ${c.as==='root'?'p-root':'p-user'}">${c.as==='root'?'as root, once':'as '+c.as}</span><span>${esc(c.label)}</span></div>`).join('')}</div>
+      <p class="note">Profile <code>${T.profile}</code>. Nothing inside the ${T.user} home folder is opened to other accounts. If VS Code can't read the first report, every change except the shared folder is undone.</p>
+      <details><summary class="note">Show the exact commands</summary><code class="cmd">sudo -n install -d -m 2750 -g usage-readers ${Wizard.FEED_ROOT}/claudebwai
+sudo -n -u claudebwai node …/setup-cli.cjs connect --consent granted --report-dir ${Wizard.FEED_ROOT}/claudebwai</code></details>
+      <div class="row"><button class="primary" onclick="dispatch({type:'connect'})">Connect</button>${cancel}</div>`;
+    case 'password': return `${cr}<h3>sudo needs your password</h3>${err}<label class="note" for="pw">Password for glitch on dev-blastworks</label><input id="pw" type="password" value="••••••••" readonly>
+      <div class="row"><button class="primary" onclick="dispatch({type:'password'})">Authorise</button><button onclick="dispatch({type:'wrongPassword'})">Authorise (wrong)</button>${cancel}</div>`;
+    case 'fallback': return `${cr}<h3>One step outside VS Code</h3><div class="banner b-warn">This VS Code account can't act as ${T.user}. Run this once in any shell logged in as ${T.user}. It won't ask you anything; you already agreed by pressing Connect.</div>
+      <code class="cmd">node /tmp/…/setup-cli.cjs connect --consent-token 7f3a…</code><div class="row"><button>Copy</button>${cancel}</div><p class="note">The wizard waits here and finishes on its own when the line runs.</p>`;
+    case 'connecting': return `${cr}<h3>Connecting…</h3>`;
+    case 'connected': return `${cr}<div class="banner b-good">Connected. The card now shows this Claude account's quota.</div><div class="steps">${s.applied.map(id=>`<div><span class="pill p-good">done</span>${esc(Wizard.CHANGES.find(c=>c.id===id).label)}</div>`).join('')}<div><span class="pill p-good">checked</span>VS Code read the first report</div></div>`;
+    case 'undone': return `${cr}<div class="banner b-bad">Not connected. ${esc(s.error)}</div><div class="steps">${s.undone.map(id=>`<div><span class="pill p-warn">undone</span>${esc(Wizard.CHANGES.find(c=>c.id===id).label)}</div>`).join('')}${s.applied.includes('folder')?`<div><span class="pill p-user">kept</span>Shared feed folder (empty, reused next time)</div>`:''}</div><div class="row"><button class="primary" onclick="dispatch({type:'open'})">Try again</button></div>`;
+    case 'cancelled': return `${cr}<div class="banner b-warn">${esc(s.error || 'Cancelled. Nothing was changed.')}</div><div class="row"><button class="primary" onclick="dispatch({type:'open'})">Start again</button></div>`;
+  }
+}
+
+function render(){
+  $('termTabs').innerHTML = ['claude','bash'].map(t=>`<span class="tab ${S.activeTab===t?'on':''}">${t==='claude'?'claude (claudebwai)':'bash (glitch)'}</span>`).join('');
+  $('termBody').textContent = S.activeTab==='claude'
+    ? (S.world.sessionAlive ? '> Claude Code, opus\n  working in /opt/glitch\n\n  (this terminal is never typed into)' : '[process exited]')
+    : 'glitch@dev-blastworks:~$ _';
+  $('wiz').innerHTML = wizScreen(S);
+
+  const ch = (k, v) => prev && JSON.stringify(k(prev)) !== JSON.stringify(k(S)) ? `<span class="changed">${v}</span>` : v;
+  const stepName = {idle:'Not started',detected:'Session picked',review:'Reviewing changes',password:'Waiting for password',fallback:'Waiting for fallback line',connecting:'Connecting',connected:'Connected',undone:'Failed, changes undone',cancelled:'Cancelled'}[S.step];
+  const sudoName = {passwordless:'sudo, no password',password:'sudo with password',none:'no sudo'}[S.world.sudo];
+  $('stateKv').innerHTML = [
+    ['Stage', ch(s=>s.step, stepName)],
+    ['Bound to', ch(s=>s.boundTo, S.boundTo ? `Claude session ${S.boundTo}` : 'nothing yet')],
+    ['Focused tab', ch(s=>s.activeTab, S.activeTab==='claude'?'Claude terminal':'another terminal')],
+    ['Setup in progress', ch(s=>s.busy, S.busy ? 'yes, a second Connect is refused' : 'no, Connect is free')],
+    ['Host allows', ch(s=>s.world.sudo, sudoName)],
+    ['Claude session', ch(s=>s.world.sessionAlive, S.world.sessionAlive ? 'running' : 'ended')],
+  ].map(([k,v])=>`<dt>${k}</dt><dd>${v}</dd>`).join('');
+  const items = Wizard.CHANGES.map(c => {
+    const on = S.applied.includes(c.id) || (c.id==='folder' && S.world.folderExists && S.step==='connected');
+    const un = S.undone.includes(c.id);
+    return `<div><span class="pill ${on?'p-good':un?'p-warn':'p-user'}">${on?'present':un?'undone':'not written'}</span><span>${esc(c.label)}</span></div>`;
+  });
+  $('stateChanges').innerHTML = items.join('');
+  $('log').innerHTML = S.log.slice().reverse().map(l=>`<div>${esc(l)}</div>`).join('') || '<div>Nothing yet.</div>';
+
+  $('world').innerHTML = `
+    <fieldset><legend>This host lets VS Code's account…</legend>${['passwordless','password','none'].map(v=>`<label><input type="radio" name="sudo" id="sudo-${v}" ${S.world.sudo===v?'checked':''} onchange="dispatch({type:'world',patch:{sudo:'${v}'}})"> ${({passwordless:'use sudo, no password (this server)',password:'use sudo with a password',none:'not use sudo at all'})[v]}</label>`).join('')}</fieldset>
+    <fieldset><legend>Shared feed folder</legend><label><input type="checkbox" id="w-folder" ${S.world.folderExists?'checked':''} onchange="dispatch({type:'world',patch:{folderExists:this.checked}})"> already set up by an earlier connect</label></fieldset>
+    <fieldset><legend>Can VS Code read the feed?</legend><label><input type="checkbox" id="w-read" ${S.world.feedReadable?'checked':''} onchange="dispatch({type:'world',patch:{feedReadable:this.checked}})"> yes (untick to simulate this morning's failure)</label></fieldset>`;
+  $('free').innerHTML = Object.keys(LABELS).map(t=>`<button ${Wizard.can[t](S)?'':'disabled'} onclick="dispatch({type:'${t}'})">${LABELS[t]}</button>`).join('') + `<button onclick="S=Wizard.initial();prev=S;render()">Reset</button>`;
+  renderScenario();
+}
+
+const SCENARIOS = [
+  {name:'This server', world:{}, steps:['open','continue','connect'],
+   desc:'dev-blastworks today: VS Code runs as glitch, and glitch may use sudo without a password. Watch for: three clicks, no terminal, no typed “yes”. Your Connect click is the consent.'},
+  {name:'Password host', world:{sudo:'password'}, steps:['open','continue','connect','wrongPassword','password'],
+   desc:'A machine where sudo asks for a password. VS Code shows its own password box. One wrong try is allowed for; after three, the wizard closes without changing anything.'},
+  {name:'No sudo', world:{sudo:'none'}, steps:['open','continue','connect','ranFallback'],
+   desc:'The last resort: VS Code\'s account has no sudo. You get one line to run as the other account, and it asks nothing because you already agreed. This is the only path that needs another shell.'},
+  {name:'Feed unreadable', world:{feedReadable:false}, steps:['open','continue','connect'],
+   desc:'This morning\'s failure. VS Code can\'t read the report. Watch for: the status-line change is undone on its own, so the Claude side is never left half-connected.'},
+  {name:'Click away mid-way', world:{}, steps:['open','continue','focusOther','connect'],
+   desc:'You click another terminal tab while the wizard is open. Today that breaks the check. Here the wizard is tied to the session it picked, so it carries on.'},
+  {name:'Cancel, then retry', world:{}, steps:['open','continue','cancel','open'],
+   desc:'You cancel at the review screen. Nothing was written, and Connect is free again immediately. No notification to close first.'},
+  {name:'Session quits', world:{}, steps:['open','continue','endSession','connect'],
+   desc:'The Claude session is closed before you press Connect. The wizard notices and closes; the Connect press that follows is refused because there is nothing to connect.'},
+];
+let sIdx = 0, sPos = 0;
+function startScenario(i){ sIdx=i; sPos=0; S=Wizard.initial(SCENARIOS[i].world); prev=S; S={...S, log:[`Walkthrough: ${SCENARIOS[i].name}.`]}; render(); }
+function scenarioStep(j){ if(j!==sPos) return; dispatch({type:SCENARIOS[sIdx].steps[j]}); sPos++; renderScenario(); }
+function renderScenario(){
+  $('stabs').innerHTML = SCENARIOS.map((s,i)=>`<button role="tab" aria-selected="${i===sIdx}" class="stab ${i===sIdx?'on':''}" onclick="startScenario(${i})">${s.name}</button>`).join('');
+  $('sdesc').textContent = SCENARIOS[sIdx].desc;
+  $('sbtns').innerHTML = SCENARIOS[sIdx].steps.map((t,j)=>`<button class="${j<sPos?'did':j===sPos?'next':''}" ${j===sPos?'':'disabled'} onclick="scenarioStep(${j})">${j+1}. ${LABELS[t]}</button>`).join('') + `<button onclick="startScenario(${sIdx})">Restart</button>`;
+}
+startScenario(0);
+</script>

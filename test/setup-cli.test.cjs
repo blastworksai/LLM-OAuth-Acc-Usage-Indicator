@@ -268,3 +268,242 @@ test('CLI retries initial descriptor link interruption under the same claim for 
     if(action==='disconnect')assert.deepEqual(JSON.parse(await f.fs.readFile(f.settings,'utf8')),{});
   }
 });
+// ---- 0.4 CP1 Task 1.4: discover, --consent granted, --result -, disconnect --remove-feed yes, argv cap ----
+const cliFile=require('node:path').resolve(__dirname,'../src/setup-cli.cjs');
+const {removeFeed}=require('../src/setup-cli.cjs');
+function capture(d) {const lines=[];d.writeStdout=async line=>{lines.push(line);};return lines;}
+async function snapshot(root) {
+  const fs=require('node:fs/promises'),path=require('node:path'),seen={};
+  async function walk(dir) {
+    for(const name of (await fs.readdir(dir)).sort()) {
+      const file=path.join(dir,name),st=await fs.lstat(file);
+      seen[path.relative(root,file)]=[st.isDirectory()?'d':st.isSymbolicLink()?'l':'f',st.mode,st.uid,st.gid,st.size,st.mtimeMs,st.ino].join(':');
+      if(st.isDirectory())await walk(file);
+    }
+  }
+  await walk(root);return seen;
+}
+function spawnCli(args,env) {
+  return new Promise((resolve,reject)=>{
+    const child=require('node:child_process').spawn(process.execPath,[cliFile,...args],{env,stdio:['ignore','pipe','pipe']});
+    let stdout='',stderr='';child.stdout.on('data',chunk=>{stdout+=chunk;});child.stderr.on('data',chunk=>{stderr+=chunk;});
+    child.on('error',reject);child.on('close',code=>resolve({code,stdout,stderr}));
+  });
+}
+function oneJsonLine(stdout) {
+  const lines=stdout.split('\n');
+  assert.equal(lines.length,2,'exactly one line on stdout: '+JSON.stringify(stdout));assert.equal(lines[1],'');
+  return JSON.parse(lines[0]);
+}
+const hex=length=>'0123456789abcdef'.repeat(4).slice(0,length);
+test('finding 3: --consent granted skips the prompt with no TTY; without it the prompt still decides',async()=>{
+  for(const action of ['connect','disconnect']) {
+    const base=action==='connect'?argv:['disconnect','--connection-id',id,'--result','/drop/r'];
+    const granted=deps();granted.readConsent=async()=>assert.fail('--consent granted must not prompt');
+    assert.equal((await run([...base,'--consent','granted'],granted)).code,0,action);
+    assert.equal(granted.calls.length,1);assert.equal(granted.results[0][1].ok,true);
+    let asked=0;const prompted=deps();prompted.readConsent=async()=>{asked++;return null;};
+    assert.equal((await run(base,prompted)).code,1,action);assert.equal(asked,1);assert.equal(prompted.calls.length,0);
+    assert.deepEqual(prompted.results[0][1],{ok:false,code:'CANCELLED',message:'Setup cancelled.'});
+  }
+});
+test('--consent is the literal granted only, and only on connect and disconnect',async()=>{
+  const discover=['discover','--provider','claude','--cli','/opt/claude','--result','-'];
+  for(const args of [...['yes','Granted','granted ','','true'].map(value=>[...argv,'--consent',value]),
+    ['disconnect','--connection-id',id,'--result','/drop/r','--consent','yes'],[...discover,'--consent','granted']]) {
+    const d=deps(),lines=capture(d);d.setup.discoverProvider=async()=>assert.fail('invalid consent reached discovery');
+    d.setup.listDisconnectConnections=async()=>assert.fail('invalid consent reached disconnect');
+    assert.equal((await run(args,d)).code,2,JSON.stringify(args));assert.equal(d.calls.length,0);assert.equal(d.results.length,0);
+    if(args.includes('-'))assert.deepEqual(lines.map(line=>JSON.parse(line).code),['INVALID_ARGUMENTS']);
+  }
+});
+test('--remove-feed is the literal yes only, and only on disconnect',async()=>{
+  for(const args of [...['no','YES','true',''].map(value=>['disconnect','--connection-id',id,'--result','/drop/r','--remove-feed',value]),
+    [...argv,'--remove-feed','yes'],['discover','--provider','claude','--cli','/opt/claude','--result','-','--remove-feed','yes']]) {
+    const d=deps();d.setup.listDisconnectConnections=async()=>assert.fail('invalid remove-feed reached disconnect');
+    d.setup.discoverProvider=async()=>assert.fail('invalid remove-feed reached discovery');
+    assert.equal((await run(args,d)).code,2,JSON.stringify(args));assert.equal(d.calls.length,0);
+  }
+});
+test('argv cap: the widest connect (8 keys, 17 argv) runs; anything longer, or a key another action lacks, is refused',async()=>{
+  const widest=[...argv,'--profile','/home/target/.claude','--report-dir','/var/lib/llm-account-usage/feeds/'+id,
+    '--target',JSON.stringify(foreignTarget),'--consent','granted'];
+  assert.equal(widest.length,17);
+  const d=deps();d.verifyTargetProcess=async target=>({...target,cliPath:'/opt/claude'});
+  assert.equal((await run(widest,d)).code,0);assert.equal(d.calls.length,1);
+  const disconnect=['disconnect','--connection-id',id,'--result','-','--target',JSON.stringify(foreignTarget),'--consent','granted','--remove-feed','yes'];
+  for(const args of [[...widest,'--unknown','x'],[...widest,'x'],new Array(18).fill('--provider'),[...disconnect,'--provider','claude'],
+    ['discover','--provider','claude','--cli','/opt/claude','--result','-','--runtime-version','0.4.0']]) {
+    const refused=deps();refused.setup.discoverProvider=async()=>assert.fail('over-long argv reached discovery');
+    refused.setup.listDisconnectConnections=async()=>assert.fail('over-long argv reached disconnect');
+    assert.equal((await run(args,refused)).code,2,String(args.length));
+  }
+});
+test('discover publishes only the preview fields and never prompts, claims, creates or connects',async()=>{
+  for(const result of ['-','/drop/discover.json']) {
+    const d=deps(),lines=capture(d);
+    const full={...d.preview,provider:'claude',settingsPath:'/home/target/.claude/settings.json',reportDir:'/var/lib/llm-account-usage/feeds/'+id,
+      createReportDirectory:false,hasExistingStatusLine:true,hasExistingHooks:false,cliPath:'/opt/claude-real',cliLookupPath:'/opt/claude',identity:{id},
+      sharedDirectories:[{path:'/opt/native',kind:'directory',uid:0,gid:2000,mode:0o2750,extra:'dropped'}]};
+    d.setup.discoverProvider=async options=>{assert.equal(options.sharedFeed,true);return full;};
+    const never=name=>async()=>assert.fail(name+' ran during discover');
+    Object.assign(d,{readConsent:never('consent'),ensureReportDirectory:never('ensureReportDirectory'),withReportFeedClaim:never('claim'),
+      checkConnectionFeed:never('checkConnectionFeed'),writeConnectionFeed:never('writeConnectionFeed')});
+    d.setup.connectProvider=never('connect');d.setup.disconnectProvider=never('disconnect');
+    assert.equal((await run(['discover','--provider','claude','--cli','/opt/claude','--report-dir','/var/lib/llm-account-usage/feeds/'+id,'--result',result],d)).code,0);
+    const published=result==='-'?JSON.parse(lines[0]):d.results[0][1];
+    assert.equal(result==='-'?lines.length:d.results.length,1);
+    assert.deepEqual(published,{ok:true,preview:{id,provider:'claude',profilePath:'/home/target/.claude',settingsPath:'/home/target/.claude/settings.json',
+      reportDir:'/var/lib/llm-account-usage/feeds/'+id,hasExistingStatusLine:true,hasExistingHooks:false,
+      sharedDirectories:[{path:'/opt/native',kind:'directory',uid:0,gid:2000,mode:0o2750}]}});
+    assert.match(d.output.join('\n'),/Discovery only reads\. Nothing was changed\./);
+  }
+});
+test('--result - publishes exactly one line even when setup fails after preview output',async()=>{
+  const d=deps(),lines=capture(d);d.setup.connectProvider=async()=>{throw new Error('secret raw command output');};
+  assert.equal((await run([...argv.slice(0,-4),'--result','-','--runtime-version','0.4.0','--consent','granted'],d)).code,1);
+  assert.equal(lines.length,1);assert.deepEqual(Object.keys(JSON.parse(lines[0])),['ok','code','message']);
+  assert.equal(JSON.parse(lines[0]).code,'SETUP_FAILED');assert.equal(d.results.length,0);assert.doesNotMatch(lines[0],/secret raw/);
+  const failing=deps();let attempts=0;failing.writeStdout=async()=>{attempts++;throw new Error('EPIPE');};
+  assert.equal((await run([...argv.slice(0,-4),'--result','-','--runtime-version','0.4.0','--consent','granted'],failing)).code,1);
+  assert.equal(attempts,1,'a failed stdout write is never followed by a second JSON line');
+});
+async function realHome(t,prefix) {
+  const fs=require('node:fs/promises'),os=require('node:os'),path=require('node:path');
+  const base=await fs.mkdtemp(path.join(os.tmpdir(),prefix));t.after(()=>fs.rm(base,{recursive:true,force:true}));
+  const home=path.join(base,'home');await fs.mkdir(home,{mode:0o700});
+  const profile=path.join(home,'.claude'),settings=path.join(profile,'settings.json');await fs.mkdir(profile,{mode:0o700});
+  const original={theme:'private',statusLine:{type:'command',command:'printf original'}};
+  await fs.writeFile(settings,JSON.stringify(original),{mode:0o600});
+  return {fs,path,base,home,profile,settings,original};
+}
+test('--result - in a real non-TTY child: one JSON line on stdout, human lines on stderr, consent granted connects (finding 3)',async t=>{
+  const h=await realHome(t,'setup-cli-stdout-');
+  // A clean environment: never inherit a provider profile override from the test runner.
+  const env={HOME:h.home,PATH:'/usr/bin:/bin',LANG:'C.UTF-8'};
+  const common=['--provider','claude','--cli',process.execPath,'--profile',h.profile,'--result','-'];
+  const before=await snapshot(h.base);
+  const discovered=await spawnCli(['discover',...common],env);
+  assert.equal(discovered.code,0,discovered.stderr);const preview=oneJsonLine(discovered.stdout);
+  assert.equal(preview.ok,true);assert.equal(preview.preview.profilePath,h.profile);assert.equal(preview.preview.hasExistingStatusLine,true);
+  assert.equal(preview.preview.reportDir,h.path.join(h.home,'.llm-account-usage-feeds',preview.preview.id));
+  assert.match(discovered.stderr,/Profile: /);assert.deepEqual(await snapshot(h.base),before,'discover wrote nothing');
+  const cancelled=await spawnCli(['connect',...common,'--runtime-version','0.4.0'],env);
+  assert.equal(cancelled.code,1);assert.deepEqual(oneJsonLine(cancelled.stdout),{ok:false,code:'CANCELLED',message:'Setup cancelled.'});
+  assert.doesNotMatch(cancelled.stdout,/Type yes/);
+  assert.deepEqual(JSON.parse(await h.fs.readFile(h.settings,'utf8')),h.original);
+  const connected=await spawnCli(['connect',...common,'--runtime-version','0.4.0','--consent','granted'],env);
+  assert.equal(connected.code,0,connected.stderr);const result=oneJsonLine(connected.stdout);
+  assert.equal(result.ok,true);assert.equal(result.connection.connected,true);assert.equal(result.connection.id,preview.preview.id);
+  assert.match(connected.stderr,/Report directory: .*\n/);assert.match(connected.stderr,/--consent granted/);
+  assert.notDeepEqual(JSON.parse(await h.fs.readFile(h.settings,'utf8')),h.original);
+  const disconnected=await spawnCli(['disconnect','--connection-id',result.connection.id,'--result','-','--consent','granted','--remove-feed','yes'],env);
+  assert.equal(disconnected.code,0,disconnected.stderr);
+  assert.deepEqual(oneJsonLine(disconnected.stdout).feed,{removed:true});
+  assert.deepEqual(JSON.parse(await h.fs.readFile(h.settings,'utf8')),h.original);
+  assert.deepEqual(await h.fs.readdir(result.connection.reportDir),[]);
+  const invalid=await spawnCli(['connect','--provider','claude','--cli','relative','--result','-'],env);
+  assert.equal(invalid.code,2);assert.equal(oneJsonLine(invalid.stdout).code,'INVALID_ARGUMENTS');assert.match(invalid.stderr,/Invalid setup arguments/);
+});
+test('GOTCHA: a 2750 target-owned feed under root-owned 0755 parents passes discover (no create), connect and remove-feed',async t=>{
+  const h=await realHome(t,'setup-cli-shared-feed-'),uid=process.getuid();
+  const {connectionIdentity}=require('../src/connection.cjs');
+  const feedId=connectionIdentity({provider:'claude',uid,settingsPath:h.path.join(await h.fs.realpath(h.profile),'settings.json')}).id;
+  // /var/lib/llm-account-usage/feeds/<id>: parents 0755, the feed folder 2750 made by root for the target.
+  const parents=['var','var/lib','var/lib/llm-account-usage','var/lib/llm-account-usage/feeds'].map(name=>h.path.join(h.base,name));
+  for(const dir of parents){await h.fs.mkdir(dir,{mode:0o755});await h.fs.chmod(dir,0o755);}
+  const feed=h.path.join(parents.at(-1),feedId);await h.fs.mkdir(feed,{mode:0o700});await h.fs.chmod(feed,0o2750);
+  // Without root the parents cannot really be root-owned, so setup's own view of them is: uid 0, gid 0 (as
+  // install -d -o root -g root makes them); the feed keeps its real owner and shows the VS Code account's gid.
+  const clone=(st,change)=>Object.assign(Object.create(Object.getPrototypeOf(st)),st,change);
+  const view=(file,st)=>parents.includes(file)?clone(st,{uid:0,gid:0}):file===feed?clone(st,{gid:4242}):st;
+  const io=new Proxy(h.fs,{get(target,key){
+    if(key==='lstat'||key==='stat')return async(file,...rest)=>view(String(file),await target[key](file,...rest));
+    return target[key];
+  }});
+  const setup=require('../src/setup.cjs').createSetup({fs:io,systemUid:0});
+  const d={setup,home:()=>h.home,uid:()=>uid,env:{PATH:''},print:()=>{},readConsent:async()=>assert.fail('consent is granted on the command line')};
+  const lines=capture(d);
+  const common=['--provider','claude','--cli',process.execPath,'--profile',h.profile,'--report-dir',feed,'--result','-'];
+  const before=await snapshot(h.base);
+  assert.equal((await run(['discover',...common],d)).code,0,lines[0]);
+  const discovered=JSON.parse(lines.shift());
+  assert.equal(discovered.ok,true,JSON.stringify(discovered));assert.equal(discovered.preview.reportDir,feed);assert.equal(discovered.preview.id,feedId);
+  assert.deepEqual(discovered.preview.sharedDirectories,[],'root-owned 0755 parents and the 2750 feed need no extra trust');
+  assert.deepEqual(await snapshot(h.base),before,'discover created nothing');
+  assert.equal((await run(['connect',...common,'--runtime-version','0.4.0','--consent','granted'],d)).code,0,lines[0]);
+  const connected=JSON.parse(lines.shift());
+  assert.equal(connected.ok,true,JSON.stringify(connected));assert.equal(connected.connection.reportDir,feed);
+  assert.equal((await h.fs.stat(feed)).mode&0o7777,0o2750,'the existing feed folder was not re-created or re-moded');
+  assert.equal((await h.fs.stat(h.path.join(feed,'.connection.json'))).mode&0o7777,0o640);
+  await assert.rejects(h.fs.stat(h.path.join(h.home,'.llm-account-usage-feeds')),{code:'ENOENT'});
+  assert.deepEqual(await h.fs.readdir(parents.at(-1)),[feedId]);
+  // Collector leftovers the target made: one report, one stale native-query lock.
+  await h.fs.writeFile(h.path.join(feed,`claude-${hex(24)}.json`),'{}',{mode:0o640});
+  const lock=h.path.join(feed,'.native-queries',`query-${hex(32)}`);await h.fs.mkdir(lock,{recursive:true,mode:0o700});
+  await h.fs.writeFile(h.path.join(lock,`owner-${hex(32)}.json`),'{}',{mode:0o600});
+  assert.equal((await run(['disconnect','--connection-id',feedId,'--result','-','--consent','granted','--remove-feed','yes'],d)).code,0,lines[0]);
+  const disconnected=JSON.parse(lines.shift());
+  assert.equal(disconnected.connection.connected,false);assert.deepEqual(disconnected.feed,{removed:true});
+  assert.deepEqual(await h.fs.readdir(feed),[],'only the folder is left, for root to rmdir');
+  assert.equal((await h.fs.stat(feed)).mode&0o7777,0o2750);
+  assert.deepEqual(JSON.parse(await h.fs.readFile(h.settings,'utf8')),h.original);
+});
+test('remove-feed deletes only the known names; a planted unknown file keeps everything and the retry finishes',async t=>{
+  const h=await realHome(t,'setup-cli-remove-feed-'),lines=[];
+  const d={home:()=>h.home,uid:()=>process.getuid(),env:{PATH:''},print:()=>{},writeStdout:async line=>{lines.push(line);},
+    setup:require('../src/setup.cjs').createSetup({systemUid:0})};
+  assert.equal((await run(['connect','--provider','claude','--cli',process.execPath,'--profile',h.profile,'--runtime-version','0.4.0','--result','-','--consent','granted'],d)).code,0);
+  const {connection}=JSON.parse(lines.shift()),feed=connection.reportDir;
+  await h.fs.writeFile(h.path.join(feed,`codex-${hex(24)}.json`),'{}',{mode:0o640});
+  await h.fs.writeFile(h.path.join(feed,'notes.txt'),'keep me',{mode:0o640});
+  const names=async()=>{const all=[];for(const name of (await h.fs.readdir(feed)).sort()){all.push(name);
+    if((await h.fs.lstat(h.path.join(feed,name))).isDirectory())for(const inner of (await h.fs.readdir(h.path.join(feed,name))).sort())all.push(name+'/'+inner);}return all;};
+  const planted=await names();
+  assert.deepEqual(planted,['.connection-control','.connection-control/claim.json','.connection.json',`codex-${hex(24)}.json`,'notes.txt']);
+  const args=['disconnect','--connection-id',connection.id,'--result','-','--consent','granted','--remove-feed','yes'];
+  assert.equal((await run(args,d)).code,1);
+  const refused=JSON.parse(lines.shift());
+  assert.equal(refused.ok,true);assert.equal(refused.connection.connected,false);
+  assert.deepEqual(refused.feed,{removed:false,code:'FEED_NOT_EMPTY',message:'The report folder holds entries Account Usage did not create. They were left in place.'});
+  assert.deepEqual(await names(),planted,'nothing was removed');assert.equal(await h.fs.readFile(h.path.join(feed,'notes.txt'),'utf8'),'keep me');
+  assert.deepEqual(JSON.parse(await h.fs.readFile(h.settings,'utf8')),h.original,'the disconnect itself still happened');
+  await h.fs.unlink(h.path.join(feed,'notes.txt'));
+  assert.equal((await run(args,d)).code,0);
+  assert.deepEqual(JSON.parse(lines.shift()).feed,{removed:true});assert.deepEqual(await h.fs.readdir(feed),[]);
+});
+test('remove-feed refuses planted symlinks and unknown nested entries without removing anything',async t=>{
+  const fs=require('node:fs/promises'),os=require('node:os'),path=require('node:path');
+  const base=await fs.mkdtemp(path.join(os.tmpdir(),'remove-feed-links-'));t.after(()=>fs.rm(base,{recursive:true,force:true}));
+  const outside=path.join(base,'outside');await fs.mkdir(outside);await fs.writeFile(path.join(outside,'precious.json'),'precious');
+  await fs.mkdir(path.join(outside,`query-${hex(32)}`));
+  const plants={
+    'report-named symlink':feed=>fs.symlink(path.join(outside,'precious.json'),path.join(feed,`claude-${hex(24)}.json`)),
+    'descriptor symlink':async feed=>{await fs.unlink(path.join(feed,'.connection.json'));await fs.symlink(path.join(outside,'precious.json'),path.join(feed,'.connection.json'));},
+    'native-queries symlink':feed=>fs.symlink(outside,path.join(feed,'.native-queries')),
+    'claim symlink':async feed=>{await fs.unlink(path.join(feed,'.connection-control/claim.json'));await fs.symlink(path.join(outside,'precious.json'),path.join(feed,'.connection-control/claim.json'));},
+    'unknown file in the control folder':feed=>fs.writeFile(path.join(feed,'.connection-control/other.json'),'{}'),
+    'unknown entry in a native-query lock':async feed=>{const lock=path.join(feed,'.native-queries',`query-${hex(32)}`);await fs.mkdir(lock,{recursive:true});await fs.writeFile(path.join(lock,'payload'),'x');},
+    'report-named folder':feed=>fs.mkdir(path.join(feed,`antigravity-${hex(24)}.json`)),
+    'unknown dot file':feed=>fs.writeFile(path.join(feed,'.collector-lock'),'x'),
+  };
+  let index=0;
+  for(const [label,plant] of Object.entries(plants)) {
+    const feed=path.join(base,`feed-${index++}`);await fs.mkdir(feed,{mode:0o700});await fs.chmod(feed,0o2750);
+    await fs.writeFile(path.join(feed,'.connection.json'),'{}',{mode:0o640});await fs.writeFile(path.join(feed,`claude-${hex(24).replace(/0/g,'f')}.json`),'{}',{mode:0o640});
+    await fs.mkdir(path.join(feed,'.connection-control'),{mode:0o700});await fs.writeFile(path.join(feed,'.connection-control/claim.json'),'{}',{mode:0o600});
+    await plant(feed);
+    const before=await snapshot(feed),outsideBefore=await snapshot(outside);
+    assert.deepEqual(await removeFeed(feed,process.getuid()),
+      {removed:false,code:'FEED_NOT_EMPTY',message:'The report folder holds entries Account Usage did not create. They were left in place.'},label);
+    assert.deepEqual(await snapshot(feed),before,label+': nothing in the feed was removed');
+    assert.deepEqual(await snapshot(outside),outsideBefore,label+': nothing outside the feed was touched');
+  }
+  const clean=path.join(base,'clean');await fs.mkdir(clean,{mode:0o700});await fs.chmod(clean,0o2750);
+  await fs.writeFile(path.join(clean,'.connection.json'),'{}');const lock=path.join(clean,'.native-queries',`.lock-${hex(32)}`);
+  await fs.mkdir(lock,{recursive:true});await fs.writeFile(path.join(lock,`owner-${hex(32)}.json`),'{}');await fs.mkdir(path.join(clean,'.connection-control'));
+  assert.deepEqual(await removeFeed(clean,process.getuid()),{removed:true});assert.deepEqual(await fs.readdir(clean),[]);
+  const link=path.join(base,'feed-link');await fs.symlink(clean,link);
+  assert.equal((await removeFeed(link,process.getuid())).code,'FEED_REMOVE_FAILED','a linked feed folder is never followed');
+  assert.equal((await removeFeed('relative/feed',process.getuid())).code,'FEED_REMOVE_FAILED');
+});

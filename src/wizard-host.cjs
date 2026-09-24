@@ -308,7 +308,12 @@ function createWizardHost({elevate,sharedFeed=require('./shared-feed.cjs'),detec
           const out=parseResult(await asTarget(r,disconnectArgv(r,r.createFolder===true)));
           if(out?.ok===true)undone.push(change);else kept.push({...change,reason:'The status line could not be restored automatically.'});
         } else if(change.id==='folder'&&change.created===true) {
-          if((await asRoot(r,sharedFeed.removeFeedArgv(r.connectionId))).code===0)undone.push(change);
+          // A claim whose mkdir gave no answer is only ours while it still has the bare claim's shape: once another run's
+          // install -d has handed it to the target, it is that run's folder and stays.
+          const now=change.uncertain===true?await sharedFeed.inspectFeed(r.feed).catch(()=>null):null;
+          if(change.uncertain===true&&!(now?.exists&&now.directory&&now.uid===0&&now.mode===0o700))
+            kept.push({...change,reason:'Another setup took this folder over, so it was left for that setup.'});
+          else if((await asRoot(r,sharedFeed.removeFeedArgv(r.connectionId))).code===0)undone.push(change);
           else kept.push({...change,reason:'rmdir refused: the folder is not empty.'});
         } else kept.push({...change,reason:'Not undone automatically.'});
       } catch(error) {kept.push({...change,reason:message(error)});}

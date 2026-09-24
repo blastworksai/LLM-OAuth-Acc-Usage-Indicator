@@ -710,3 +710,20 @@ test('R2b. mkdir times out after making the folder: the claim is recorded and th
   assert.equal(h.world.feedExists,false,'no stranded folder');
   assertRootSafe(h);assertBundleRemoved(h);
 });
+
+test('R2c. a timed-out claim that another run has since handed to the target is left for that run, never rmdir-ed',async()=>{
+  const h=harness({on:{claimFeed:()=>{
+    // our mkdir made nothing; another run's mkdir did (root 0700), then its install -d handed it over before our rollback
+    // First inspect after the claim (ours, right away) sees the bare claim; any later one sees it handed to the target.
+    const claimAt=h.events.filter(e=>e==='inspect').length;h.world.feedExists=true;h.world.feedGid=0;
+    const handed=()=>h.events.filter(e=>e==='inspect').length>claimAt+1;
+    Object.defineProperty(h.world,'feedUid',{get:()=>handed()?UID:0,configurable:true});
+    Object.defineProperty(h.world,'feedMode',{get:()=>handed()?0o2750:0o700,configurable:true});
+    throw Object.assign(new Error('timed out'),{code:'ETIMEDOUT'});}}});
+  const state=await connectRun(h);
+  assert.equal(state.step,'undone');
+  assert.ok(!h.kinds().includes('rmdir'),'the other run\'s folder is not removed');
+  assert.equal(h.world.feedExists,true);
+  assert.match(state.kept.find(c=>c.id==='folder').reason,/Another setup/);
+  assertRootSafe(h);assertBundleRemoved(h);
+});

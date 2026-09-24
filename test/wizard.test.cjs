@@ -357,25 +357,25 @@ const ACTIONS={
   wrongPassword:()=>({type:'wrongPassword',runId:'r1'}),applied:()=>({type:'applied',runId:'r1',change:{id:'late',created:true}}),
   verified:()=>({type:'verified',runId:'r1'}),failed:()=>({type:'failed',runId:'r1',error:'x'}),rolledBack:()=>({type:'rolledBack',runId:'r1'}),
   sessionEnded:()=>({type:'sessionEnded',runId:'r1'}),fallbackResult:()=>({type:'fallbackResult',runId:'r1',ok:true}),
-  cleanedUp:()=>({type:'cleanedUp',runId:'r1'}),close:()=>({type:'close'}),
+  cleanedUp:()=>({type:'cleanedUp',runId:'r1'}),close:()=>({type:'close'}),earlierCleanup:()=>({type:'earlierCleanup',warning:'left'}),
 };
 const ACCEPTS={
-  idle:['open'],
-  'detecting:probe':['cancel','sudoProbed','failed','sessionEnded'],
-  'detecting:discover':['cancel','sudoProbed','discovered','failed','sessionEnded'],
-  detected:['continue','cancel','sessionEnded'],
-  review:['connect','cancel','sessionEnded'],
-  password:['password','wrongPassword','cancel','failed','sessionEnded'],
-  fallback:['fallbackResult','cancel','failed','sessionEnded'],
-  connecting:['applied','cancel','failed','sessionEnded'],
-  verifying:['verified','cancel','failed','sessionEnded'],
-  undoing:['applied','failed','rolledBack'],
-  connected:['open','cleanedUp'],
-  undone:['open','retry','cleanedUp'],
-  cancelled:['open','retry','cleanedUp'],
-  'connected:settled':['open','close'],
-  'undone:settled':['open','retry','close'],
-  'cancelled:settled':['open','retry','close'],
+  idle:['open','earlierCleanup'],
+  'detecting:probe':['cancel','sudoProbed','failed','sessionEnded','earlierCleanup'],
+  'detecting:discover':['cancel','sudoProbed','discovered','failed','sessionEnded','earlierCleanup'],
+  detected:['continue','cancel','sessionEnded','earlierCleanup'],
+  review:['connect','cancel','sessionEnded','earlierCleanup'],
+  password:['password','wrongPassword','cancel','failed','sessionEnded','earlierCleanup'],
+  fallback:['fallbackResult','cancel','failed','sessionEnded','earlierCleanup'],
+  connecting:['applied','cancel','failed','sessionEnded','earlierCleanup'],
+  verifying:['verified','cancel','failed','sessionEnded','earlierCleanup'],
+  undoing:['applied','failed','rolledBack','earlierCleanup'],
+  connected:['open','cleanedUp','earlierCleanup'],
+  undone:['open','retry','cleanedUp','earlierCleanup'],
+  cancelled:['open','retry','cleanedUp','earlierCleanup'],
+  'connected:settled':['open','close','earlierCleanup'],
+  'undone:settled':['open','retry','close','earlierCleanup'],
+  'cancelled:settled':['open','retry','close','earlierCleanup'],
 };
 
 test('grid: every step x every action is accepted exactly where the machine says',()=>{
@@ -467,4 +467,26 @@ test('close: a cleanup warning does not stop the close, and a late result of the
   for(const late of [{type:'cleanedUp',runId:'r1',warning:'late'},{type:'verified',runId:'r1'},{type:'rolledBack',runId:'r1'}])
     assert.equal(step(freeze(closed),late),closed,late.type);
   assert.equal(drive([open('r2')],closed).step,'detecting');
+});
+
+test('earlierCleanup: a replaced run\'s leftover shows on the current run, at any step, and changes nothing else',()=>{
+  const s=drive(REACH.review);
+  const next=step(freeze(s),{type:'earlierCleanup',warning:'The setup bundle could not be removed: /var/lib/llm-account-usage/bundles/x.'});
+  assert.equal(next.step,'review');assert.equal(next.busy,s.busy);assert.deepEqual(next.pending,s.pending);
+  assert.match(next.warning,/bundles\/x/);
+  assert.equal(step(freeze(s),{type:'earlierCleanup',warning:''}).warning,s.warning,'an empty warning is refused');
+});
+
+test('R4. a disconnect whose changes all landed but whose final check failed says disconnected, with a warning',()=>{
+  const {initial:init,step:st}=require('../src/wizard.cjs');
+  let s=st(init(),{type:'open',runId:'d1',mode:'disconnect',target:TARGET,connection:{id:'v2-'+'a'.repeat(32),provider:'claude',uid:TARGET.uid}});
+  s=st(s,{type:'sudoProbed',runId:'d1',sudo:'passwordless'});
+  s=st(s,{type:'continue'});
+  s=st(s,{type:'discovered',runId:'d1',preview:{...PREVIEW,changes:[{id:'status',as:TARGET.user,label:'status'},{id:'folder',as:'root',label:'folder'}]}});
+  s=st(s,{type:'connect'});
+  s=st(s,{type:'applied',runId:'d1',change:{id:'status',as:TARGET.user}});
+  s=st(s,{type:'applied',runId:'d1',change:{id:'folder',as:'root'}});
+  assert.equal(s.step,'verifying');
+  s=st(s,{type:'failed',runId:'d1',error:'The shared folder is still there.'});
+  assert.equal(s.step,'connected');assert.equal(s.error,null);assert.match(s.warning,/still there/);
 });

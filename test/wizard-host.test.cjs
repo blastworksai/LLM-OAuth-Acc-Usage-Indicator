@@ -46,6 +46,7 @@ function classify(argv) {
   if(bin==='/usr/bin/install'&&a1==='-m')return 'bundleFile';
   if(bin==='/bin/sh'&&a1==='-c'&&a2==='command -v node')return 'node';
   if(bin===NODE&&typeof a1==='string'&&a1.endsWith('/src/setup-cli.cjs')&&['discover','connect','disconnect'].includes(a2))return a2;
+  if(bin==='/usr/bin/mkdir')return 'claimFeed';
   if(bin==='/usr/bin/rmdir')return 'rmdir';
   if(bin==='/usr/bin/rm')return 'rmBundle';
   return 'unknown';
@@ -60,6 +61,8 @@ function harness({world:w={},on={},probe,checkPassword,answers=[],detect,deps={}
     roots:()=>OK,bundleDir:()=>OK,bundleFile:()=>OK,
     node:()=>({code:0,stdout:`${NODE}\n`,stderr:''}),
     discover:()=>json({ok:true,preview:PREVIEW_OUT}),
+    // mkdir is atomic: it fails when the folder is already there (another run made it first).
+    claimFeed:()=>{if(world.feedExists)return {code:1,stdout:'',stderr:'File exists'};world.feedExists=true;return OK;},
     createFeed:()=>{world.feedExists=true;return OK;},
     connect:()=>json({ok:true,connection:descriptor()}),
     disconnect:()=>json({ok:true,connection:descriptor({connected:false}),feed:{removed:true}}),
@@ -114,7 +117,7 @@ const isRoot=call=>call.options.asUser===undefined;
 // Root only ever makes its own folders, stages its own bundle, rmdirs a feed folder, or rm -r's a bundle.
 function assertRootSafe(h) {
   for(const call of h.calls.filter(isRoot)) {
-    assert.ok(['roots','bundleDir','bundleFile','createFeed','rmdir','rmBundle'].includes(call.kind),`unexpected root argv ${call.argv.join(' ')}`);
+    assert.ok(['roots','bundleDir','bundleFile','claimFeed','createFeed','rmdir','rmBundle'].includes(call.kind),`unexpected root argv ${call.argv.join(' ')}`);
     if(call.kind==='rmBundle')assert.ok(call.argv[3].startsWith(realFeed.BUNDLES+'/')&&call.argv.length===4);
     if(call.kind==='rmdir')assert.deepEqual(call.argv,['/usr/bin/rmdir','--',FEED]);
   }
@@ -152,7 +155,7 @@ test('1. passwordless connect: exact command order, roles and argv',async()=>{
   assert.deepEqual(h.events,[
     'state:detecting','resolveUser','probe','state:detected',
     'state:detecting',...STAGE,'run:node','run:discover','inspect','state:review',
-    'detectProvider','state:connecting','inspect','run:createFeed','inspect','precheck','run:connect',
+    'detectProvider','state:connecting','inspect','run:claimFeed','run:createFeed','precheck','run:connect',
     'state:verifying','detectProvider','readFeeds','readConnectionFeeds','onConnected','state:connected','run:rmBundle',
   ]);
   const bundle=bundleOf(h),script=`${bundle}/src/setup-cli.cjs`;
@@ -163,16 +166,17 @@ test('1. passwordless connect: exact command order, roles and argv',async()=>{
     realFeed.stageBundleArgv({bundleId:bundle.split('/').pop(),files:[...MANIFEST],extensionPath:EXT}));
   assert.deepEqual(by('node').argv,['/bin/sh','-c','command -v node']);
   assert.deepEqual(by('discover').argv,[NODE,script,'discover','--provider','claude','--target',JSON.stringify({provider:'claude',process:PROC}),'--result','-']);
+  assert.deepEqual(by('claimFeed').argv,['/usr/bin/mkdir','-m','0700','--',FEED]);
   assert.deepEqual(by('createFeed').argv,['/usr/bin/install','-d','-m','2750','-o',String(UID),'-g',String(GID),FEED]);
   assert.deepEqual(by('connect').argv,[NODE,script,'connect','--provider','claude','--profile',PROFILE,'--report-dir',FEED,
     '--runtime-version',VERSION,'--target',JSON.stringify({provider:'claude',process:PROC}),'--consent','granted','--result','-']);
-  for(const kind of ['roots','bundleDir','bundleFile','createFeed','rmBundle'])assert.ok(h.calls.filter(call=>call.kind===kind).every(isRoot),`${kind} as root`);
+  for(const kind of ['roots','bundleDir','bundleFile','claimFeed','createFeed','rmBundle'])assert.ok(h.calls.filter(call=>call.kind===kind).every(isRoot),`${kind} as root`);
   for(const kind of ['node','discover','connect'])assert.equal(by(kind).options.asUser,USER,`${kind} as target`);
   assert.ok(h.calls.every(call=>call.options.password===null||call.options.password===undefined),'no password on a passwordless host');
   // The review screen listed the real changes: the folder (root) then the status line (target).
   const review=h.states.find(s=>s.step==='review');
   assert.deepEqual(review.preview.changes.map(c=>[c.id,c.as]),[['folder','root'],['status',USER]]);
-  assert.deepEqual(review.preview.commands.map(c=>c.as),['root',USER]);
+  assert.deepEqual(review.preview.commands.map(c=>c.as),['root','root',USER]);
   assert.deepEqual(state.applied.map(c=>c.id),['folder','status']);
   assert.equal(state.applied[0].created,true);
   assert.equal(h.connected.length,1);
@@ -624,4 +628,65 @@ test('retry after an undone run is a fresh run on the same target with its own b
   assert.equal(bundles.length,2);
   assert.deepEqual(h.calls.filter(call=>call.kind==='rmBundle').map(call=>call.argv[3]),bundles);
   assertRootSafe(h);
+});
+
+// ---- Codex review of CP2 (5b1be25): one regression per finding ----
+test('R1. setup-cli connect reports ok:false: the status line may have changed, so the rollback restores it',async()=>{
+  const h=harness({on:{connect:()=>json({ok:false,code:'SETUP_FAILED'})}});
+  const state=await connectRun(h);
+  assert.equal(state.step,'undone');
+  assert.deepEqual(h.kinds().slice(h.kinds().indexOf('connect')),['connect','disconnect','rmdir','rmBundle']);
+  assert.deepEqual(state.undone.map(c=>c.id),['status','folder']);
+  assertRootSafe(h);assertBundleRemoved(h);
+});
+
+test('R2. another run claims the feed folder first: this run never re-owns, empties or removes it',async()=>{
+  const h=harness({on:{claimFeed:()=>{h.world.feedExists=true;return {code:1,stdout:'',stderr:'File exists'};}}});
+  const state=await connectRun(h);
+  assert.equal(state.step,'undone');
+  assert.match(state.error,/could not be claimed/);
+  for(const kind of ['createFeed','connect','disconnect','rmdir'])assert.ok(!h.kinds().includes(kind),`${kind} must not run`);
+  assert.equal(h.world.feedExists,true);
+  assertRootSafe(h);assertBundleRemoved(h);
+});
+
+test('R3. a bundle removal that fails after the run was replaced still reaches the screen',async()=>{
+  const gate=deferred();
+  const h=harness({on:{rmBundle:()=>gate.promise}});
+  h.host.dispatch(OPEN);await h.host.settled();
+  h.host.dispatch({type:'cancel'});
+  await until(()=>h.kinds().includes('rmBundle')||h.host.getState().pending===null,'cleanup started');
+  // cancel before any staging: nothing to remove, so stage one first
+  if(!h.kinds().includes('rmBundle')) {
+    h.host.dispatch(OPEN);await until(()=>h.host.getState().step==='detected','detected');
+    h.host.dispatch({type:'continue'});await until(()=>h.kinds().includes('discover'),'discover');
+    await until(()=>h.host.getState().step==='review','review');
+    h.host.dispatch({type:'cancel'});
+    await until(()=>h.kinds().includes('rmBundle'),'bundle removal started');
+  }
+  const bundle=bundleOf(h);
+  h.host.dispatch(OPEN); // replaces the run while rm -r is still running
+  gate.resolve({code:1,stdout:'',stderr:''});
+  const state=await h.host.settled();
+  assert.notEqual(state.step,'idle');
+  assert.equal(state.warning,`The setup bundle could not be removed: ${bundle}.`);
+});
+
+test('R5. a cancelled run\'s slow identity re-check never swallows Connect in the next run',async()=>{
+  let slow=null;
+  const h=harness({detect:(pid,options)=>slow?slow.promise:{provider:'claude',process:{...PROC},cliPath:null}});
+  await toReview(h);
+  slow=deferred();
+  h.host.dispatch({type:'connect'}); // re-check hangs
+  h.host.dispatch({type:'cancel'});
+  const hung=slow;slow=null;
+  // settled() would wait on the hung re-check, so wait for the cancelled run to finish its cleanup instead
+  await until(()=>h.host.getState().step==='cancelled'&&h.host.getState().pending===null,'first run cancelled and cleaned up');
+  h.host.dispatch(OPEN);await until(()=>h.host.getState().step==='detected','detected');
+  h.host.dispatch({type:'continue'});await until(()=>h.host.getState().step==='review','review');
+  h.host.dispatch({type:'connect'});
+  await until(()=>h.kinds().includes('connect'),'Connect in the new run went ahead');
+  hung.resolve({provider:'claude',process:{...PROC},cliPath:null});
+  const state=await h.host.settled();
+  assert.equal(state.step,'connected');
 });

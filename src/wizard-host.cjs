@@ -71,7 +71,7 @@ function createWizardHost({elevate,sharedFeed=require('./shared-feed.cjs'),detec
   function kick() {if(!inflight)inflight=Promise.resolve().then(pump).finally(()=>{inflight=null;if(due())kick();});}
   async function pump() {
     for(;;) {
-      if(orphans.length){await finish(orphans.shift());continue;}
+      if(orphans.length){const warning=await finish(orphans.shift());if(warning)commit({type:'earlierCleanup',warning});continue;}
       const pending=state.pending,r=run;
       if(!pending||handled.has(pending)||!r||state.runId!==r.runId)return;
       handled.add(pending);
@@ -95,7 +95,10 @@ function createWizardHost({elevate,sharedFeed=require('./shared-feed.cjs'),detec
       case 'apply':return applyChange(r,pending.changes[0]);
       case 'verify':return r.raw.mode==='disconnect'?verifyDisconnect(r):verifyConnect(r);
       case 'rollback':return rollback(r,pending);
-      case 'cleanup':return finish(r).then(warning=>{if(state.runId===r.runId)result(r,{type:'cleanedUp',...(warning?{warning}:{})});});
+      case 'cleanup':return finish(r).then(warning=>{
+        if(state.runId===r.runId)result(r,{type:'cleanedUp',...(warning?{warning}:{})});
+        else if(warning)commit({type:'earlierCleanup',warning}); // replaced while rm -r ran: never lost unseen
+      });
     }
   }
   // ---- elevated calls: the password is an option to elevate.run, never an argument ----
@@ -199,7 +202,7 @@ function createWizardHost({elevate,sharedFeed=require('./shared-feed.cjs'),detec
     result(r,{type:'discovered',preview:{id:p.id,provider:r.target.provider,profilePath:p.profilePath,settingsPath:p.settingsPath,reportDir:r.feed,
       previousReportDir:p.reportDir!==r.feed&&publicPath(p.reportDir)?p.reportDir:null,changes,
       sharedDirectories:Array.isArray(p.sharedDirectories)?p.sharedDirectories:[],hasExistingStatusLine:p.hasExistingStatusLine===true,
-      hasExistingHooks:p.hasExistingHooks===true,commands:[...(r.createFolder?[{as:'root',argv:createArgv(r)}]:[]),{as:user,argv:connectArgv(r)}]}});
+      hasExistingHooks:p.hasExistingHooks===true,commands:[...(r.createFolder?[{as:'root',argv:sharedFeed.claimFeedArgv(r.connectionId)},{as:'root',argv:createArgv(r)}]:[]),{as:user,argv:connectArgv(r)}]}});
   }
   async function ask(r,attempt) {
     if(!live(r,'password'))return;
@@ -229,12 +232,18 @@ function createWizardHost({elevate,sharedFeed=require('./shared-feed.cjs'),detec
   async function createFolder(r) {
     if((await sharedFeed.inspectFeed(r.feed)).exists)
       throw safeError('FEED_FOLDER_APPEARED','The feed folder appeared after the review. Nothing was changed; press Retry to review it again.');
+    // The claim is atomic: only a run whose mkdir succeeded owns the folder, so a second window racing on the same
+    // profile can never empty or remove this one's folder, and install -d never re-owns a folder it did not claim.
+    let claimed=null;
+    try {claimed=(await asRoot(r,sharedFeed.claimFeedArgv(r.connectionId))).code;} catch {}
+    if(claimed!==0) {
+      if(live(r,'connecting'))result(r,{type:'failed',error:`The shared feed folder ${r.feed} could not be claimed: another setup may have made it first. Press Retry to review it again.`});
+      return;
+    }
+    result(r,{type:'applied',change:{id:'folder',as:'root',path:r.feed,created:true}});
     let code=null;
     try {code=(await asRoot(r,createArgv(r))).code;} catch {}
-    // Uncertain means present: rmdir on rollback is harmless if it is not there.
-    const after=await sharedFeed.inspectFeed(r.feed).catch(()=>({exists:true}));
-    const readable=code===0&&after.exists&&await sharedFeed.precheckReadable(r.feed);
-    if(after.exists)result(r,{type:'applied',change:{id:'folder',as:'root',path:r.feed,created:true}});
+    const readable=code===0&&await sharedFeed.precheckReadable(r.feed);
     // Finding 4: the host proves it can read the folder before the target account is touched at all.
     if(!readable&&(live(r,'connecting')||live(r,'verifying')))
       result(r,{type:'failed',error:code===0?'VS Code could not read the feed folder.':'Creating the shared feed folder failed.'});
@@ -244,13 +253,11 @@ function createWizardHost({elevate,sharedFeed=require('./shared-feed.cjs'),detec
     let out,thrown=null;
     try {out=parseResult(await asTarget(r,connectArgv(r)));} catch(error) {thrown=error;}
     if(out?.ok===true&&out.connection){r.connection=out.connection;return result(r,{type:'applied',change});}
-    if(out?.ok===false) {
-      if(live(r,'connecting'))result(r,{type:'failed',error:`Setup as ${r.target.user} could not finish. Review the selected profile, executable and report-directory permissions.`});
-      return;
-    }
-    // No readable result: it may have run. Record it so the rollback restores the status line.
+    // ok:false or no readable result: setup-cli may have changed the status line before it failed (the descriptor is
+    // written after connectProvider), so record the change as uncertain and let the rollback restore it.
     result(r,{type:'applied',change:{...change,uncertain:true}});
-    if(live(r,'verifying'))result(r,{type:'failed',error:thrown?message(thrown):`Setup as ${r.target.user} gave no readable result, so it is being undone.`});
+    if(live(r,'verifying'))result(r,{type:'failed',error:out?.ok===false?`Setup as ${r.target.user} could not finish, so it is being undone. Review the selected profile, executable and report-directory permissions.`
+      :thrown?message(thrown):`Setup as ${r.target.user} gave no readable result, so it is being undone.`});
   }
   async function verifyConnect(r) {
     let descriptor;
@@ -324,14 +331,16 @@ function createWizardHost({elevate,sharedFeed=require('./shared-feed.cjs'),detec
     return commit({type:'retry',runId});
   }
   function connect() {
-    if(checking)return state;
+    if(checking&&checking.runId===state.runId)return state; // one re-check per run; a cancelled run's never blocks the next
     if(!wizard.can.connect(state))return commit({type:'connect'});
     const r=run;
     // Re-check the process identity before anything is written; focus is never consulted.
-    checking=recheck(r).catch(()=>false).then(alive=>{
+    const mine={runId:r.runId};
+    mine.promise=recheck(r).catch(()=>false).then(alive=>{
       if(!live(r,'review'))return;
       if(alive)commit({type:'connect'});else result(r,{type:'sessionEnded'});
-    }).finally(()=>{checking=null;});
+    }).finally(()=>{if(checking===mine)checking=null;});
+    checking=mine;
     return state;
   }
   function dispatch(action) {
@@ -342,7 +351,7 @@ function createWizardHost({elevate,sharedFeed=require('./shared-feed.cjs'),detec
     if(type==='connect')return connect();
     return commit({type});
   }
-  async function settled() {while(inflight||checking)await (inflight||checking);return state;}
+  async function settled() {while(inflight||checking)await (inflight||checking.promise);return state;}
   return {dispatch,getState:()=>structuredClone(state),settled};
 }
 module.exports={createWizardHost,verifyDescriptor};

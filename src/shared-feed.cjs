@@ -6,7 +6,7 @@ const {constants}=require('node:fs');
 const path=require('node:path');
 const {publicPath}=require('./connection.cjs');
 const ROOT='/var/lib/llm-account-usage',FEEDS=ROOT+'/feeds',BUNDLES=ROOT+'/bundles';
-const INSTALL='/usr/bin/install',RMDIR='/usr/bin/rmdir',RM='/usr/bin/rm';
+const INSTALL='/usr/bin/install',MKDIR='/usr/bin/mkdir',RMDIR='/usr/bin/rmdir',RM='/usr/bin/rm';
 const CONNECTION_ID=/^v2-[a-f0-9]{32}$/;
 const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const BUNDLE_FILE=/^(src|collectors)\/[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/;
@@ -21,6 +21,9 @@ const createFeedArgv=({connectionId,uid,gid}={})=>{
   const target=feedPath(connectionId);
   return [INSTALL,'-d','-m','2750','-o',numeric(uid,'INVALID_UID'),'-g',numeric(gid,'INVALID_GID'),target];
 };
+// The atomic claim: mkdir fails if the folder exists, so exactly one run can call a feed folder its own. Root-only 0700
+// until createFeedArgv hands it to the target; install -d is never run on a folder this run did not claim.
+const claimFeedArgv=connectionId=>[MKDIR,'-m','0700','--',feedPath(connectionId)];
 // rmdir refuses a non-empty folder, so root never deletes target-owned content.
 const removeFeedArgv=connectionId=>[RMDIR,'--',feedPath(connectionId)];
 // files: the bundle manifest as relative names ('src/setup-cli.cjs'), the same list handoff.cjs stages.
@@ -59,5 +62,5 @@ async function precheckReadable(target,{fs:io=fs}={}) {
     return true;
   } catch {return false;} finally {await handle?.close();}
 }
-module.exports={ROOT,FEEDS,BUNDLES,feedPath,bundlePath,ensureRootsArgv,createFeedArgv,removeFeedArgv,stageBundleArgv,removeBundleArgv,
+module.exports={ROOT,FEEDS,BUNDLES,feedPath,bundlePath,ensureRootsArgv,claimFeedArgv,createFeedArgv,removeFeedArgv,stageBundleArgv,removeBundleArgv,
   inspectFeed,precheckReadable};

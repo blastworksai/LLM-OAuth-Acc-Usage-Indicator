@@ -28,6 +28,7 @@
 //   {type:'verified',runId,connection?,warning?}   {type:'failed',runId,error,warning?}
 //   {type:'rolledBack',runId,undone:[id|change],kept:[id|change],warning?}
 //   {type:'sessionEnded',runId}   {type:'fallbackResult',runId,ok,change?,error?,warning?}   {type:'cleanedUp',runId,warning?}
+//   {type:'earlierCleanup',warning}  a replaced run's bundle could not be removed: shown on whatever run is current
 // Every entry of preview.changes must be reported by `applied`; the last one moves the run to verifying.
 // Focus is not an action: the run is bound to target.process from open (finding 6). busy is the only lock and
 // clears on a terminal step, before cleanup; cleanup problems land in `warning`, never block (finding 1).
@@ -78,7 +79,11 @@ function apply(s) {
   return {...s,step:'connecting',pending:{effect:'apply',changes}};
 }
 function rollback(s,why) {
-  if(s.mode==='disconnect')return log(finish(s,'undone',{error:why,undone:[],kept:remaining(s)}),`${why} Nothing was undone; still in place: ${labels(remaining(s))}.`);
+  if(s.mode==='disconnect') {
+    // Every change was made and only the final check failed: it is disconnected, with the check's problem as a warning.
+    if(!remaining(s).length)return log(finish(s,'connected',{error:null,warning:warn(s,why)}),`Disconnected; the final check reported: ${why}`);
+    return log(finish(s,'undone',{error:why,undone:[],kept:remaining(s)}),`${why} Nothing was undone; still in place: ${labels(remaining(s))}.`);
+  }
   const done=[...s.applied].reverse();
   if(s.sudo==='none')return log(finish(s,'undone',{error:why,undone:[],kept:done}),`${why} No sudo here, so these stay until undone by hand: ${labels(done)}.`);
   const undo=done.filter(c=>c.id!=='folder'||c.created===true), keep=done.filter(c=>c.id==='folder'&&c.created!==true);
@@ -104,6 +109,7 @@ const can={
   sessionEnded:s=>BEFORE_CONNECT.has(s.step)||APPLYING.has(s.step),
   fallbackResult:s=>s.step==='fallback',
   cleanedUp:s=>TERMINAL.has(s.step)&&pending(s,'cleanup'),
+  earlierCleanup:(s,a)=>!!a&&typeof a.warning==='string'&&!!a.warning,
 };
 
 function step(s,a) {
@@ -172,6 +178,7 @@ function step(s,a) {
       if(BEFORE_CONNECT.has(s.step))return log(finish(s,'cancelled',{error:null}),'Cancelled before anything was written. Ready to start again straight away.');
       return rollback(s,'You cancelled.');
     case 'cleanedUp':return {...s,pending:null,warning:warn(s,a.warning)};
+    case 'earlierCleanup':return log({...s,warning:warn(s,a.warning)},`An earlier run left something behind: ${a.warning}`);
     case 'close':return initial();
   }
   return s;

@@ -710,11 +710,12 @@ test('Copy puts the exact reviewed commands on the clipboard; the password box i
   assert.equal(box.password,true);assert.equal(box.ignoreFocusOut,true);assert.match(box.prompt,/\(sudo\)/);
   await send({type:'wizard',intent:'copy'});
   const lines=h.clipboard.split('\n');
-  assert.equal(lines.length,2);assert.ok(h.notices.includes('Copied 2 commands.'));
-  assert.match(lines[0],new RegExp(`^/usr/bin/install -d -m 2750 -o 2000 -g \\d+ ${connection.reportDir}$`));
-  assert.match(lines[1],/^\/usr\/bin\/node \/var\/lib\/llm-account-usage\/bundles\/[0-9a-f-]+\/src\/setup-cli\.cjs connect --provider claude /);
-  assert.ok(lines[1].includes(`--target '{"provider":"claude","process":{"pid":30,"uid":2000,"start_ticks":"30","boot_id":"boot"}}'`));
-  assert.ok(lines[1].endsWith('--consent granted --result -'));
+  assert.equal(lines.length,3);assert.ok(h.notices.includes('Copied 3 commands.'));
+  assert.equal(lines[0],`/usr/bin/mkdir -m 0700 -- ${connection.reportDir}`);
+  assert.match(lines[1],new RegExp(`^/usr/bin/install -d -m 2750 -o 2000 -g \\d+ ${connection.reportDir}$`));
+  assert.match(lines[2],/^\/usr\/bin\/node \/var\/lib\/llm-account-usage\/bundles\/[0-9a-f-]+\/src\/setup-cli\.cjs connect --provider claude /);
+  assert.ok(lines[2].includes(`--target '{"provider":"claude","process":{"pid":30,"uid":2000,"start_ticks":"30","boot_id":"boot"}}'`));
+  assert.ok(lines[2].endsWith('--consent granted --result -'));
   await send({type:'wizard',intent:'connect'});
   assert.equal(h.api.getWizardState().step,'connected');assert.equal(h.inputs.length,1,'Connect does not ask again');
   assert.ok(h.root.calls.every(call=>call.held),'every elevated call carries the held password as an option');

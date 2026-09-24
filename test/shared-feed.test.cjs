@@ -118,3 +118,8 @@ test('precheckReadable refuses a folder swapped between lstat and open, and clos
   assert.equal(await feed.precheckReadable('/f',{fs:io(before,async()=>{throw Object.assign(new Error('x'),{code:'EACCES'});})}),false);
   assert.equal(closed,3);
 });
+
+test('claimFeedArgv: an atomic, root-only mkdir of exactly the feed path; bad ids refused',()=>{
+  assert.deepEqual(feed.claimFeedArgv(ID),['/usr/bin/mkdir','-m','0700','--',feed.feedPath(ID)]);
+  for(const bad of ['v2-XYZ','../x','',null])assert.throws(()=>feed.claimFeedArgv(bad));
+});

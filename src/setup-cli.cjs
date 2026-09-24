@@ -150,6 +150,9 @@ async function run(argv,dependencies={}) {
   const options={homeDir,uid,env:dependencies.env||process.env,nodePath:dependencies.nodePath||process.execPath,
     collectorPath:dependencies.collectorPath||path.join(__dirname,'../collectors/passive.cjs'),
     storagePath:path.join(homeDir,'.local/state/llm-account-usage/target-setup')};
+  // Set just before the provider settings are touched: a failure after it reports SETUP_FAILED_CHANGED, so the host
+  // rolls the status line back; a failure before it (checks, consent, feed folder) left the profile as it was.
+  let changing=false;
   try {
     const verify=async()=>{
       if(!args.target)return null;
@@ -204,6 +207,7 @@ async function run(argv,dependencies={}) {
       create:args.action==='connect'&&(preview.createReportDirectory??!args['report-dir'])});
     const connection=await (dependencies.withReportFeedClaim||setup.withReportFeedClaim)(options.reportDir,preview.id,options,async publication=>{
       await (dependencies.checkConnectionFeed||require('./connection-feed.cjs').checkConnectionFeed)(options.reportDir,preview.id);
+      changing=true;
       const result=args.action==='connect'?await setup.connectProvider(options):await setup.disconnectProvider(options);
       const value={};
       for(const key of ['id','provider','uid','profilePath','settingsPath','connected','cliLookupPath','reportDir','launcherPath','backupPath'])value[key]=result[key];
@@ -218,7 +222,7 @@ async function run(argv,dependencies={}) {
     print(feed.removed?'The Account Usage files in the report directory were removed.':feed.message);
     await publish(args.result,{ok:true,connection,feed});return {code:feed.removed?0:1};
   } catch {
-    const result={ok:false,code:'SETUP_FAILED',message:'Target-user setup could not finish. Review the selected profile, executable and report-directory permissions.'};
+    const result={ok:false,code:changing?'SETUP_FAILED_CHANGED':'SETUP_FAILED',message:'Target-user setup could not finish. Review the selected profile, executable and report-directory permissions.'};
     print(result.message);
     try {await publish(args.result,result);}catch {print('The setup result could not be written.');}
     return {code:1};

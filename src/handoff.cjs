@@ -102,7 +102,7 @@ async function prepareHandoff({extensionPath,provider,target,action='connect',co
             (action==='connect'&&(connection.runtimeVersion!==runtimeVersion || (expected.cliPath!==null&&connection.cliLookupPath!==expected.cliPath)))||
             (action==='disconnect'&&connection.id!==connectionId)||
             (profilePath&&connection.profilePath!==profilePath)||(reportDir&&connection.reportDir!==reportDir))throw invalid();
-        } else if(result.ok!==false||Object.keys(result).length!==3||!['CANCELLED','SETUP_FAILED'].includes(result.code)||
+        } else if(result.ok!==false||Object.keys(result).length!==3||!['CANCELLED','SETUP_FAILED','SETUP_FAILED_CHANGED'].includes(result.code)||
           typeof result.message!=='string'||result.message.length>512||/[\x00-\x1f\x7f]/.test(result.message))throw invalid();
         const current=await verify();
         if(disposed||!current||current.unavailable||current.provider!==(expected.cliPath===null?null:expected.provider)||

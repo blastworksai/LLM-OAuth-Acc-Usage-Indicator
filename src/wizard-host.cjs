@@ -236,6 +236,13 @@ function createWizardHost({elevate,sharedFeed=require('./shared-feed.cjs'),detec
     // profile can never empty or remove this one's folder, and install -d never re-owns a folder it did not claim.
     let claimed=null;
     try {claimed=(await asRoot(r,sharedFeed.claimFeedArgv(r.connectionId))).code;} catch {}
+    if(claimed===null) {
+      // mkdir gave no answer (timeout): a root-owned 0700 folder is the claim's own shape, so record it and let the
+      // rollback rmdir it (empty, so harmless) rather than strand a folder the next review would refuse.
+      const after=await sharedFeed.inspectFeed(r.feed).catch(()=>null);
+      if(after?.exists&&after.directory&&after.uid===0&&after.mode===0o700)
+        result(r,{type:'applied',change:{id:'folder',as:'root',path:r.feed,created:true,uncertain:true}});
+    }
     if(claimed!==0) {
       if(live(r,'connecting'))result(r,{type:'failed',error:`The shared feed folder ${r.feed} could not be claimed: another setup may have made it first. Press Retry to review it again.`});
       return;
@@ -253,8 +260,13 @@ function createWizardHost({elevate,sharedFeed=require('./shared-feed.cjs'),detec
     let out,thrown=null;
     try {out=parseResult(await asTarget(r,connectArgv(r)));} catch(error) {thrown=error;}
     if(out?.ok===true&&out.connection){r.connection=out.connection;return result(r,{type:'applied',change});}
-    // ok:false or no readable result: setup-cli may have changed the status line before it failed (the descriptor is
-    // written after connectProvider), so record the change as uncertain and let the rollback restore it.
+    // A failure before setup-cli touched the provider settings changed nothing: undoing it would disconnect a profile
+    // that was already working (a reconnect). SETUP_FAILED_CHANGED, or no readable result, may have changed the status
+    // line, so that is recorded as uncertain and the rollback restores it.
+    if(out?.ok===false&&out.code!=='SETUP_FAILED_CHANGED') {
+      if(live(r,'connecting'))result(r,{type:'failed',error:`Setup as ${r.target.user} could not finish; its status line was not changed. Review the selected profile, executable and report-directory permissions.`});
+      return;
+    }
     result(r,{type:'applied',change:{...change,uncertain:true}});
     if(live(r,'verifying'))result(r,{type:'failed',error:out?.ok===false?`Setup as ${r.target.user} could not finish, so it is being undone. Review the selected profile, executable and report-directory permissions.`
       :thrown?message(thrown):`Setup as ${r.target.user} gave no readable result, so it is being undone.`});

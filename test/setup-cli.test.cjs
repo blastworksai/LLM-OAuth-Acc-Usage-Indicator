@@ -363,7 +363,7 @@ test('--result - publishes exactly one line even when setup fails after preview 
   const d=deps(),lines=capture(d);d.setup.connectProvider=async()=>{throw new Error('secret raw command output');};
   assert.equal((await run([...argv.slice(0,-4),'--result','-','--runtime-version','0.4.0','--consent','granted'],d)).code,1);
   assert.equal(lines.length,1);assert.deepEqual(Object.keys(JSON.parse(lines[0])),['ok','code','message']);
-  assert.equal(JSON.parse(lines[0]).code,'SETUP_FAILED');assert.equal(d.results.length,0);assert.doesNotMatch(lines[0],/secret raw/);
+  assert.equal(JSON.parse(lines[0]).code,'SETUP_FAILED_CHANGED','connectProvider was entered, so the settings may have changed');assert.equal(d.results.length,0);assert.doesNotMatch(lines[0],/secret raw/);
   const failing=deps();let attempts=0;failing.writeStdout=async()=>{attempts++;throw new Error('EPIPE');};
   assert.equal((await run([...argv.slice(0,-4),'--result','-','--runtime-version','0.4.0','--consent','granted'],failing)).code,1);
   assert.equal(attempts,1,'a failed stdout write is never followed by a second JSON line');
@@ -506,4 +506,12 @@ test('remove-feed refuses planted symlinks and unknown nested entries without re
   const link=path.join(base,'feed-link');await fs.symlink(clean,link);
   assert.equal((await removeFeed(link,process.getuid())).code,'FEED_REMOVE_FAILED','a linked feed folder is never followed');
   assert.equal((await removeFeed('relative/feed',process.getuid())).code,'FEED_REMOVE_FAILED');
+});
+
+test('a failure before the provider settings are touched reports SETUP_FAILED, never SETUP_FAILED_CHANGED',async()=>{
+  const d=deps(),lines=capture(d);let entered=false;
+  d.ensureReportDirectory=async()=>{throw new Error('feed folder refused');};
+  d.setup.connectProvider=async()=>{entered=true;throw new Error('must not be reached');};
+  assert.equal((await run([...argv.slice(0,-4),'--result','-','--runtime-version','0.4.0','--consent','granted'],d)).code,1);
+  assert.equal(entered,false);assert.equal(JSON.parse(lines[0]).code,'SETUP_FAILED');
 });

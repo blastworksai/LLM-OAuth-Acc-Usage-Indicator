@@ -631,8 +631,8 @@ test('retry after an undone run is a fresh run on the same target with its own b
 });
 
 // ---- Codex review of CP2 (5b1be25): one regression per finding ----
-test('R1. setup-cli connect reports ok:false: the status line may have changed, so the rollback restores it',async()=>{
-  const h=harness({on:{connect:()=>json({ok:false,code:'SETUP_FAILED'})}});
+test('R1. setup-cli connect fails after touching the settings: the rollback restores the status line',async()=>{
+  const h=harness({on:{connect:()=>json({ok:false,code:'SETUP_FAILED_CHANGED'})}});
   const state=await connectRun(h);
   assert.equal(state.step,'undone');
   assert.deepEqual(h.kinds().slice(h.kinds().indexOf('connect')),['connect','disconnect','rmdir','rmBundle']);
@@ -689,4 +689,24 @@ test('R5. a cancelled run\'s slow identity re-check never swallows Connect in th
   hung.resolve({provider:'claude',process:{...PROC},cliPath:null});
   const state=await h.host.settled();
   assert.equal(state.step,'connected');
+});
+
+test('R1b. a reconnect whose setup fails before touching the settings leaves the working connection alone',async()=>{
+  const h=harness({world:{feedExists:true},on:{connect:()=>json({ok:false,code:'SETUP_FAILED'})}});
+  const state=await h.drive({...OPEN,connection:CONNECTION},{type:'continue'},{type:'connect'});
+  assert.equal(state.step,'undone');
+  assert.match(state.error,/status line was not changed/);
+  assert.ok(!h.kinds().includes('disconnect'),'no disconnect: the old connection keeps working');
+  assert.ok(!h.kinds().includes('rmdir'));
+  assertRootSafe(h);assertBundleRemoved(h);
+});
+
+test('R2b. mkdir times out after making the folder: the claim is recorded and the rollback rmdirs it',async()=>{
+  const h=harness({on:{claimFeed:()=>{h.world.feedExists=true;h.world.feedUid=0;h.world.feedGid=0;h.world.feedMode=0o700;
+    throw Object.assign(new Error('timed out'),{code:'ETIMEDOUT'});}}});
+  const state=await connectRun(h);
+  assert.equal(state.step,'undone');
+  assert.deepEqual(h.kinds().slice(h.kinds().indexOf('claimFeed')),['claimFeed','rmdir','rmBundle']);
+  assert.equal(h.world.feedExists,false,'no stranded folder');
+  assertRootSafe(h);assertBundleRemoved(h);
 });

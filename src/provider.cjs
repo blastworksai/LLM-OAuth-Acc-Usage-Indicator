@@ -21,6 +21,10 @@ async function processGone(pid,readFile=fs.readFile) {
   return /^[ZX]$/.test(raw.slice(raw.lastIndexOf(')')+2).split(' ',1)[0]);
  } catch(error) {return error?.code==='ENOENT'||error?.code==='ESRCH';}
 }
+// Readable for another user's process, unlike /proc/<pid>/exe.
+async function getCommandLine(pid) {
+ try{return (await fs.readFile(`/proc/${pid}/cmdline`,'utf8')).split('\0').filter(Boolean);}catch{return null;}
+}
 async function getExecutable(pid) {
  try{return await fs.readlink(`/proc/${pid}/exe`);}catch{return null;}
 }
@@ -83,7 +87,7 @@ function createProviderDetector({platform=process.platform,uid=process.getuid?.(
  env=process.env,home=os.homedir(),processIds:listProcesses=processIds,
  getProcess=readProcess,getExecutable:readExecutable=getExecutable,
  resolveExecutable:resolveNative=resolveExecutable,resolveCommand:resolveInstalled=resolveCommand,
- processGone:isGone=processGone}={}) {
+ processGone:isGone=processGone,getCommandLine:readCommandLine=getCommandLine}={}) {
  const automatic=async function(terminalPid) {
   if(platform!=='linux')return null;
   try {
@@ -158,7 +162,26 @@ function createProviderDetector({platform=process.platform,uid=process.getuid?.(
     }
    }
    const wrapper=c=>c.process.uid===0 && USER_SWITCHERS.has(c.process.comm) && ancestors.some(a=>same(a,c.process));
-   const innermost=candidates.filter(c=>!wrapper(c));
+   // An npm install puts a script launcher on PATH (`node /usr/bin/codex`) that
+   // spawns the native CLI as its direct child in the same foreground group; both
+   // match. Drop the parent only when it is that: same UID, same group and tty,
+   // parent of another kept candidate, and its script resolves to a provider
+   // launcher on PATH. Any other parent/child pair stays ambiguous.
+   const launchers=new Set();
+   for(const {cliPath} of (await knownProviders(env,home,resolveNative,resolveInstalled)).wrapped.values()) {
+    const real=await resolveInstalled(cliPath);if(typeof real==='string')launchers.add(real);
+   }
+   const launcher=async c=>{
+    const child=candidates.some(d=>!wrapper(d) && d.process.ppid===c.process.pid && d.process.uid===c.process.uid &&
+      d.process.pgrp===c.process.pgrp && d.process.tty_nr===c.process.tty_nr);
+    if(!child || !launchers.size)return false;
+    const argv=await readCommandLine(c.process.pid);
+    if(!Array.isArray(argv) || argv.length<2 || !path.isAbsolute(argv[1]))return false;
+    const real=await resolveInstalled(argv[1]);
+    return typeof real==='string' && launchers.has(real) && sameForeground(c.process,await checked(c.process.pid));
+   };
+   const innermost=[];
+   for(const c of candidates)if(!wrapper(c) && !await launcher(c))innermost.push(c);
    if(innermost.length>1)return unavailable;
    if(!sameForeground(terminal,await checked(terminalPid)))return unavailable;
    if(!innermost.length)return null;

@@ -161,6 +161,15 @@ test('a native CLI outside the editor PATH can be selected without workspace con
   assert.equal(h.connected.length,1);assert.equal(h.connected[0].cliPath,'/example/native/claude');
   assert.equal(h.connected[0].env,undefined);assert.equal(h.errors.length,0);
 });
+test('a script launcher on PATH offers the native executable picker instead of a dead end',async()=>{
+  const h=harness({pickPath:'/example/native/codex',discover:async options=>{
+    if(!options.cliPath)throw problem('UNSUPPORTED_CLI');
+    return {profilePath:'/example/profile',hasExistingStatusLine:false};
+  }});
+  await h.commands.get('llmAccountUsage.connect')();
+  assert.equal(h.connected.length,1);assert.equal(h.connected[0].cliPath,'/example/native/codex');
+  assert.equal(h.errors.length,0);
+});
 test('cancelling the profile confirmation or picker never connects a provider',async()=>{
   for(const options of [{confirm:undefined},{pickPath:null,discover:async()=>{throw problem('PROFILE_REQUIRED');}}]) {
     if('confirm' in options)options.confirm='Cancel';

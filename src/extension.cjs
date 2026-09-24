@@ -251,7 +251,8 @@ function activate(context) {
         try {found=await setup.discoverProvider(options);}
         catch(error) {
           const profileMissing=error?.safeToDisplay===true && error.code==='PROFILE_REQUIRED';
-          const executableMissing=error?.safeToDisplay===true && error.code==='CLI_NOT_FOUND';
+          // A script launcher on PATH (an npm install) is as good as missing: offer the picker.
+          const executableMissing=error?.safeToDisplay===true && ['CLI_NOT_FOUND','UNSUPPORTED_CLI'].includes(error.code);
           if(!profileMissing && !executableMissing)throw error;
           const action=profileMissing?'Choose profile':'Choose executable';
           if(await vscode.window.showWarningMessage(error.message,action)!==action)return;

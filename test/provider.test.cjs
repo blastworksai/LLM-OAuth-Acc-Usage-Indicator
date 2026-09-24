@@ -100,6 +100,32 @@ test('a wrapper around the foreign CLI yields the innermost foreground process, 
   provider:null,cliPath:null,process:{pid:13,uid:2000,start_ticks:'13',boot_id:'boot'}
  });
 });
+// Shape measured 24 Sep on the glitchc pane: an npm Codex install runs
+// `node /usr/bin/codex`, which spawns the native CLI in its own foreground group.
+const npmPane=(child={})=>[...sudoPane(),proc(14,13,{uid:2000,tty_nr:2,pgrp:13,tpgid:13,...child})];
+const npmFixture=(processes,changes={})=>fixture({getExecutable:denied,
+ processIds:async function*(){for(const p of processes)yield p.pid;},getProcess:async pid=>processes.find(p=>p.pid===pid)||null,
+ resolveExecutable:async()=>null,resolveCommand:async lookup=>({'/opt/tools/codex':'/opt/pkg/codex/bin/codex.js',
+  '/opt/other/tool':'/opt/pkg/other/tool.js'})[lookup]||null,
+ getCommandLine:async pid=>pid===13?['node','/opt/tools/codex','--yolo']:null,...changes});
+test('an npm script launcher above the foreign CLI yields the native child, not ambiguity',async()=>{
+ assert.deepEqual(await npmFixture(npmPane()).detect(10,{allowForeign:true,topologyOnly:true}),{
+  provider:null,cliPath:null,process:{pid:14,uid:2000,start_ticks:'14',boot_id:'boot'}
+ });
+});
+test('a parent is dropped as a launcher only when its script is a provider launcher, same user and group',async()=>{
+ const cases=[
+  ['script is not a provider launcher',npmPane(),{getCommandLine:async pid=>pid===13?['node','/opt/other/tool']:null}],
+  ['command line unreadable',npmPane(),{getCommandLine:async()=>null}],
+  ['relative script path',npmPane(),{getCommandLine:async pid=>pid===13?['node','codex']:null}],
+  ['child runs as another user',npmPane({uid:3000}),{}],
+  ['child in another process group',npmPane({pgrp:14,tpgid:14}),{}]
+ ];
+ for(const [label,processes,changes] of cases) {
+  const result=await npmFixture(processes,changes).detect(10,{allowForeign:true,topologyOnly:true});
+  assert.notEqual(result?.process?.pid,14,label);
+ }
+});
 test('two foreign foreground processes that do not nest stay ambiguous',async()=>{
  const processes=[...sudoPane(),proc(14,10,{uid:3000,pgrp:10,tpgid:10})];
  const f=fixture({getExecutable:denied,processIds:async function*(){for(const p of processes)yield p.pid;},

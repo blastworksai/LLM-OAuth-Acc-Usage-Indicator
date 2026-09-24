@@ -23,6 +23,9 @@ function recoverable(code, message, recoveryAction) {
   return Object.assign(failure(code, message), {recoverable:true, recoveryAction});
 }
 const managedStatusLine = line => typeof line?.command === 'string' && line.command.includes(MARKER);
+// A status line whose every value is an empty string (Antigravity can leave {type:'',command:''}) runs nothing: it counts as
+// no status line to wrap, and disconnect puts the exact stub back.
+const emptyStatusLine = line => object(line) && Object.values(line).every(value => value === '');
 function installedCommand(launcherPath, originalStatusLine) {
   // Let the provider's existing shell interpret the exact user-owned source.
   // The launcher only duplicates raw stdin; it never selects an interpreter
@@ -161,7 +164,7 @@ function createSetup(dependencies = {}) {
     const entry = await stat(file);
     if(!entry) return null;
     if(!entry.isFile() || entry.isSymbolicLink() || entry.uid !== o.uid ||
-      (entry.mode & 0o022) || (privateFile && (entry.mode & 0o077)) || entry.nlink !== 1 || entry.size > limit)
+      (entry.mode & 0o002) || (privateFile && (entry.mode & 0o077)) || entry.nlink !== 1 || entry.size > limit)
       throw failure('UNSAFE_PATH', 'Setup refused an unsafe file owner, link, size, or permission mode.');
     const handle = await io.open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
     try {
@@ -179,11 +182,16 @@ function createSetup(dependencies = {}) {
     if(!object(result)) throw failure('INVALID_SETTINGS', 'The settings file must contain a JSON object. Setup left it unchanged.');
     return result;
   }
-  async function replace(file, bytes, expected, o, mode = 0o600) {
+  // Without an explicit mode, a rewrite keeps the file's own permission bits (a group-writable settings file stays group-writable);
+  // a new file is 0600.
+  async function replace(file, bytes, expected, o, mode) {
     await safeDirectories(path.dirname(file), o);
+    const current = mode === undefined && expected !== null ? await stat(file) : null;
+    const finalMode = mode ?? (current ? current.mode & 0o775 : 0o600);
     const temporary = path.join(path.dirname(file), `.account-usage-${randomUUID()}.tmp`);
-    const handle = await io.open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, mode);
+    const handle = await io.open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
     try {
+      await handle.chmod(finalMode);
       await handle.writeFile(bytes);
       await handle.sync();
       await handle.close();
@@ -241,7 +249,7 @@ function createSetup(dependencies = {}) {
     return path.join(absolute(o.homeDir), o.provider === 'claude' ? '.claude' : o.provider === 'codex' ? '.codex' : '.gemini/antigravity-cli');
   }
   function checkStatusLine(config) {
-    if(!own(config, 'statusLine')) return;
+    if(!own(config, 'statusLine') || emptyStatusLine(config.statusLine)) return;
     const line = config.statusLine;
     if(!object(line) || line.type !== 'command' || typeof line.command !== 'string' || !line.command.trim() || line.command.includes('\0'))
       throw failure('UNSUPPORTED_STATUSLINE', 'The existing status line is not a supported command. Setup left it unchanged.');
@@ -267,7 +275,7 @@ function createSetup(dependencies = {}) {
     if(o.provider === 'codex') checkCodexHooks(config);else if(validateStatusLine) checkStatusLine(config);
     const identity = connectionIdentity({provider:o.provider, uid:o.uid, settingsPath});
     return {identity, id:identity.id, provider:o.provider, profilePath, settingsPath, ...await findCli(o),
-      hasExistingStatusLine:o.provider !== 'codex' && own(config, 'statusLine'), hasExistingHooks:o.provider === 'codex' && own(config, 'hooks'), bytes, config};
+      hasExistingStatusLine:o.provider !== 'codex' && own(config, 'statusLine') && !emptyStatusLine(config.statusLine), hasExistingHooks:o.provider === 'codex' && own(config, 'hooks'), bytes, config};
   }
   async function discoverProvider(input) {
     const o = options(input);
@@ -409,7 +417,8 @@ function createSetup(dependencies = {}) {
     const statusline = kind === 'statusline' && object(data.installedStatusLine) &&
       (data.hadStatusLine ? object(data.originalStatusLine) && typeof data.originalStatusLine.command === 'string' : true) &&
       data.installedStatusLine.command === installedCommand(loc.launcherPath, data.hadStatusLine ? data.originalStatusLine : null) &&
-      typeof data.hadStatusLine === 'boolean' && typeof data.backupName === 'string' && /^settings\.before-[\w-]+\.json$/.test(data.backupName);
+      typeof data.hadStatusLine === 'boolean' && typeof data.backupName === 'string' && /^settings\.before-[\w-]+\.json$/.test(data.backupName) &&
+      (data.emptyStatusLine === undefined || (!data.hadStatusLine && emptyStatusLine(data.emptyStatusLine)));
     const codex = kind === 'codex-hook' && isDeepStrictEqual(data.installedHook, installedCodexHook(loc.launcherPath)) &&
       typeof data.hadHooks === 'boolean' && typeof data.hadStop === 'boolean' && typeof data.backupName === 'string' &&
       /^hooks\.before-[\w-]+\.json$/.test(data.backupName);
@@ -665,7 +674,8 @@ function createSetup(dependencies = {}) {
         installedStatusLine.command = installedCommand(loc.launcherPath, found.hasExistingStatusLine ? found.config.statusLine : null);
         if(o.provider === 'antigravity' && !found.hasExistingStatusLine)Object.assign(installedStatusLine, {enabled:true, stack_with_default:true});
         data={...common,kind:'statusline',installedStatusLine,hadStatusLine:found.hasExistingStatusLine,
-          originalStatusLine:found.hasExistingStatusLine ? found.config.statusLine : null,backupName:`settings.before-${randomUUID()}.json`};
+          originalStatusLine:found.hasExistingStatusLine ? found.config.statusLine : null,backupName:`settings.before-${randomUUID()}.json`,
+          ...(emptyStatusLine(found.config.statusLine) ? {emptyStatusLine:found.config.statusLine} : {})};
         next={...found.config,statusLine:installedStatusLine};
       }
       await put(path.join(loc.root, data.backupName), found.bytes || json({}), o, 0o600);
@@ -721,6 +731,7 @@ function createSetup(dependencies = {}) {
         if(!isDeepStrictEqual(config.statusLine, data.installedStatusLine))
           throw failure('SETTINGS_CHANGED', 'The installed status line was edited or removed. Disconnect left the settings unchanged.');
         if(data.hadStatusLine) config.statusLine = data.originalStatusLine;
+        else if(data.emptyStatusLine !== undefined) config.statusLine = data.emptyStatusLine;
         else delete config.statusLine;
       }
       await replace(data.settingsPath, json(config), bytes, o);

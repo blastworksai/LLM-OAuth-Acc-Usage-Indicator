@@ -727,3 +727,21 @@ test('R2c. a timed-out claim that another run has since handed to the target is 
   assert.match(state.kept.find(c=>c.id==='folder').reason,/Another setup/);
   assertRootSafe(h);assertBundleRemoved(h);
 });
+
+test('R9. a refused profile names its reason from the host\'s own sentences; an unknown code keeps the general text',async()=>{
+  const refused=harness({on:{discover:()=>json({ok:false,code:'SETUP_FAILED',reason:'UNSAFE_PATH',message:'x'})}});
+  let state=await refused.drive(OPEN,{type:'continue'});
+  assert.equal(state.step,'cancelled');
+  assert.match(state.error,/^A file in claudebwai's Claude profile has an unsafe owner, link, size or permission mode.* Nothing was changed\.$/);
+  const stub=harness({on:{discover:()=>json({ok:false,code:'SETUP_FAILED',reason:'UNSUPPORTED_STATUSLINE',message:'x'})}});
+  state=await stub.drive(OPEN,{type:'continue'});
+  assert.match(state.error,/^claudebwai's Claude status line is not a command that can be wrapped/);
+  for(const reason of ['NOT_A_KNOWN_CODE','constructor','__proto__',undefined]) {
+    const h=harness({on:{discover:()=>json({ok:false,code:'SETUP_FAILED',...(reason?{reason}:{}),message:'planted words'})}});
+    state=await h.drive(OPEN,{type:'continue'});
+    assert.equal(state.error,"claudebwai could not read its Claude profile. Nothing was changed.",String(reason));
+  }
+  const connect=harness({on:{connect:()=>json({ok:false,code:'SETUP_FAILED',reason:'ALREADY_CONNECTED',message:'x'})}});
+  state=await connect.drive(OPEN,{type:'continue'},{type:'connect'});
+  assert.equal(state.error,"Setup as claudebwai stopped. claudebwai's Claude already has an Account Usage hook. Its status line was not changed.");
+});

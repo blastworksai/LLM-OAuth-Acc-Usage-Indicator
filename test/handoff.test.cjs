@@ -181,3 +181,14 @@ test('exclusive completed-result publication tolerates the temporary two-link wi
   assert.equal((await fs.lstat(f.handoff.resultPath)).nlink,1);
   assert.equal((await f.handoff.readResult()).ok,true);
 });
+
+test('a failed result may carry one reason code; a malformed reason is refused',async t=>{
+  const good=await fixture(t);
+  await publish(good.handoff,{ok:false,code:'SETUP_FAILED',reason:'UNSAFE_PATH',message:'Target-user setup could not finish.'});
+  assert.deepEqual(await good.handoff.readResult(),{ok:false,code:'SETUP_FAILED',message:'Target-user setup could not finish.'});
+  for(const reason of ['unsafe path','A','UNSAFE_PATH\n',7]) {
+    const bad=await fixture(t);
+    await publish(bad.handoff,{ok:false,code:'SETUP_FAILED',reason,message:'Target-user setup could not finish.'});
+    await assert.rejects(bad.handoff.readResult(),/setup result could not be verified/i,String(reason));
+  }
+});

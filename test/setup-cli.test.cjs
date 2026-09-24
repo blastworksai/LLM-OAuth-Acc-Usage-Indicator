@@ -528,3 +528,17 @@ test('SETUP_FAILED_CHANGED only when setup replaced the settings and a later ste
   assert.equal((await run(cli,again)).code,1);
   assert.equal(JSON.parse(againLines[0]).code,'SETUP_FAILED');
 });
+
+test('a failed setup publishes the setup error\'s code as its reason, never its text',async()=>{
+  const d=deps(),lines=capture(d);
+  d.setup.connectProvider=async()=>{throw Object.assign(new Error('secret raw text'),{code:'UNSAFE_PATH',safeToDisplay:true});};
+  assert.equal((await run([...argv.slice(0,-4),'--result','-','--runtime-version','0.4.0','--consent','granted'],d)).code,1);
+  const published=JSON.parse(lines[0]);
+  assert.equal(published.reason,'UNSAFE_PATH');assert.equal(published.code,'SETUP_FAILED');assert.doesNotMatch(lines[0],/secret raw/);
+  for(const [error,reason] of [[Object.assign(new Error('x'),{code:'lower_case',safeToDisplay:true}),undefined],
+    [Object.assign(new Error('x'),{code:'UNSAFE_PATH'}),undefined],[new Error('unverified-target-process'),'UNVERIFIED_SESSION']]) {
+    const e=deps(),out=capture(e);e.setup.connectProvider=async()=>{throw error;};
+    await run([...argv.slice(0,-4),'--result','-','--runtime-version','0.4.0','--consent','granted'],e);
+    assert.equal(JSON.parse(out[0]).reason,reason,error.message);
+  }
+});

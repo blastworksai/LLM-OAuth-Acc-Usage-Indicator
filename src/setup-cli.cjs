@@ -9,6 +9,8 @@ const KEYS={connect:['provider','cli','result','profile','report-dir','runtime-v
   discover:['provider','cli','profile','report-dir','target','result'],
   disconnect:['connection-id','result','target','consent','remove-feed']};
 // Hard cap: the action plus one flag/value pair per key of the widest action.
+const REASON_CODE=/^[A-Z][A-Z_]{1,39}$/;
+const SESSION_ERRORS=new Set(['unverified-target-process','wrong-target-user','changed-target-executable','wrong-target-provider']);
 const MAX_ARGV=1+2*Math.max(...Object.values(KEYS).map(keys=>keys.length));
 function parse(argv) {
   if(!Array.isArray(argv)||argv.length>MAX_ARGV)throw new Error('arguments');
@@ -222,8 +224,10 @@ async function run(argv,dependencies={}) {
     try {feed=await removeFeed(options.reportDir,uid,dependencies.fs||fs);}catch {feed={...FEED_REMOVE_FAILED};}
     print(feed.removed?'The Account Usage files in the report directory were removed.':feed.message);
     await publish(args.result,{ok:true,connection,feed});return {code:feed.removed?0:1};
-  } catch {
-    const result={ok:false,code:changing?'SETUP_FAILED_CHANGED':'SETUP_FAILED',message:'Target-user setup could not finish. Review the selected profile, executable and report-directory permissions.'};
+  } catch(error) {
+    // The reason is a code only, never the error's text: the host maps it to its own sentence.
+    const reason=error?.safeToDisplay===true&&REASON_CODE.test(error.code??'')?error.code:SESSION_ERRORS.has(error?.message)?'UNVERIFIED_SESSION':null;
+    const result={ok:false,code:changing?'SETUP_FAILED_CHANGED':'SETUP_FAILED',...(reason?{reason}:{}),message:'Target-user setup could not finish. Review the selected profile, executable and report-directory permissions.'};
     print(result.message);
     try {await publish(args.result,result);}catch {print('The setup result could not be written.');}
     return {code:1};

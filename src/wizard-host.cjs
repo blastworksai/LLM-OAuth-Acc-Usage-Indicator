@@ -22,6 +22,26 @@ const CONNECTION_ID=/^v2-[a-f0-9]{32}$/;
 const GENERIC='Setup stopped on an unexpected error.';
 const safeError=(code,message)=>Object.assign(new Error(message),{code,safeToDisplay:true});
 const message=error=>error?.safeToDisplay===true&&typeof error.message==='string'&&error.message?error.message:GENERIC;
+// A failed setup-cli result names its reason as a code from setup.cjs; the sentence is the host's own. An unknown code falls
+// back to the general sentence, so the target account can never put its own words on this screen.
+const REASONS={
+  UNSAFE_PATH:(u,n)=>`a file in ${u}'s ${n} profile has an unsafe owner, link, size or permission mode: it is writable by everyone, owned by another account, or hard-linked.`,
+  UNSUPPORTED_STATUSLINE:(u,n)=>`${u}'s ${n} status line is not a command that can be wrapped, or it is switched off.`,
+  UNSUPPORTED_HOOKS:u=>`${u}'s Codex hooks file has a shape setup does not recognise.`,
+  INVALID_SETTINGS:(u,n)=>`${u}'s ${n} settings file is not a JSON object.`,
+  PROFILE_REQUIRED:(u,n)=>`${u}'s ${n} profile folder was not found, or a profile override is set.`,
+  CLI_NOT_FOUND:(u,n)=>`the ${n} program was not found on ${u}'s PATH.`,
+  UNSUPPORTED_CLI:(u,n)=>`the ${n} program ${u} runs is not a native Linux binary setup can trust.`,
+  UNSUPPORTED_RUNTIME:u=>`node, as ${u} runs it, is not a binary setup can trust.`,
+  DIRECTORY_TRUST_REQUIRED:()=>'a shared folder on the profile path was not approved on the review screen.',
+  ALREADY_CONNECTED:(u,n)=>`${u}'s ${n} already has an Account Usage hook.`,
+  SETTINGS_CHANGED:(u,n)=>`${u}'s ${n} settings changed while setup was reading them.`,
+  UNSAFE_REPORT_DIRECTORY:u=>`the report folder for ${u} is not safe to use.`,
+  FEED_ALREADY_CLAIMED:u=>`the report folder for ${u} belongs to a different profile.`,
+  SETUP_BUSY:u=>`another setup for ${u} is still running.`,
+  UNVERIFIED_SESSION:(u,n)=>`the ${n} session could not be confirmed as ${u}'s. It may have restarted.`};
+const reasonText=(out,user,name)=>{const f=out?.ok===false&&Object.hasOwn(REASONS,out.reason??'')?REASONS[out.reason]:null;
+  if(!f)return null;const s=f(user,name);return s.startsWith(user)?s:s[0].toUpperCase()+s.slice(1);}; // an account name keeps its case
 const processOf=p=>({pid:p.pid,uid:p.uid,start_ticks:p.start_ticks,boot_id:p.boot_id});
 
 // The one copy of the setup-result check (was extension.cjs:128-140). Used by the wizard host, the no-sudo fallback
@@ -189,7 +209,8 @@ function createWizardHost({elevate,sharedFeed=require('./shared-feed.cjs'),detec
       '--target',targetJson(r),'--result','-']));
     const p=out?.ok===true?out.preview:null;
     if(!p||typeof p!=='object'||!CONNECTION_ID.test(p.id||'')||p.provider!==r.target.provider||!publicPath(p.profilePath)||(saved&&p.profilePath!==saved))
-      throw safeError('DISCOVER_FAILED',`${user} could not read its ${name} profile. Nothing was changed.`);
+      throw safeError('DISCOVER_FAILED',out?.ok===false&&reasonText(out,user,name)?`${reasonText(out,user,name)} Nothing was changed.`
+        :`${user} could not read its ${name} profile. Nothing was changed.`);
     if(!live(r,'detecting'))return;
     r.connectionId=p.id;r.feed=sharedFeed.feedPath(p.id);r.preview={profilePath:p.profilePath};
     const gid=getgid(),info=await sharedFeed.inspectFeed(r.feed);
@@ -264,11 +285,15 @@ function createWizardHost({elevate,sharedFeed=require('./shared-feed.cjs'),detec
     // that was already working (a reconnect). SETUP_FAILED_CHANGED, or no readable result, may have changed the status
     // line, so that is recorded as uncertain and the rollback restores it.
     if(out?.ok===false&&out.code!=='SETUP_FAILED_CHANGED') {
-      if(live(r,'connecting'))result(r,{type:'failed',error:`Setup as ${r.target.user} could not finish; its status line was not changed. Review the selected profile, executable and report-directory permissions.`});
+      const why=reasonText(out,r.target.user,NAMES[r.target.provider]);
+      if(live(r,'connecting'))result(r,{type:'failed',error:why?`Setup as ${r.target.user} stopped. ${why} Its status line was not changed.`
+        :`Setup as ${r.target.user} could not finish; its status line was not changed. Review the selected profile, executable and report-directory permissions.`});
       return;
     }
     result(r,{type:'applied',change:{...change,uncertain:true}});
-    if(live(r,'verifying'))result(r,{type:'failed',error:out?.ok===false?`Setup as ${r.target.user} could not finish, so it is being undone. Review the selected profile, executable and report-directory permissions.`
+    const undoWhy=reasonText(out,r.target.user,NAMES[r.target.provider]);
+    if(live(r,'verifying'))result(r,{type:'failed',error:out?.ok===false?(undoWhy?`Setup as ${r.target.user} stopped, so it is being undone. ${undoWhy}`
+      :`Setup as ${r.target.user} could not finish, so it is being undone. Review the selected profile, executable and report-directory permissions.`)
       :thrown?message(thrown):`Setup as ${r.target.user} gave no readable result, so it is being undone.`});
   }
   async function verifyConnect(r) {

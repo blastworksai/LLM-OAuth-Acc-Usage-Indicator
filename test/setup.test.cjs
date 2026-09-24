@@ -664,7 +664,7 @@ test('shared directory trust cannot approve a different group, world writes, lin
   await fs.chmod(f.homeDir, 0o777);
   await assert.rejects(f.setup.discoverProvider(options), {code:'UNSAFE_PATH'});
   await fs.chmod(f.homeDir, 0o2770);
-  await fs.chmod(f.settingsPath, 0o660);
+  await fs.chmod(f.settingsPath, 0o662);
   await assert.rejects(f.setup.connectProvider(options), {code:'UNSAFE_PATH'});
   await fs.chmod(f.settingsPath, 0o600);
   const link = path.join(f.homeDir, 'linked');
@@ -1156,6 +1156,37 @@ test('Antigravity uses its own config and native idle usage collector', async t 
   assert.equal(run.args[0], 'antigravity-statusline');
   assert.ok(run.args.includes('--agy-full-usage'));
   await assert.rejects(f.setup.discoverProvider({...f.options, env:{GEMINI_CLI_HOME:'/unknown'}}), {code:'PROFILE_REQUIRED'});
+});
+
+test('a group-writable settings file connects, keeps its mode through connect and disconnect; world-writable stays refused', async t => {
+  for(const provider of ['claude','codex']) {
+    const f = await fixture(t, provider);
+    await writeJson(f.settingsPath, provider==='codex'?{hooks:{}}:{});await fs.chmod(f.settingsPath, 0o664);
+    const connection = await f.setup.connectProvider(f.options);
+    assert.equal((await fs.stat(f.settingsPath)).mode & 0o7777, 0o664, `${provider}: connect keeps the mode`);
+    await f.setup.disconnectProvider({...f.options, connectionId:connection.id});
+    assert.equal((await fs.stat(f.settingsPath)).mode & 0o7777, 0o664, `${provider}: disconnect keeps the mode`);
+    await fs.chmod(f.settingsPath, 0o666);
+    await assert.rejects(f.setup.discoverProvider(f.options), {code:'UNSAFE_PATH'});
+  }
+});
+
+test('an all-empty Antigravity status line counts as none; disconnect puts the exact stub back', async t => {
+  const f = await fixture(t, 'antigravity'), stub = {type:'', command:''};
+  await writeJson(f.settingsPath, {statusLine:stub, title:{type:'', command:''}, keep:1});
+  const preview = await f.setup.discoverProvider(f.options);
+  assert.equal(preview.hasExistingStatusLine, false);
+  const connection = await f.setup.connectProvider(f.options);
+  const config = await readJson(f.settingsPath);
+  assert.equal(config.statusLine.type, 'command');
+  assert.equal(config.statusLine.stack_with_default, true);
+  assert.doesNotMatch(config.statusLine.command, /\(\n/, 'nothing is wrapped');
+  assert.deepEqual(config.title, {type:'', command:''});
+  assert.equal((await f.setup.listConnections(f.options)).length, 1, 'the receipt with the stub still validates');
+  await f.setup.disconnectProvider({...f.options, connectionId:connection.id});
+  assert.deepEqual(await readJson(f.settingsPath), {statusLine:stub, title:{type:'', command:''}, keep:1});
+  await writeJson(f.settingsPath, {statusLine:{type:'', command:'x'}});
+  await assert.rejects(f.setup.discoverProvider(f.options), {code:'UNSUPPORTED_STATUSLINE'}, 'a half-filled line is still refused');
 });
 
 test('Codex connect appends one managed Stop hook and preserves unrelated hooks', async t => {

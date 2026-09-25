@@ -90,18 +90,21 @@ test('disconnecting cannot be cancelled mid-apply and the crumb says Disconnect'
   const html=renderWizard(state({mode:'disconnect',step:'connecting',preview:PREVIEW}));
   assert.ok(html.includes('<h2>Disconnecting…</h2>')&&intents(html).length===0&&crumbOn(html)==='Disconnect');
 });
-test('verifying says it is checking the first report',()=>{
-  assert.ok(renderWizard(state({step:'verifying',preview:PREVIEW})).includes('<h2>Checking the first report…</h2>'));
+test('verifying says it is checking the new connection',()=>{
+  assert.ok(renderWizard(state({step:'verifying',preview:PREVIEW})).includes('<h2>Checking the new connection…</h2>'));
 });
 test('undoing is transient: the reason, no buttons',()=>{
   const html=renderWizard(state({step:'undoing',error:'VS Code could not read the feed folder.',pending:{effect:'rollback',undo:[],keep:[]}}));
   assert.ok(html.includes('<h2>Undoing changes…</h2>')&&text(html).includes('VS Code could not read the feed folder.')&&intents(html).length===0);
 });
-test('connected (connect mode) confirms the quota card and lists what was done, with Close',()=>{
+test('connected (connect mode) says what was checked, when usage appears, and lists what was done, with Close',()=>{
+  // Review follow-up: the host checks the connection descriptor, not a report, so the screen must not claim a report was read.
   const html=renderWizard(state({step:'connected',busy:false,preview:PREVIEW,applied:[{id:'folder',created:true},{id:'status',as:'claudebwai'}]}));
   const t=text(html);
-  assert.ok(t.includes("Connected. The card now shows this Claude account's quota.")&&t.includes('done Shared feed folder')
-    &&t.includes('done Claude status line')&&t.includes('checked VS Code read the first report')&&intents(html).join()==='close'&&crumbOn(html)==='Done');
+  assert.ok(t.includes("Connected. Usage for this Claude account appears on the card after the session's next turn. Restart the session first if it was already running."),t);
+  assert.ok(t.includes('checked VS Code can read the new connection'),t);
+  assert.ok(!t.includes('first report')&&!t.includes('now shows'),t);
+  assert.ok(t.includes('done Shared feed folder')&&t.includes('done Claude status line')&&intents(html).join()==='close'&&crumbOn(html)==='Done');
 });
 test('connected in disconnect mode is worded Disconnected',()=>{
   const html=renderWizard(state({mode:'disconnect',step:'connected',busy:false,applied:[{id:'status',label:'Status line restored'}]}));

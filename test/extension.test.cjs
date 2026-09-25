@@ -37,7 +37,7 @@ function fakeRoot({sudo='passwordless',password=null,connection=null,discover,co
 }
 function harness({discover,connect,disconnect,recover='Recover connection',confirm='Connect',pickPath='/example/profile',pickProvider='claude',pickConnection,savedTrust=[],terminal,detect=async()=>null,connections=[],reports=[],match,collect,
   uid=1000,descriptors=[],managed=[],version='0.4.0',feedRejected=0,descriptorRejected=0,sudo={},input,
-  setupApi,realFeeds=false,configured=[],storagePath='/example/editor-storage',nodePath='/example/editor-node',extensionPath='/example/extension'}={}) {
+  setupApi,realFeeds=false,configured=[],storagePath='/example/editor-storage',nodePath='/example/editor-node',extensionPath='/example/extension',wrapHost}={}) {
   const commands=new Map(),connected=[],discovered=[],errors=[],warnings=[],confirmations=[],notices=[],inputs=[],posted=[],storage=new Map([['trustedDirectories',savedTrust],['managedFeedDirectories',managed]]);
   let clipboard='';const feedBatches=[],descriptorBatches=[],root=fakeRoot(sudo);
   let provider,receive,picks=0,lastPickItems=[],collectionCalls=0,feedDirectories=[];
@@ -65,17 +65,20 @@ function harness({discover,connect,disconnect,recover='Recover connection',confi
     require:name=>name==='vscode'?vscode:name==='./setup.cjs'?setup:name==='./core.cjs'?core:name==='./collect.cjs'?{collectTerminal:async pid=>{collectionCalls++;return collect?.(pid)??null;}}:name==='./provider.cjs'?{detectProvider:detect}:
       name==='./connection-feed.cjs'?{readConnectionFeeds:async directories=>{descriptorBatches.push([...directories]);return {connections:descriptors.filter(value=>directories.includes(value.reportDir)),rejected:descriptorRejected};}}:
       name==='./connection.cjs'?require('../src/connection.cjs'):name==='./panel.cjs'?{buildViewModel:()=>({}),renderContent:()=>'',renderDocument:()=>''}:
-      name==='./wizard.cjs'?require('../src/wizard.cjs'):name==='./wizard-host.cjs'?require('../src/wizard-host.cjs'):name==='./wizard-view.cjs'?require('../src/wizard-view.cjs'):
+      name==='./wizard.cjs'?require('../src/wizard.cjs'):name==='./wizard-host.cjs'?(wrapHost?{...require('../src/wizard-host.cjs'),
+        createWizardHost:options=>wrapHost(require('../src/wizard-host.cjs').createWizardHost(options))}:require('../src/wizard-host.cjs')):name==='./wizard-view.cjs'?require('../src/wizard-view.cjs'):
       name==='./elevate.cjs'?{createElevate:()=>root.elevate,resolveUser:async value=>users[value]??'glitch'}:name==='./shared-feed.cjs'?root.sharedFeed:require(name)};
   vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../src/extension.cjs'),'utf8'),sandbox);
-  const api=sandbox.module.exports.activate({globalStorageUri:{fsPath:storagePath},extensionPath,extension:{packageJSON:{version}},subscriptions:[],
-    globalState:{get:(key,fallback)=>storage.get(key)??fallback,update:async(key,value)=>{storage.set(key,value);}}});
+  const context={globalStorageUri:{fsPath:storagePath},extensionPath,extension:{packageJSON:{version}},subscriptions:[],
+    globalState:{get:(key,fallback)=>storage.get(key)??fallback,update:async(key,value)=>{storage.set(key,value);}}};
+  const api=sandbox.module.exports.activate(context);
   const openCard=()=>{
     provider.resolveWebviewView({webview:{asWebviewUri:uri=>uri.fsPath,postMessage:async message=>{posted.push(message);},
       onDidReceiveMessage:callback=>{receive=callback;return disposable();}},visible:true,onDidChangeVisibility:disposable,onDidDispose:disposable});
     return async message=>{receive(message);await settle(api);};
   };
-  return {commands,connected,discovered,errors,warnings,confirmations,notices,inputs,posted,storage,openCard,api,vscode,root,polls,post:message=>receive(message),feedBatches,descriptorBatches,get clipboard(){return clipboard;},get picks(){return picks;},get lastPickItems(){return lastPickItems;},get collectionCalls(){return collectionCalls;},get feedDirectories(){return feedDirectories;}};
+  return {commands,connected,discovered,errors,warnings,confirmations,notices,inputs,posted,storage,openCard,api,vscode,root,polls,
+    exports:sandbox.module.exports,subscriptions:context.subscriptions,post:message=>receive(message),feedBatches,descriptorBatches,get clipboard(){return clipboard;},get picks(){return picks;},get lastPickItems(){return lastPickItems;},get collectionCalls(){return collectionCalls;},get feedDirectories(){return feedDirectories;}};
 }
 // Waits until the wizard host has no effect in flight, including a close deferred to the next microtask.
 async function settle(api) {for(let i=0;i<4;i++){await api.wizardSettled();await new Promise(setImmediate);}return api.getWizardState();}
@@ -836,4 +839,21 @@ test('a disconnected descriptor stays actionable until the wizard removes it fro
   assert.ok(h.lastPickItems.some(item=>item.connection.id===connection.id));
   await send({type:'wizard',intent:'continue'});await send({type:'wizard',intent:'connect'});
   assert.equal(h.api.getWizardState().step,'connected');assert.deepEqual([...h.storage.get('managedFeedDirectories')],[]);
+});
+
+test('review 1: deactivate() returns the wizard host\'s dispose promise, and the cleanup runs exactly once',async()=>{
+ let resolve,calls=0;const gate=new Promise(done=>{resolve=done;});
+ const h=harness({terminal:terminal(),wrapHost:host=>({...host,dispose:()=>{calls++;return gate.then(()=>host.dispose());}})});
+ assert.equal(typeof h.exports.deactivate,'function','extension.cjs exports deactivate');
+ let done=false;
+ const p=h.exports.deactivate();
+ assert.equal(typeof p?.then,'function','deactivate hands VS Code a promise to wait for');
+ void p.then(()=>{done=true;});
+ for(const subscription of h.subscriptions)subscription.dispose(); // VS Code disposes the subscriptions after deactivate
+ for(let i=0;i<10;i++)await new Promise(setImmediate);
+ assert.equal(done,false,'deactivate waits for the host\'s dispose');
+ resolve();await p;
+ assert.equal(done,true);
+ assert.equal(calls,1,'the host is disposed once, not once per road');
+ assert.equal(h.exports.deactivate(),p,'a second deactivate is the same cleanup');
 });

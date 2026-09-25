@@ -243,3 +243,21 @@ test('reportDir reaches a connect line as --report-dir, and every line stays ins
   assert.equal(await parses(decoded.slice(1)),true);
  }
 });
+test('review 5: a failure opening or reading the new temp root removes it and closes every handle',async t=>{
+ // Each fault lands after mkdtemp: the root's own open (EMFILE), then the identity read after the open succeeded.
+ for(const key of ['open','lstat']) {
+  const tempRoot=await fs.mkdtemp(path.join(os.tmpdir(),'handoff-root-fault-'));t.after(()=>fs.rm(tempRoot,{recursive:true,force:true}));
+  const handles=[];let fired=false;
+  const io=new Proxy(fs,{get(target,name){
+   if(name===key)return async(file,...rest)=>{
+    if(!fired&&String(file).startsWith(tempRoot+path.sep)){fired=true;throw Object.assign(new Error('injected'),{code:'EMFILE'});}
+    return fs[name](file,...rest);};
+   if(name==='open')return async(...args)=>{const handle=await fs.open(...args);handles.push(handle);return handle;};
+   return target[name];}});
+  const target={provider:'claude',cliPath:'/usr/bin/claude',process:{pid:20,uid:process.getuid(),start_ticks:'20',boot_id:'boot'}};
+  await assert.rejects(prepareHandoff({extensionPath,provider:'claude',target,tempRoot,runtimeVersion:'0.4.0',revalidate:async()=>target,fs:io}),{code:'EMFILE'});
+  assert.equal(fired,true,key);
+  assert.deepEqual(await fs.readdir(tempRoot),[],`${key}: the temp root is removed`);
+  assert.ok(handles.every(handle=>handle.fd===-1),`${key}: every handle is closed`);
+ }
+});

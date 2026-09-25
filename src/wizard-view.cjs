@@ -10,7 +10,8 @@
 // The no-sudo road's host adds to the state it emits (wizard-host.cjs): fallbackCommand (the one line to run now),
 // fallbackAdmin (that line is the admin's folder line), fallbackWaitMs (how long the wizard waits for it) and
 // fallbackUndo ('waiting' with the disconnect line in fallbackCommand, 'done', 'failed') on the screens after a run
-// that may have changed the status line without sudo to undo it.
+// that may have changed the status line without sudo to undo it, and fallbackUnsure (a line was shown to run as the
+// target and no result came back): such a screen never says "Nothing was changed".
 // `idle` renders nothing: the account card owns that state.
 const {can}=require('./wizard.cjs');
 
@@ -133,8 +134,8 @@ function reviewScreen(s) {
   const body=disconnecting(s)
     ?`${profile}Disconnect puts the status line back as it was and removes the shared folder when it is empty.`
     :s.sudo==='none'
-      ?`${profile}Nothing inside the ${escape(who(s))} home folder is opened to other accounts. Without sudo nothing can be undone automatically: if VS Code can't read the first report, the wizard shows the line that puts the status line back.`
-      :`${profile}Nothing inside the ${escape(who(s))} home folder is opened to other accounts. If VS Code can't read the first report, every change is undone; a shared folder that was already there stays.`;
+      ?`${profile}Nothing inside the ${escape(who(s))} home folder is opened to other accounts. Without sudo nothing can be undone automatically: if VS Code can't read the new connection, the wizard shows the line that puts the status line back.`
+      :`${profile}Nothing inside the ${escape(who(s))} home folder is opened to other accounts. If VS Code can't read the new connection, every change is undone; a shared folder that was already there stays.`;
   const existing=!disconnecting(s)&&p.hasExistingStatusLine?note('Your existing status line keeps running; the usage report wraps it.'):'';
   const asked=s.sudo==='password'?note(`${escape(verb(s))} uses the password you already gave; it won't ask again.`):'';
   return `${crumbs(s)}${heading('What will change')}${changesList(s)}${sharedList(s)}${note(body)}${existing}${asked}${commands(s)}
@@ -165,13 +166,23 @@ function fallbackScreen(s,context) {
     ${row(button('copy','Copy'),cancelButton(s))}
     ${note(`The wizard waits here and finishes on its own when the line runs.${escape(waitNote(s))}`)}`;
 }
+// A line shown to run as the target gave no answer before the wizard stopped: say plainly what it may have done.
+function unsureBanner(s) {
+  if(s.fallbackUnsure!==true||s.fallbackUndo==='done')return '';
+  const status=`${who(s)}'s ${name(s)} status line`;
+  return banner('warn',disconnecting(s)
+    ?`If the line was run as ${who(s)}, it may already have disconnected ${status} from VS Code.`
+    :`If the line was run as ${who(s)}, it may have changed ${status}.`);
+}
 // After a no-sudo run that may have changed the status line: what is left to undo, and the one line that undoes it.
 function undoBlock(s) {
   const status=`${who(s)}'s ${name(s)} status line`;
   if(s.fallbackUndo==='done')return banner('good',`The undo line ran as ${who(s)}: ${status} is back as it was.`);
   const where=[s.preview?.profilePath?` in <code>${escape(s.preview.profilePath)}</code>`:'',
     s.preview?.reportDir?` may now report usage to <code>${escape(s.preview.reportDir)}</code>`:' may have been changed'].join('');
-  if(s.fallbackUndo==='failed')return banner('bad',`The undo line ran as ${who(s)} but could not finish, so ${status} has to be put back by hand.`)
+  if(s.fallbackUndo==='failed')return banner('bad',s.fallbackUnsure===true
+    ?`The undo line ran as ${who(s)} but could not finish. If the first line never ran, there is nothing to put back; if it did, ${status} has to be put back by hand.`
+    :`The undo line ran as ${who(s)} but could not finish, so ${status} has to be put back by hand.`)
     +note(`${escape(status)}${where}.`);
   if(s.fallbackUndo!=='waiting')return '';
   const line=str(s.fallbackCommand);
@@ -184,21 +195,22 @@ function progressScreen(s,title) {
 function connectedScreen(s) {
   const done=disconnecting(s)
     ?`Disconnected. The ${name(s)} status line no longer reports usage to VS Code.`
-    :`Connected. The card now shows this ${name(s)} account's quota.`;
-  const checked=disconnecting(s)?'':`<li>${pill('good','checked')}<span>VS Code read the first report</span></li>`;
+    :`Connected. Usage for this ${name(s)} account appears on the card after the session's next turn. Restart the session first if it was already running.`;
+  // What the host checked is the connection descriptor, not a report: no report exists until the session's next turn.
+  const checked=disconnecting(s)?'':`<li>${pill('good','checked')}<span>VS Code can read the new connection</span></li>`;
   return `${crumbs(s)}${banner('good',done)}${banner('warn',s.warning)}
     <ul class="wizard-steps">${itemList(s.applied,s,'good','done')}${checked}</ul>
     ${row(button('close','Close',true))}`;
 }
 function undoneScreen(s) {
   const lead=disconnecting(s)?'Not disconnected.':'Not connected.';
-  return `${crumbs(s)}${banner('bad',[lead,str(s.error)].filter(Boolean).join(' '))}${banner('warn',s.warning)}
+  return `${crumbs(s)}${banner('bad',[lead,str(s.error)].filter(Boolean).join(' '))}${unsureBanner(s)}${banner('warn',s.warning)}
     <ul class="wizard-steps">${itemList(s.undone,s,'warn','undone')}${itemList(s.kept,s,'user','kept')}</ul>${undoBlock(s)}
     ${row(can.retry(s)&&button('retry','Try again',true),button('close','Close'))}`;
 }
 function cancelledScreen(s) {
-  const fallback=s.fallbackUndo?'Cancelled.':'Cancelled. Nothing was changed.';
-  return `${crumbs(s)}${banner('warn',str(s.error)||fallback)}${banner('warn',s.warning)}${undoBlock(s)}
+  const fallback=s.fallbackUndo||s.fallbackUnsure===true?'Cancelled.':'Cancelled. Nothing was changed.';
+  return `${crumbs(s)}${banner('warn',str(s.error)||fallback)}${unsureBanner(s)}${banner('warn',s.warning)}${undoBlock(s)}
     ${row(can.retry(s)&&button('retry','Start again',true),button('close','Close'))}`;
 }
 
@@ -212,7 +224,7 @@ function screen(s,context) {
     case 'password':return passwordScreen(s,context);
     case 'fallback':return fallbackScreen(s,context);
     case 'connecting':return progressScreen(s,disconnecting(s)?'Disconnecting…':'Connecting…');
-    case 'verifying':return progressScreen(s,disconnecting(s)?'Checking the status line…':'Checking the first report…');
+    case 'verifying':return progressScreen(s,disconnecting(s)?'Checking the status line…':'Checking the new connection…');
     case 'undoing':return progressScreen(s,'Undoing changes…');
     case 'connected':return connectedScreen(s);
     case 'undone':return undoneScreen(s);

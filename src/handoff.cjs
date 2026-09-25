@@ -26,11 +26,10 @@ async function prepareHandoff({extensionPath,provider,target,action='connect',co
   }
   const verify=revalidate||(()=>require('./provider.cjs').detectProvider(target.terminalPid||target.process.pid,{allowForeign:true,topologyOnly:target.cliPath===null}));
   const root=await io.mkdtemp(path.join(tempRoot,'llm-account-usage-'));
-  let drop,disposed=false,cleanupResult;
-  const rootHandle=await io.open(root,constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
-  const rootAnchor=`/proc/self/fd/${rootHandle.fd}`,directories=new Map();
-  const filename=`${randomUUID()}.json`;
-  const identity=await io.lstat(root);
+  // From here on every failure goes through dispose(), so the root never outlives a failed prepare (review 5): the
+  // handle and the identity are taken inside the try below, and dispose() copes with either one missing.
+  let drop,disposed=false,cleanupResult,rootHandle=null,rootAnchor=null,identity=null;
+  const directories=new Map(),filename=`${randomUUID()}.json`;
   async function dispose() {
     if(disposed)return cleanupResult;disposed=true;
     let left=false;
@@ -52,20 +51,29 @@ async function prepareHandoff({extensionPath,provider,target,action='connect',co
       // Every directory this run may have made is tried by name, pinned or not: a failure between a mkdir and its
       // open left that folder unpinned, and skipping it kept the root (finding 2's signature: only results/ left).
       // rmdir never follows a symlink and never removes a non-empty folder; a name never made is ENOENT.
+      // Nothing can have been made inside the root before its handle was open: every mkdir goes through rootAnchor.
       for(const name of ['src','collectors']) {
-        await directories.get(name)?.close();await attempt(()=>io.rmdir(`${rootAnchor}/${name}`));
+        await directories.get(name)?.close();if(rootAnchor)await attempt(()=>io.rmdir(`${rootAnchor}/${name}`));
       }
       if(drop){await drop.close();drop=null;}
-      await attempt(()=>io.rmdir(`${rootAnchor}/results`));
-      const current=await io.lstat(root).catch(error=>{if(error.code!=='ENOENT')throw error;});
-      if(current && current.isDirectory() && current.ino===identity.ino && current.dev===identity.dev && current.uid===identity.uid)
+      if(rootAnchor)await attempt(()=>io.rmdir(`${rootAnchor}/results`));
+      // The root is removed only while it is still the folder mkdtemp made: the identity read at prepare, or, when that
+      // read is what failed, the open handle's own fstat. With neither, a directory we own (rmdir never follows a link,
+      // and never removes a folder with anything in it).
+      const known=identity||await rootHandle?.stat().catch(()=>null)||null;
+      let current=null;
+      try {current=await io.lstat(root);} catch(error) {if(error.code!=='ENOENT')left=true;}
+      if(current && current.isDirectory() && (known?current.ino===known.ino && current.dev===known.dev && current.uid===known.uid:current.uid===process.getuid()))
         await attempt(()=>io.rmdir(root));
       else if(current)left=true;
-    } finally {await rootHandle.close();}
+    } finally {await rootHandle?.close();}
     cleanupResult=left?{removed:false,warning:'Unexpected entries in the setup bundle were left safely in place.'}:{removed:true};
     return cleanupResult;
   }
   try {
+    rootHandle=await io.open(root,constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
+    rootAnchor=`/proc/self/fd/${rootHandle.fd}`;
+    identity=await io.lstat(root);
     await io.chmod(root,0o755);
     for(const name of ['src','collectors']) {
       await io.mkdir(`${rootAnchor}/${name}`,{mode:0o755});

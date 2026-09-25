@@ -20,6 +20,9 @@ const WIZARD_DONE=new Set(['connected','undone','cancelled']);
 const SAFE_WORD=/^[A-Za-z0-9_@%+=:,./-]+$/;
 const quoteWord=value=>{const word=typeof value==='string'?value:String(value??'');return SAFE_WORD.test(word)?word:`'${word.replace(/'/g,`'\\''`)}'`;};
 const argvLine=argv=>Array.isArray(argv)&&argv.length?argv.map(quoteWord).join(' '):null;
+// The running activation's cleanup, for deactivate(). VS Code calls deactivate and then disposes the subscriptions;
+// both reach the same cleanup, which runs once and hands back the wizard host's dispose promise.
+let stopActive=null;
 
 function activate(context) {
   let view, assets={}, lastContent='';
@@ -357,9 +360,20 @@ function activate(context) {
     if(!view?.visible || polling || wizardActive())return;
     polling=true;try{await refresh(true);}finally{polling=false;}
   },2000);
-  context.subscriptions.push({dispose(){clearInterval(timer);controller.dispose();void wizardHost?.dispose?.().catch?.(()=>{});}});
+  let stopping=null;
+  const stop=()=>{
+    if(!stopping) {
+      clearInterval(timer);controller.dispose();
+      stopping=Promise.resolve(wizardHost?.dispose?.()).catch(()=>{});
+    }
+    return stopping;
+  };
+  stopActive=stop;
+  context.subscriptions.push({dispose(){void stop();}});
   void refresh();
   return {getState:()=>controller.state,getRows:()=>buildRows(controller.state),getViewModel,getHtml,refresh:()=>refresh(),
     getWizardState:()=>wizardState,wizardSettled:async()=>{await wizardHost?.settled();return wizardState;}};
 }
-module.exports={activate};
+// Returns the wizard host's dispose promise, so VS Code waits for the fallback's handoff and poll to be gone.
+function deactivate() {return stopActive?.();}
+module.exports={activate,deactivate};

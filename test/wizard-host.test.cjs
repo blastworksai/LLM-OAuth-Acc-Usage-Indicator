@@ -883,11 +883,13 @@ test('F4. no sudo: two minutes without a result goes to cancelled and disposes t
   assert.equal(state.step,'cancelled');
   assert.match(state.error,/within 2 minutes.*the line no longer works/);
   assert.equal(h.handoffs.made[0].disposed,1);
-  assert.equal(h.clock.pending(),0);
+  // Review 2: no answer is not "nothing ran", so the undo line is offered; its poll is the only timer left.
+  assert.equal(state.fallbackUndo,'waiting');
+  assert.equal(state.fallbackUnsure,true);
+  assert.equal(h.clock.pending(),1);
   const reads=h.handoffs.made[0].reads;
   await h.advance(10000);
-  assert.equal(h.handoffs.made[0].reads,reads,'no poll after the timeout');
-  assert.equal(state.fallbackUndo,undefined);
+  assert.equal(h.handoffs.made[0].reads,reads,'no poll of the connect line after the timeout');
   const admin=noSudo({world:{feedExists:false}});
   await connectRun(admin);
   await admin.advance(120000);
@@ -903,8 +905,9 @@ test('F5. no sudo: Cancel stops the poll and disposes the handoff; a line that h
   let state=h.host.getState();
   assert.equal(state.step,'cancelled');
   assert.equal(h.handoffs.made[0].disposed,1);
-  assert.equal(h.clock.pending(),0);
-  assert.match(textOf(renderWizard(state)),/Cancelled\. Nothing was changed\./);
+  // Review 2: the connect line was shown and gave no answer, so it may have run: never "Nothing was changed" (F15).
+  assert.equal(h.clock.pending(),1,'only the undo line is polled');
+  assert.doesNotMatch(textOf(renderWizard(state)),/Nothing was changed/);
   const ran=noSudo();
   await connectRun(ran);
   ran.handoffs.made[0].result={ok:true,connection:descriptor()}; // it ran; Cancel lands before the next tick
@@ -1071,7 +1074,8 @@ test('F13. the no-sudo screens escape every value they show',()=>{
   const base={mode:'connect',target:{provider:'claude',user:EVIL,uid:1,pid:1,process:{}},sudo:'none',busy:false,runId:'r',pending:null,
     applied:[],undone:[],kept:[{id:'status'}],preview:{profilePath:`/p/${EVIL}`,reportDir:`/f/${EVIL}`,changes:[{id:'status'}]},error:EVIL,warning:null,log:[]};
   const screens=[{...base,step:'fallback',busy:true,fallbackAdmin:true,fallbackCommand:EVIL,fallbackWaitMs:120000},
-    ...['waiting','failed','done'].flatMap(u=>[{...base,step:'undone',fallbackUndo:u,fallbackCommand:EVIL},{...base,step:'cancelled',fallbackUndo:u,fallbackCommand:EVIL}])];
+    ...['waiting','failed','done'].flatMap(u=>[{...base,step:'undone',fallbackUndo:u,fallbackCommand:EVIL},{...base,step:'cancelled',fallbackUndo:u,fallbackCommand:EVIL}]),
+    ...['connect','disconnect'].flatMap(mode=>[{...base,mode,step:'cancelled',fallbackUnsure:true},{...base,mode,step:'cancelled',fallbackUnsure:true,fallbackUndo:'failed'}])];
   for(const s of screens) {
     const html=renderWizard(s);
     assert.ok(html.length>0);
@@ -1079,4 +1083,127 @@ test('F13. the no-sudo screens escape every value they show',()=>{
   }
   assert.ok(textOf(renderWizard(screens[0])).includes('An admin step first'));
   assert.ok(textOf(renderWizard(screens[1])).includes("can't undo this itself"));
+});
+
+// ---- CP3 Codex review (25 Sep): each test below reproduces a finding and failed on c2e868c ----
+test('F14. review 1: dispose() between Connect and the fallback effect starts nothing: no handoff, no poll, no timer',async()=>{
+  // dispose lands inside the Connect commit, before the pump's microtask reaches startFallback: r.fb does not exist yet.
+  let disposing=null,h=null;
+  h=noSudo({deps:{onState:s=>{if(s.step==='fallback'&&!disposing)disposing=h.host.dispose();}}});
+  await h.drive(OPEN,{type:'continue'},{type:'connect'});
+  assert.ok(disposing,'dispose ran inside the Connect commit');
+  await disposing;
+  await h.advance(5000);
+  assert.ok(h.handoffs.made.every(made=>made.disposed===1),'every handoff made after dispose is disposed');
+  assert.ok(h.handoffs.made.every(made=>made.reads===0),'no poll ever read a result');
+  assert.equal(h.clock.pending(),0,'no timer outlives dispose');
+  // An intent after dispose starts no new run.
+  const before=h.host.getState();
+  assert.deepEqual(h.host.dispatch(OPEN),before);
+  await h.host.settled();
+  assert.equal(h.host.getState().runId,before.runId);
+  assert.deepEqual(h.calls,[]);
+});
+test('F14b. review 1: dispose() while the handoff is being prepared waits for it and disposes it before resolving',async()=>{
+  const gate=deferred();
+  const slow=noSudo({deps:{prepareHandoff:async opts=>{await gate.promise;return fakeHandoffs().prepare(opts).then(made=>{slow.late=made;return made;});}}});
+  slow.host.dispatch(OPEN);await slow.host.settled();
+  slow.host.dispatch({type:'continue'});await slow.host.settled();
+  slow.host.dispatch({type:'connect'});
+  await until(()=>slow.host.getState().step==='fallback','fallback shown');
+  let done=false;
+  const p=slow.host.dispose().then(()=>{done=true;});
+  for(let i=0;i<20;i++)await new Promise(setImmediate);
+  assert.equal(done,false,'dispose waits for the handoff being prepared');
+  gate.resolve();await p;
+  assert.equal(slow.late.disposed,1,'the late handoff was disposed before dispose resolved');
+  assert.equal(slow.clock.pending(),0);
+  assert.equal(slow.host.dispose(),slow.host.dispose(),'dispose is one promise, however often it is called');
+});
+
+const MAYBE=/If the line was run as claudebwai, it may have changed claudebwai's Claude status line\./;
+test('F15. review 2: Cancel or timeout with the connect line shown and no result never says "Nothing was changed"; the disconnect line is offered',async()=>{
+  for(const end of ['cancel','timeout']) {
+    const h=noSudo();
+    await connectRun(h);
+    if(end==='cancel')await h.drive({type:'cancel'});else await h.advance(120000);
+    const state=h.host.getState();
+    assert.equal(state.step,'cancelled',end);
+    for(const seen of h.states.filter(s=>s.step==='cancelled'))
+      assert.ok(!textOf(renderWizard(seen)).includes('Nothing was changed'),`${end}: no screen claims nothing changed`);
+    const html=renderWizard(state),t=textOf(html);
+    assert.match(t,MAYBE,end);
+    assert.equal(h.handoffs.made[0].disposed,1,end);
+    assert.equal(h.handoffs.made.length,2,`${end}: the undo line is prepared`);
+    assert.equal(h.handoffs.made[1].opts.action,'disconnect');
+    assert.equal(h.handoffs.made[1].opts.connectionId,ID);
+    assert.equal(state.fallbackUndo,'waiting');
+    assert.equal(state.fallbackCommand,h.handoffs.made[1].command);
+    assert.ok(t.includes(h.handoffs.made[1].command)&&intentsOf(html).includes('copy'),end);
+    assert.deepEqual(h.calls,[]);
+  }
+  // A result that shows nothing changed keeps the plain wording.
+  for(const out of [{ok:false,code:'CANCELLED',message:'Setup cancelled.'},{ok:false,code:'SETUP_FAILED',message:'x'}]) {
+    const h=noSudo();
+    await connectRun(h);
+    h.handoffs.made[0].result=out; // it answered; Cancel lands before the next tick
+    await h.drive({type:'cancel'});
+    const state=h.host.getState();
+    assert.match(textOf(renderWizard(state)),/Cancelled\. Nothing was changed\./,out.code);
+    assert.doesNotMatch(textOf(renderWizard(state)),MAYBE);
+    assert.equal(h.handoffs.made.length,1,`${out.code}: no undo line`);
+  }
+  // The admin line ran nothing as the target: still "Nothing was changed".
+  const admin=noSudo({world:{feedExists:false}});
+  await connectRun(admin);
+  await admin.drive({type:'cancel'});
+  assert.match(textOf(renderWizard(admin.host.getState())),/Cancelled\. Nothing was changed\./);
+  // A cancelled disconnect line says its own honest equivalent, and offers no connect-side undo.
+  const off=noSudo();
+  await off.drive(OPEN_DISCONNECT,{type:'continue'},{type:'connect'});
+  await off.drive({type:'cancel'});
+  const t=textOf(renderWizard(off.host.getState()));
+  assert.ok(!t.includes('Nothing was changed'),t);
+  assert.match(t,/If the line was run as claudebwai, it may already have disconnected claudebwai's Claude status line from VS Code\./);
+  assert.equal(off.handoffs.made.length,1);
+});
+
+test('F16. review 3: the no-sudo road refuses a feed folder VS Code cannot read, before any line and when the admin folder appears',async()=>{
+  const h=noSudo({world:{readable:false}});
+  let state=await connectRun(h);
+  assert.equal(state.step,'cancelled');
+  assert.match(state.error,/VS Code can't read the shared folder .*Nothing was run as claudebwai/);
+  assert.equal(h.handoffs.made.length,0,'no line is shown');
+  assert.ok(h.events.includes('precheck'));
+  const late=noSudo({world:{feedExists:false,readable:false}});
+  await connectRun(late);
+  assert.equal(late.host.getState().fallbackAdmin,true);
+  late.world.feedExists=true;
+  await late.advance(250);
+  state=late.host.getState();
+  assert.equal(state.step,'cancelled');
+  assert.match(state.error,/VS Code can't read the shared folder /);
+  assert.equal(late.handoffs.made.length,0);
+  assert.equal(late.clock.pending(),0);
+});
+
+test('F17. review 4: an undo line that ran calls onDisconnected with the same shape as the no-sudo disconnect',async()=>{
+  const h=noSudo({world:{descriptorReadable:false}});
+  await connectRun(h);
+  h.handoffs.made[0].result={ok:true,connection:descriptor()};
+  await h.advance(250);
+  assert.equal(h.host.getState().fallbackUndo,'waiting');
+  h.handoffs.made[1].result={ok:true,connection:descriptor({connected:false})};
+  await h.advance(250);
+  assert.equal(h.host.getState().fallbackUndo,'done');
+  assert.deepEqual(h.disconnected,[[FEED,ID]]);
+  // A failed undo line disconnected nothing.
+  const bad=noSudo({world:{descriptorReadable:false}});
+  await connectRun(bad);
+  bad.handoffs.made[0].result={ok:true,connection:descriptor()};
+  await bad.advance(250);
+  bad.handoffs.made[1].result={ok:false,code:'SETUP_FAILED',message:'x'};
+  await bad.advance(250);
+  assert.equal(bad.host.getState().fallbackUndo,'failed');
+  assert.deepEqual(bad.disconnected,[]);
 });

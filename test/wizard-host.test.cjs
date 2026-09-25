@@ -1207,3 +1207,41 @@ test('F17. review 4: an undo line that ran calls onDisconnected with the same sh
   assert.equal(bad.host.getState().fallbackUndo,'failed');
   assert.deepEqual(bad.disconnected,[]);
 });
+
+test('F18. review round 2: a reconnect is never offered a disconnect line, so a working connection is never removed',async()=>{
+  for(const end of ['cancel','timeout','unverifiable']) {
+    const h=noSudo();
+    await h.drive({...OPEN,connection:CONNECTION},{type:'continue'},{type:'connect'});
+    if(end==='cancel')await h.drive({type:'cancel'});
+    else if(end==='timeout')await h.advance(120000);
+    else {h.handoffs.made[0].result=()=>{throw new Error('unverified');};await h.advance(250);}
+    const state=h.host.getState(),t=textOf(renderWizard(state));
+    assert.equal(h.handoffs.made.length,1,`${end}: no undo line is prepared`);
+    assert.equal(state.fallbackUndo,undefined,end);
+    assert.ok(!h.handoffs.made.some(x=>x.opts.action==='disconnect'),end);
+    assert.doesNotMatch(t,/stopped after it had changed the status line/,end);
+    if(end!=='unverifiable')assert.match(t,/may have refreshed the existing connection\. A reconnect never rewrites .* so there is nothing to undo/,end);
+  }
+});
+
+test('F19. review round 2: Cancel after the admin made the folder names the folder that stays, never "Nothing was changed"',async()=>{
+  const h=noSudo({world:{feedExists:false}});
+  await connectRun(h);
+  h.world.feedExists=true; // the admin ran the line; Cancel lands before the next tick
+  await h.drive({type:'cancel'});
+  const t=textOf(renderWizard(h.host.getState()));
+  assert.doesNotMatch(t,/Nothing was changed\./);
+  assert.ok(t.includes(`The shared folder ${FEED} the admin made stays`),t);
+});
+
+test('F20. review round 2: a no-sudo disconnect whose result cannot be verified says so, never "Not disconnected."',async()=>{
+  const h=noSudo();
+  await h.drive(OPEN_DISCONNECT,{type:'continue'},{type:'connect'});
+  h.handoffs.made[0].result=()=>{throw new Error('unverified');};
+  await h.advance(250);
+  const state=h.host.getState(),t=textOf(renderWizard(state));
+  assert.equal(state.step,'undone');
+  assert.doesNotMatch(t,/Not disconnected\./);
+  assert.match(t,/Disconnect not confirmed\./);
+  assert.match(t,/may already have disconnected/);
+});

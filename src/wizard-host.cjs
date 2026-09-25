@@ -110,6 +110,7 @@ function createWizardHost({elevate,sharedFeed=require('./shared-feed.cjs'),detec
     if(s.step==='fallback'&&r.fb?.command)Object.assign(s,{fallbackCommand:r.fb.command,fallbackAdmin:r.fb.phase==='folder',fallbackWaitMs:WAIT_MS});
     else if(['undone','cancelled'].includes(s.step)) {
       if(r.fb?.unsure)s.fallbackUnsure=true;
+      if(r.fb&&isReconnect(r))s.fallbackReconnect=true;
       if(r.undo) {
         s.fallbackUndo=r.undo.status;
         if(r.undo.status==='waiting')s.fallbackCommand=r.undo.command;
@@ -257,6 +258,9 @@ function createWizardHost({elevate,sharedFeed=require('./shared-feed.cjs'),detec
   // Review 3: the sudo road's readability precheck, on this road too, before any line runs as the target.
   const unreadableError=(r,admin)=>safeError('FEED_FOLDER_UNREADABLE',`VS Code can't read the shared folder ${r.feed}, so it could never show the usage reported there. `+
     `Nothing was run as ${r.target.user}${admin?'; the folder the admin made stays':' and nothing was changed'}.`);
+  // A reconnect keeps its connection id and never rewrites the status line (CP2 round 3), so a disconnect line would
+  // remove a working connection: a reconnect is never offered one (review round 2).
+  const isReconnect=r=>r.raw.mode!=='disconnect'&&CONNECTION_ID.test(r.raw.connection?.id||'');
   async function startFallback(r) {
     if(disposed||!live(r,'fallback'))return;
     // unsure: a target line is on screen and has not answered; it may have run, so no screen may say nothing changed.
@@ -315,7 +319,7 @@ function createWizardHost({elevate,sharedFeed=require('./shared-feed.cjs'),detec
       try {out=await fb.handoff.readResult();}
       catch {
         if(fb.stopped||!live(r,'fallback'))return;
-        fb.settled=true;fb.unsure=false;fb.changed=r.raw.mode!=='disconnect';
+        fb.settled=true;fb.unsure=r.raw.mode==='disconnect';fb.changed=r.raw.mode!=='disconnect';
         return result(r,{type:'fallbackResult',ok:false,error:`The line ran as ${r.target.user}, but its result could not be verified.`});
       }
       if(fb.stopped||!live(r,'fallback'))return;
@@ -332,7 +336,7 @@ function createWizardHost({elevate,sharedFeed=require('./shared-feed.cjs'),detec
       const user=r.target.user,why=reasonText(out,user,NAMES[r.target.provider]);
       if(out.code==='SETUP_FAILED_CHANGED'&&r.raw.mode!=='disconnect')fb.changed=true;
       const error=out.code==='CANCELLED'?`The line was cancelled as ${user}. Nothing was changed.`
-        :fb.changed?`Setup as ${user} stopped after it had changed the status line.`
+        :fb.changed&&!isReconnect(r)?`Setup as ${user} stopped after it had changed the status line.`
         :r.raw.mode==='disconnect'?`Disconnect as ${user} could not finish. Nothing was removed.`
         :`Setup as ${user} could not finish; its status line was not changed.`;
       result(r,{type:'fallbackResult',ok:false,error:why&&out.code!=='CANCELLED'?`${error} ${why}`:error});
@@ -349,6 +353,10 @@ function createWizardHost({elevate,sharedFeed=require('./shared-feed.cjs'),detec
     fb.stopped=true;
     if(fb.timer){clearTimer(fb.timer);fb.timer=null;}
     if(fb.busy)await fb.busy;
+    if(fb.phase==='folder'&&connect) {
+      const info=await sharedFeed.inspectFeed(r.feed).catch(()=>null);
+      if(info?.exists)warnings.push(`Nothing was run as ${r.target.user}. The shared folder ${r.feed} the admin made stays; an admin can remove it.`);
+    }
     if(fb.handoff) {
       if(!fb.settled) {
         let out=null,bad=false;
@@ -590,7 +598,7 @@ function createWizardHost({elevate,sharedFeed=require('./shared-feed.cjs'),detec
       if(r.fb) {
         const warning=await track(endFallback(r));
         if(warning)warnings.push(warning);
-        if(r.fb.changed&&r.raw.mode!=='disconnect'&&['undone','cancelled'].includes(ended)&&run===r) {
+        if(r.fb.changed&&r.raw.mode!=='disconnect'&&!isReconnect(r)&&['undone','cancelled'].includes(ended)&&run===r) {
           const failed=await track(offerUndo(r));
           if(failed)warnings.push(failed);
         }

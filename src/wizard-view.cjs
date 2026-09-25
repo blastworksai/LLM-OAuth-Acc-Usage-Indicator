@@ -172,6 +172,7 @@ function unsureBanner(s) {
   const status=`${who(s)}'s ${name(s)} status line`;
   return banner('warn',disconnecting(s)
     ?`If the line was run as ${who(s)}, it may already have disconnected ${status} from VS Code.`
+    :s.fallbackReconnect===true?`If the line was run as ${who(s)}, it may have refreshed the existing connection. A reconnect never rewrites ${status}, so there is nothing to undo.`
     :`If the line was run as ${who(s)}, it may have changed ${status}.`);
 }
 // After a no-sudo run that may have changed the status line: what is left to undo, and the one line that undoes it.
@@ -203,13 +204,13 @@ function connectedScreen(s) {
     ${row(button('close','Close',true))}`;
 }
 function undoneScreen(s) {
-  const lead=disconnecting(s)?'Not disconnected.':'Not connected.';
+  const lead=disconnecting(s)?(s.fallbackUnsure===true?'Disconnect not confirmed.':'Not disconnected.'):'Not connected.';
   return `${crumbs(s)}${banner('bad',[lead,str(s.error)].filter(Boolean).join(' '))}${unsureBanner(s)}${banner('warn',s.warning)}
     <ul class="wizard-steps">${itemList(s.undone,s,'warn','undone')}${itemList(s.kept,s,'user','kept')}</ul>${undoBlock(s)}
     ${row(can.retry(s)&&button('retry','Try again',true),button('close','Close'))}`;
 }
 function cancelledScreen(s) {
-  const fallback=s.fallbackUndo||s.fallbackUnsure===true?'Cancelled.':'Cancelled. Nothing was changed.';
+  const fallback=s.fallbackUndo||s.fallbackUnsure===true||s.warning?'Cancelled.':'Cancelled. Nothing was changed.';
   return `${crumbs(s)}${banner('warn',str(s.error)||fallback)}${unsureBanner(s)}${banner('warn',s.warning)}${undoBlock(s)}
     ${row(can.retry(s)&&button('retry','Start again',true),button('close','Close'))}`;
 }

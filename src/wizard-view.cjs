@@ -204,7 +204,8 @@ function connectedScreen(s) {
     ${row(button('close','Close',true))}`;
 }
 function undoneScreen(s) {
-  const lead=disconnecting(s)?(s.fallbackUnsure===true?'Disconnect not confirmed.':'Not disconnected.'):'Not connected.';
+  const lead=disconnecting(s)?(s.fallbackUnsure===true?'Disconnect not confirmed.':'Not disconnected.')
+    :s.fallbackReconnect===true?'Reconnect not confirmed. The existing connection was left in place.':'Not connected.';
   return `${crumbs(s)}${banner('bad',[lead,str(s.error)].filter(Boolean).join(' '))}${unsureBanner(s)}${banner('warn',s.warning)}
     <ul class="wizard-steps">${itemList(s.undone,s,'warn','undone')}${itemList(s.kept,s,'user','kept')}</ul>${undoBlock(s)}
     ${row(can.retry(s)&&button('retry','Try again',true),button('close','Close'))}`;

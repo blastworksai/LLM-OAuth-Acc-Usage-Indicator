@@ -1220,6 +1220,7 @@ test('F18. review round 2: a reconnect is never offered a disconnect line, so a 
     assert.equal(state.fallbackUndo,undefined,end);
     assert.ok(!h.handoffs.made.some(x=>x.opts.action==='disconnect'),end);
     assert.doesNotMatch(t,/stopped after it had changed the status line/,end);
+    if(end==='unverifiable'){assert.doesNotMatch(t,/Not connected\./);assert.match(t,/Reconnect not confirmed\. The existing connection was left in place\./);}
     if(end!=='unverifiable')assert.match(t,/may have refreshed the existing connection\. A reconnect never rewrites .* so there is nothing to undo/,end);
   }
 });

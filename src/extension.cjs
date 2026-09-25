@@ -290,7 +290,7 @@ function activate(context) {
         if(await withRecovery(connectCurrent,options)===false)return;
         await context.globalState.update('trustedDirectories',options.trustedDirectories);
         setupOptions.trustedDirectories=options.trustedDirectories;
-        await vscode.window.showInformationMessage(`${providerName(picked.provider)} connected. Select its terminal and finish a fresh turn to publish account usage.`);
+        await vscode.window.showInformationMessage(`${providerName(picked.provider)} connected. Restart any session that was already open, then finish a turn in it to publish account usage.`);
         await refresh();return;
       }
     } catch(error) {await showSetupError(error);}

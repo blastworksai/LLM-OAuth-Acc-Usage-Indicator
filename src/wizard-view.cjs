@@ -7,6 +7,10 @@
 // There is never a password field here: VS Code's own input box takes the password (the host shows it).
 // context (optional): {user, host, fallbackCommand} — the VS Code account, the host name, and the one-line
 // fallback command when the extension has one to show. Absent fields are left out, never invented.
+// The no-sudo road's host adds to the state it emits (wizard-host.cjs): fallbackCommand (the one line to run now),
+// fallbackAdmin (that line is the admin's folder line), fallbackWaitMs (how long the wizard waits for it) and
+// fallbackUndo ('waiting' with the disconnect line in fallbackCommand, 'done', 'failed') on the screens after a run
+// that may have changed the status line without sudo to undo it.
 // `idle` renders nothing: the account card owns that state.
 const {can}=require('./wizard.cjs');
 
@@ -128,7 +132,9 @@ function reviewScreen(s) {
   const profile=p.profilePath?`Profile <code>${escape(p.profilePath)}</code>. `:'';
   const body=disconnecting(s)
     ?`${profile}Disconnect puts the status line back as it was and removes the shared folder when it is empty.`
-    :`${profile}Nothing inside the ${escape(who(s))} home folder is opened to other accounts. If VS Code can't read the first report, every change is undone; a shared folder that was already there stays.`;
+    :s.sudo==='none'
+      ?`${profile}Nothing inside the ${escape(who(s))} home folder is opened to other accounts. Without sudo nothing can be undone automatically: if VS Code can't read the first report, the wizard shows the line that puts the status line back.`
+      :`${profile}Nothing inside the ${escape(who(s))} home folder is opened to other accounts. If VS Code can't read the first report, every change is undone; a shared folder that was already there stays.`;
   const existing=!disconnecting(s)&&p.hasExistingStatusLine?note('Your existing status line keeps running; the usage report wraps it.'):'';
   const asked=s.sudo==='password'?note(`${escape(verb(s))} uses the password you already gave; it won't ask again.`):'';
   return `${crumbs(s)}${heading('What will change')}${changesList(s)}${sharedList(s)}${note(body)}${existing}${asked}${commands(s)}
@@ -141,13 +147,36 @@ function passwordScreen(s,context) {
     ${note(`${escape(forWhom)}VS Code's password box is open at the top of the window. Type it there; this panel never sees it, and nothing is changed yet.`)}
     ${row(cancelButton(s))}`;
 }
+const waitNote=s=>Number.isInteger(s.fallbackWaitMs)&&s.fallbackWaitMs>0?` It stops waiting after ${Math.round(s.fallbackWaitMs/60000)} minutes.`:'';
+const commandBlock=line=>line?`<code class="wizard-cmd">${escape(line)}</code>`:'';
 function fallbackScreen(s,context) {
   const line=str(context.fallbackCommand||s.fallbackCommand);
+  if(s.fallbackAdmin===true) {
+    const feed=str(s.preview?.reportDir)||'the shared feed folder';
+    return `${crumbs(s)}${heading('An admin step first')}
+    ${banner('warn',`The shared folder ${feed} does not exist yet, and making it needs sudo, which this VS Code account can't use. Ask an admin to run this line once. The wizard then shows the line to run as ${who(s)}.`)}
+    ${commandBlock(line)}
+    ${row(button('copy','Copy'),cancelButton(s))}
+    ${note(`The wizard waits here for the folder.${escape(waitNote(s))}`)}`;
+  }
   return `${crumbs(s)}${heading('One step outside VS Code')}
     ${banner('warn',`This VS Code account can't act as ${who(s)}. Run this once in any shell logged in as ${who(s)}. It won't ask you anything; you already agreed by pressing ${verb(s)}.`)}
     ${line?`<code class="wizard-cmd">${escape(line)}</code>`:''}
     ${row(button('copy','Copy'),cancelButton(s))}
-    ${note('The wizard waits here and finishes on its own when the line runs.')}`;
+    ${note(`The wizard waits here and finishes on its own when the line runs.${escape(waitNote(s))}`)}`;
+}
+// After a no-sudo run that may have changed the status line: what is left to undo, and the one line that undoes it.
+function undoBlock(s) {
+  const status=`${who(s)}'s ${name(s)} status line`;
+  if(s.fallbackUndo==='done')return banner('good',`The undo line ran as ${who(s)}: ${status} is back as it was.`);
+  const where=[s.preview?.profilePath?` in <code>${escape(s.preview.profilePath)}</code>`:'',
+    s.preview?.reportDir?` may now report usage to <code>${escape(s.preview.reportDir)}</code>`:' may have been changed'].join('');
+  if(s.fallbackUndo==='failed')return banner('bad',`The undo line ran as ${who(s)} but could not finish, so ${status} has to be put back by hand.`)
+    +note(`${escape(status)}${where}.`);
+  if(s.fallbackUndo!=='waiting')return '';
+  const line=str(s.fallbackCommand);
+  return `${note(`Without sudo the wizard can't undo this itself. ${escape(status)}${where}. To put it back, run this once in any shell logged in as ${escape(who(s))}:`)}
+    ${commandBlock(line)}${line?row(button('copy','Copy')):''}`;
 }
 function progressScreen(s,title) {
   return `${crumbs(s)}${heading(title)}${banner('bad',s.step==='undoing'?s.error:null)}${row(cancelButton(s))}`;
@@ -164,11 +193,12 @@ function connectedScreen(s) {
 function undoneScreen(s) {
   const lead=disconnecting(s)?'Not disconnected.':'Not connected.';
   return `${crumbs(s)}${banner('bad',[lead,str(s.error)].filter(Boolean).join(' '))}${banner('warn',s.warning)}
-    <ul class="wizard-steps">${itemList(s.undone,s,'warn','undone')}${itemList(s.kept,s,'user','kept')}</ul>
+    <ul class="wizard-steps">${itemList(s.undone,s,'warn','undone')}${itemList(s.kept,s,'user','kept')}</ul>${undoBlock(s)}
     ${row(can.retry(s)&&button('retry','Try again',true),button('close','Close'))}`;
 }
 function cancelledScreen(s) {
-  return `${crumbs(s)}${banner('warn',str(s.error)||'Cancelled. Nothing was changed.')}${banner('warn',s.warning)}
+  const fallback=s.fallbackUndo?'Cancelled.':'Cancelled. Nothing was changed.';
+  return `${crumbs(s)}${banner('warn',str(s.error)||fallback)}${banner('warn',s.warning)}${undoBlock(s)}
     ${row(can.retry(s)&&button('retry','Start again',true),button('close','Close'))}`;
 }
 

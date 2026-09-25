@@ -9,12 +9,30 @@
 // handed to elevate.run as an option, and set to null when the run is cleaned up. It never enters state, argv or errors.
 // Root is used for: /var/lib/llm-account-usage roots, the root-owned setup bundle, creating an ABSENT feed folder, and
 // rmdir of a feed folder this run created (or the disconnect road removes). An existing folder is never chowned.
+// The no-sudo road (CP3, Task 3.2): sudo:'none' → Connect → `fallback`. No root is ever used on it. The host prepares a
+// handoff (handoff.cjs) whose one line the member runs as the target, and polls its dropbox every POLL_MS for WAIT_MS.
+// --report-dir names the shared feed only when that folder already exists with the sudo road's shape; otherwise the
+// screen first shows the one admin line that makes it, and the handoff is prepared once the folder is there. A result
+// goes through the same descriptor check as the sudo road. Nothing can be rolled back without sudo, so a run that may
+// have changed the status line ends with a second handoff: the exact disconnect line, kept until Close or a new run.
+// What the screen shows beyond the machine's state rides on the emitted copy only: fallbackCommand (the one line to run
+// now), fallbackAdmin, fallbackWaitMs, fallbackUndo ('waiting'|'done'|'failed'). The machine never sees them.
 const fsp=require('node:fs/promises');
 const path=require('node:path');
 const {randomUUID}=require('node:crypto');
 const wizard=require('./wizard.cjs');
-const {sameProcess,validatePublicConnection,publicPath}=require('./connection.cjs');
+const {sameProcess,validatePublicConnection,publicPath,connectionIdentity}=require('./connection.cjs');
 const {MANIFEST}=require('./handoff.cjs');
+const POLL_MS=250,WAIT_MS=2*60*1000;
+const PROFILE_DIRS={claude:'.claude',codex:'.codex',antigravity:'.gemini/antigravity-cli'}; // setup.cjs's defaults
+// The target's home from /etc/passwd (world-readable), matched on uid AND name so a duplicate uid never picks a stranger.
+async function passwdHome(uid,user,io=fsp) {
+  for(const line of String(await io.readFile('/etc/passwd','utf8')).split('\n')) {
+    const f=line.split(':');
+    if(f.length>=7&&f[0]===user&&f[2]===String(uid))return f[5];
+  }
+  return null;
+}
 const PROVIDERS=['claude','codex','antigravity'];
 const NAMES={claude:'Claude',codex:'Codex',antigravity:'Antigravity'};
 const INTENTS=new Set(['open','retry','continue','connect','cancel','close']);
@@ -69,17 +87,33 @@ async function verifyDescriptor(value,{provider,uid,action='connect',connection=
 // readConnectionFeeds; readFeeds; resolveUser(uid); askPassword({attempt,tries,prompt,error,signal}) -> string | undefined
 // (the extension shows showInputBox({password:true,prompt,ignoreFocusOut:true}); undefined = dismissed = cancel);
 // onState(state) after every change; onConnected(reportDir,process,descriptor); onDisconnected(reportDir,connectionId).
+// No-sudo road: prepareHandoff (handoff.cjs); homeOf(uid,user) -> the target's home or null; now/setTimer/clearTimer
+// (injectable so tests never wait two real minutes).
 function createWizardHost({elevate,sharedFeed=require('./shared-feed.cjs'),detectProvider,readConnectionFeeds,readFeeds,resolveUser,askPassword,
   extensionPath,runtimeVersion,getgid=()=>process.getgid(),getuid=()=>process.getuid(),uuid=randomUUID,fs:io=fsp,manifest=MANIFEST,
+  prepareHandoff=(...args)=>require('./handoff.cjs').prepareHandoff(...args),homeOf=passwdHome,
+  now=()=>Date.now(),setTimer=(fn,ms)=>setTimeout(fn,ms),clearTimer=timer=>clearTimeout(timer),
   onState=()=>{},onConnected=()=>{},onDisconnected=()=>{}}={}) {
-  if(!elevate||![elevate.probe,elevate.checkPassword,elevate.run,detectProvider,readConnectionFeeds,readFeeds,resolveUser,askPassword]
-    .every(value=>typeof value==='function')||!publicPath(extensionPath)||typeof runtimeVersion!=='string')
+  if(!elevate||![elevate.probe,elevate.checkPassword,elevate.run,detectProvider,readConnectionFeeds,readFeeds,resolveUser,askPassword,
+    prepareHandoff,homeOf,now,setTimer,clearTimer].every(value=>typeof value==='function')||!publicPath(extensionPath)||typeof runtimeVersion!=='string')
     throw new TypeError('createWizardHost: missing dependency');
   let state=wizard.initial(),run=null,inflight=null,checking=null,asking=null;
-  const orphans=[],handled=new WeakSet();
+  const orphans=[],handled=new WeakSet(),ticking=new Set();
+  // The state as the screen sees it: the machine's state plus the no-sudo road's line for the current run.
+  function snapshot() {
+    const s=structuredClone(state),r=run;
+    if(!r||s.runId!==r.runId)return s;
+    if(s.step==='fallback'&&r.fb?.command)Object.assign(s,{fallbackCommand:r.fb.command,fallbackAdmin:r.fb.phase==='folder',fallbackWaitMs:WAIT_MS});
+    else if(['undone','cancelled'].includes(s.step)&&r.undo) {
+      s.fallbackUndo=r.undo.status;
+      if(r.undo.status==='waiting')s.fallbackCommand=r.undo.command;
+    }
+    return s;
+  }
+  const emit=()=>{try {onState(snapshot());}catch {}};
   const commit=action=>{
     const next=wizard.step(state,action);
-    if(next!==state){state=next;try {onState(structuredClone(state));}catch {}}
+    if(next!==state){state=next;emit();}
     if(asking&&(state.runId!==asking.runId||state.step!=='password'))asking.controller.abort();
     kick();
     return state;
@@ -111,11 +145,11 @@ function createWizardHost({elevate,sharedFeed=require('./shared-feed.cjs'),detec
       case 'probe':return elevate.probe().then(sudo=>result(r,{type:'sudoProbed',sudo}));
       case 'discover':return discover(r);
       case 'askPassword':return ask(r,pending.attempt);
-      case 'fallback':return; // CP3 (Task 3.2): the no-sudo one-line road. Until then the wizard waits here; Cancel ends it.
+      case 'fallback':return startFallback(r);
       case 'apply':return applyChange(r,pending.changes[0]);
       case 'verify':return r.raw.mode==='disconnect'?verifyDisconnect(r):verifyConnect(r);
       case 'rollback':return rollback(r,pending);
-      case 'cleanup':return finish(r).then(warning=>{
+      case 'cleanup':return finish(r,state.step).then(warning=>{
         if(state.runId===r.runId)result(r,{type:'cleanedUp',...(warning?{warning}:{})});
         else if(warning)commit({type:'earlierCleanup',warning}); // replaced while rm -r ran: never lost unseen
       });
@@ -176,10 +210,177 @@ function createWizardHost({elevate,sharedFeed=require('./shared-feed.cjs'),detec
       await rootOk(r,argv,'BUNDLE_FAILED','The setup files could not be staged.');
     }
   }
-  function noSudoPreview(r) {
-    // CP3 stub: the no-sudo road. The review names the one change the fallback line would make; Connect moves to fallback.
-    result(r,{type:'discovered',preview:{id:null,provider:r.target.provider,profilePath:null,reportDir:null,sharedDirectories:[],
-      hasExistingStatusLine:false,commands:[],changes:[{id:'status',as:r.target.user,label:`${NAMES[r.target.provider]} status line, set up by one command you run as ${r.target.user}`}]}});
+  // The no-sudo review. Nothing runs as the target before Connect, so the profile is the saved one (reconnect,
+  // disconnect) or setup.cjs's default under the target's home; the line pins it with --profile, which fixes the
+  // connection id and therefore the shared feed folder's name.
+  async function noSudoPreview(r) {
+    const name=NAMES[r.target.provider],user=r.target.user,c=r.raw.connection;
+    if(r.raw.mode==='disconnect') {
+      if(!c||!CONNECTION_ID.test(c.id||'')||!publicPath(c.reportDir)||!publicPath(c.profilePath))
+        throw safeError('INVALID_CONNECTION','The saved connection could not be read. Nothing was changed.');
+      r.connectionId=c.id;r.feed=c.reportDir;r.profile=c.profilePath;
+    } else {
+      const saved=savedProfile(r);
+      if(saved&&CONNECTION_ID.test(c?.id||''))r.profile=saved;
+      else {
+        const home=await Promise.resolve(homeOf(r.target.uid,user)).catch(()=>null);
+        if(!publicPath(home))throw safeError('HOME_UNKNOWN',`${user}'s home folder could not be read from /etc/passwd, so the wizard cannot name its ${name} profile. Nothing was changed.`);
+        r.profile=path.join(home,PROFILE_DIRS[r.target.provider]);
+      }
+      r.connectionId=connectionIdentity({provider:r.target.provider,uid:r.target.uid,
+        settingsPath:path.join(r.profile,r.target.provider==='codex'?'hooks.json':'settings.json')}).id;
+      r.feed=sharedFeed.feedPath(r.connectionId);
+    }
+    if(!live(r,'detecting'))return;
+    const change=r.raw.mode==='disconnect'
+      ?{id:'status',as:user,label:`Restore the ${name} status line in ${r.profile}, by one line you run as ${user}`}
+      :{id:'status',as:user,label:`${name} status line in ${r.profile} reports usage to ${r.feed}, set up by one line you run as ${user}`};
+    result(r,{type:'discovered',preview:{id:r.connectionId,provider:r.target.provider,profilePath:r.profile,reportDir:r.feed,sharedDirectories:[],
+      hasExistingStatusLine:false,commands:[],changes:[change]}});
+  }
+  // ---- the no-sudo road: one line, a dropbox, a poll ----
+  const handoffTarget=r=>({cliPath:publicPath(r.raw.target?.cliPath)?r.raw.target.cliPath:null,process:processOf(r.target.process),
+    ...(r.raw.terminalPid?{terminalPid:r.raw.terminalPid}:{})});
+  const handoffRecheck=r=>{const cli=handoffTarget(r).cliPath;
+    return ()=>detectProvider(r.raw.terminalPid??r.target.process.pid,{allowForeign:true,topologyOnly:cli===null});};
+  const adminLine=r=>`sudo install -d -m 2750 -o ${r.target.user} -g ${getgid()} ${r.feed}`;
+  const feedShapeError=(r,info)=>safeError('FEED_FOLDER_UNSAFE',`The feed folder ${r.feed} already exists as ${info.directory?'a folder':'something other than a folder'} with owner uid ${info.uid}, `+
+    `group gid ${info.gid}, mode ${(info.mode??0).toString(8)}. It must be owner uid ${r.target.uid}, group gid ${getgid()}, mode 2750. It was not changed, and nothing else was.`);
+  const feedShaped=(r,info)=>info.directory&&info.uid===r.target.uid&&info.gid===getgid()&&info.mode===0o2750;
+  async function startFallback(r) {
+    if(!live(r,'fallback'))return;
+    r.fb={phase:null,command:null,handoff:null,deadline:0,timer:null,stopped:false,changed:false,settled:false};
+    if(r.raw.mode!=='disconnect') {
+      const info=await sharedFeed.inspectFeed(r.feed);
+      if(!live(r,'fallback'))return;
+      if(info.exists&&!feedShaped(r,info))throw feedShapeError(r,info);
+      if(!info.exists) {
+        // Without root the folder cannot be made here: the one line to show is the admin's. The poll watches for it.
+        Object.assign(r.fb,{phase:'folder',command:adminLine(r)});
+        arm(r);emit();return;
+      }
+    }
+    await openHandoff(r);
+  }
+  async function openHandoff(r) {
+    const disconnect=r.raw.mode==='disconnect';
+    const handoff=await prepareHandoff({extensionPath,provider:r.target.provider,target:handoffTarget(r),action:disconnect?'disconnect':'connect',
+      revalidate:handoffRecheck(r),...(disconnect?{connectionId:r.connectionId}:{runtimeVersion,profilePath:r.profile,reportDir:r.feed})});
+    if(r.fb.stopped||!live(r,'fallback')){await handoff.dispose().catch(()=>{});return;}
+    Object.assign(r.fb,{phase:'result',handoff,command:handoff.command});
+    arm(r);emit();
+  }
+  // Each line gets its own two minutes from the moment it is shown.
+  function arm(r) {r.fb.deadline=now()+WAIT_MS;schedule(r,r.fb,()=>fallbackTick(r));}
+  function schedule(r,watch,fn) {
+    if(watch.stopped)return;
+    watch.timer=setTimer(()=>{
+      watch.timer=null;
+      if(watch.stopped)return;
+      const p=Promise.resolve().then(fn).catch(()=>{}).finally(()=>{ticking.delete(p);watch.busy=null;});
+      watch.busy=p;ticking.add(p);
+    },POLL_MS);
+  }
+  async function fallbackTick(r) {
+    const fb=r.fb;
+    if(fb.stopped||!live(r,'fallback'))return;
+    try {
+      if(fb.phase==='folder') {
+        const info=await sharedFeed.inspectFeed(r.feed);
+        if(fb.stopped||!live(r,'fallback'))return;
+        if(info.exists) {
+          if(!feedShaped(r,info))return result(r,{type:'failed',error:feedShapeError(r,info).message});
+          return await openHandoff(r);
+        }
+        if(now()>=fb.deadline)return result(r,{type:'failed',error:`The shared folder ${r.feed} did not appear within 2 minutes, so the wizard stopped waiting. Nothing was changed. Once an admin has made it, press Start again.`});
+        return schedule(r,fb,()=>fallbackTick(r));
+      }
+      let out;
+      try {out=await fb.handoff.readResult();}
+      catch {
+        if(fb.stopped||!live(r,'fallback'))return;
+        fb.settled=true;fb.changed=r.raw.mode!=='disconnect';
+        return result(r,{type:'fallbackResult',ok:false,error:`The line ran as ${r.target.user}, but its result could not be verified.`});
+      }
+      if(fb.stopped||!live(r,'fallback'))return;
+      if(out==null) {
+        if(now()>=fb.deadline)return result(r,{type:'failed',error:'Nothing came back from the line within 2 minutes, so the wizard stopped waiting and the line no longer works. Press Start again for a new one.'});
+        return schedule(r,fb,()=>fallbackTick(r));
+      }
+      fb.settled=true;
+      if(out.ok===true) {
+        r.connection=out.connection;
+        if(r.raw.mode!=='disconnect'){fb.changed=true;r.connectionId=out.connection.id;}
+        return result(r,{type:'fallbackResult',ok:true,change:{id:'status',as:r.target.user}});
+      }
+      const user=r.target.user;
+      if(out.code==='SETUP_FAILED_CHANGED'&&r.raw.mode!=='disconnect')fb.changed=true;
+      result(r,{type:'fallbackResult',ok:false,error:out.code==='CANCELLED'?`The line was cancelled as ${user}. Nothing was changed.`
+        :fb.changed?`Setup as ${user} stopped after it had changed the status line.`
+        :r.raw.mode==='disconnect'?`Disconnect as ${user} could not finish. Nothing was removed.`
+        :`Setup as ${user} could not finish; its status line was not changed.`});
+    } catch(error) {
+      if(!fb.stopped&&live(r,'fallback'))result(r,{type:'failed',error:message(error)});
+    }
+  }
+  // Ends the fallback watch and disposes its handoff. A line that ran just before Cancel or the timeout is still read,
+  // so the screen never says "Nothing was changed" over a change. Returns a warning or null.
+  async function endFallback(r) {
+    const fb=r.fb,connect=r.raw.mode!=='disconnect',warnings=[];
+    fb.stopped=true;
+    if(fb.timer){clearTimer(fb.timer);fb.timer=null;}
+    if(fb.busy)await fb.busy;
+    if(fb.handoff) {
+      if(!fb.settled) {
+        let out=null,bad=false;
+        try {out=await fb.handoff.readResult();} catch {bad=true;}
+        if(bad||out?.ok===true||(out?.code==='SETUP_FAILED_CHANGED')) {
+          if(connect){fb.changed=true;if(out?.ok===true){r.connection=out.connection;r.connectionId=out.connection.id;}
+            warnings.push(`The line had already run as ${r.target.user} before the wizard stopped, so its status line was changed.`);}
+          else if(out?.ok===true) {
+            await Promise.resolve(onDisconnected(r.raw.connection.reportDir,r.raw.connection.id)).catch(()=>{});
+            warnings.push(`The line had already run as ${r.target.user} before the wizard stopped: it is disconnected.`);
+          }
+        }
+      }
+      const done=await fb.handoff.dispose().catch(()=>({removed:false}));
+      if(done?.removed!==true)warnings.push(typeof done?.warning==='string'&&done.warning?done.warning:'The fallback setup files could not all be removed.');
+      fb.handoff=null;
+    }
+    return warnings.join(' ')||null;
+  }
+  // No rollback runs without sudo: a run that may have changed the status line gets the exact disconnect line instead.
+  async function offerUndo(r) {
+    try {
+      const handoff=await prepareHandoff({extensionPath,provider:r.target.provider,target:handoffTarget(r),action:'disconnect',
+        connectionId:r.connectionId,revalidate:handoffRecheck(r)});
+      if(r.released||run!==r){await handoff.dispose().catch(()=>{});return null;} // replaced or closed meanwhile
+      r.undo={handoff,command:handoff.command,status:'waiting',stopped:false,timer:null,busy:null};
+      schedule(r,r.undo,()=>undoTick(r));
+      return null;
+    } catch {
+      return `The undo line could not be prepared. ${r.target.user}'s ${NAMES[r.target.provider]} status line in ${r.profile} has to be put back by hand.`;
+    }
+  }
+  async function undoTick(r) {
+    const u=r.undo;
+    if(!u||u.stopped)return;
+    let out;
+    try {out=await u.handoff.readResult();} catch {out={ok:false};}
+    if(u.stopped)return;
+    if(out==null)return schedule(r,u,()=>undoTick(r));
+    u.status=out.ok===true?'done':'failed';
+    await releaseUndo(r,false);
+    if(run===r)emit();
+  }
+  async function releaseUndo(r,wait=true) {
+    if(r&&wait)r.released=true;
+    const u=r?.undo;
+    if(!u||u.stopped)return;
+    u.stopped=true;
+    if(u.timer){clearTimer(u.timer);u.timer=null;}
+    if(wait&&u.busy)await u.busy;
+    await u.handoff.dispose().catch(()=>{});
   }
   async function discover(r) {
     if(state.sudo==='none')return noSudoPreview(r);
@@ -322,6 +523,16 @@ function createWizardHost({elevate,sharedFeed=require('./shared-feed.cjs'),detec
     result(r,{type:'applied',change:{id:'folder',as:'root',path:r.feed}});
   }
   async function verifyDisconnect(r) {
+    if(r.fb) {
+      // The no-sudo road: the line disconnected as the target; the folder stays, since removing it needs root.
+      const value=await verifyDescriptor(r.connection,{provider:r.target.provider,uid:r.target.uid,action:'disconnect',connection:r.raw.connection,
+        readFeeds,readConnectionFeeds,requireDescriptor:false});
+      if(!live(r,'verifying'))return;
+      await onDisconnected(value.reportDir,value.id);
+      const kept=value.reportDir===sharedFeed.feedPath(value.id);
+      return result(r,{type:'verified',connection:value,
+        ...(kept?{warning:`The shared folder ${value.reportDir} stays: removing it needs an admin (sudo rmdir after its files are gone).`}:{})});
+    }
     if(r.feedRoad&&(await sharedFeed.inspectFeed(r.feed)).exists)throw safeError('FEED_FOLDER_LEFT',`The shared folder ${r.feed} is still there.`);
     result(r,{type:'verified',connection:r.connection});
   }
@@ -346,13 +557,26 @@ function createWizardHost({elevate,sharedFeed=require('./shared-feed.cjs'),detec
     const left=kept.filter(change=>change.reason);
     result(r,{type:'rolledBack',undone,kept,...(left.length?{warning:`Still in place: ${left.map(change=>change.path||change.id).join(', ')}.`}:{})});
   }
-  async function finish(r) {
+  // ended: the step the run finished on, when it is still the current run (null for a replaced one, which nobody sees).
+  async function finish(r,ended=null) {
     if(r.finished)return null;
     r.finished=true;
+    const warnings=[];
     try {
-      if(!r.staged)return null;
-      try {if((await asRoot(r,sharedFeed.removeBundleArgv(r.bundleId))).code===0)return null;} catch {}
-      return `The setup bundle could not be removed: ${sharedFeed.bundlePath(r.bundleId)}.`;
+      if(r.fb) {
+        const warning=await endFallback(r);
+        if(warning)warnings.push(warning);
+        if(r.fb.changed&&r.raw.mode!=='disconnect'&&['undone','cancelled'].includes(ended)&&run===r) {
+          const failed=await offerUndo(r);
+          if(failed)warnings.push(failed);
+        }
+      }
+      if(r.staged) {
+        let removed=false;
+        try {removed=(await asRoot(r,sharedFeed.removeBundleArgv(r.bundleId))).code===0;} catch {}
+        if(!removed)warnings.push(`The setup bundle could not be removed: ${sharedFeed.bundlePath(r.bundleId)}.`);
+      }
+      return warnings.join(' ')||null;
     } finally {r.password=null;}
   }
   // ---- intents ----
@@ -360,6 +584,7 @@ function createWizardHost({elevate,sharedFeed=require('./shared-feed.cjs'),detec
     if(!wizard.can.open(state))return commit({type:'open'});
     const runId=uuid(),before=run;
     if(before&&!before.finished)orphans.push(before);
+    if(before)void releaseUndo(before); // a new run ends the previous run's undo line
     run={runId,raw:{mode,target,terminalPid:Number.isSafeInteger(terminalPid)&&terminalPid>0?terminalPid:undefined,connection,provider},password:null};
     commit({type:'open',runId,mode,target:null,connection:connection&&typeof connection==='object'?
       {id:connection.id,provider:connection.provider,uid:connection.uid,profilePath:connection.profilePath,reportDir:connection.reportDir}:null});
@@ -369,6 +594,7 @@ function createWizardHost({elevate,sharedFeed=require('./shared-feed.cjs'),detec
     if(!wizard.can.retry(state)||!run?.target)return commit({type:'retry'});
     const before=run,runId=uuid();
     if(!before.finished)orphans.push(before);
+    void releaseUndo(before);
     run={runId,raw:before.raw,target:before.target,password:null};
     return commit({type:'retry',runId});
   }
@@ -391,9 +617,23 @@ function createWizardHost({elevate,sharedFeed=require('./shared-feed.cjs'),detec
     if(type==='open')return open(action);
     if(type==='retry')return retry();
     if(type==='connect')return connect();
-    return commit({type});
+    const before=run;
+    const next=commit({type});
+    if(type==='close'&&next.step==='idle'&&before)void releaseUndo(before); // Close ends the undo line with the wizard
+    return next;
   }
-  async function settled() {while(inflight||checking)await (inflight||checking.promise);return state;}
-  return {dispatch,getState:()=>structuredClone(state),settled};
+  // Waits for effects, the Connect re-check and any poll tick in flight; a waiting fallback itself is not awaited.
+  async function settled() {
+    while(inflight||checking||ticking.size)await (inflight||checking?.promise||[...ticking][0]);
+    return snapshot();
+  }
+  // For the extension's deactivate: stops every poll and disposes every handoff this host still holds.
+  async function dispose() {
+    const r=run;
+    if(!r)return;
+    await releaseUndo(r);
+    if(r.fb&&!r.fb.stopped)await endFallback(r).catch(()=>{});
+  }
+  return {dispatch,getState:snapshot,settled,dispose};
 }
 module.exports={createWizardHost,verifyDescriptor};

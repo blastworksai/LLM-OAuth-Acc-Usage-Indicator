@@ -745,3 +745,336 @@ test('R9. a refused profile names its reason from the host\'s own sentences; an 
   state=await connect.drive(OPEN,{type:'continue'},{type:'connect'});
   assert.equal(state.error,"Setup as claudebwai stopped. claudebwai's Claude already has an Account Usage hook. Its status line was not changed.");
 });
+
+// ---- CP3 Task 3.2: the no-sudo road inside the wizard ----
+// No sudo is ever called on this road, so every test also asserts elevate.run saw nothing. The handoff is a fake with the
+// shape of handoff.cjs's prepareHandoff ({root,command,resultPath,readResult,dispose}); the clock is a fake, so the
+// two-minute wait costs nothing.
+const {renderWizard}=require('../src/wizard-view.cjs');
+const HOME='/home/claudebwai';
+const ADMIN_LINE=`sudo install -d -m 2750 -o ${USER} -g ${GID} ${FEED}`;
+function fakeClock() {
+  let t=0;const queue=[];
+  return {now:()=>t,pending:()=>queue.length,
+    setTimer:(fn,ms)=>{const entry={at:t+ms,fn};queue.push(entry);return entry;},
+    clearTimer:entry=>{const i=queue.indexOf(entry);if(i>=0)queue.splice(i,1);},
+    async advance(ms,host) {
+      const end=t+ms;
+      for(;;) {
+        queue.sort((a,b)=>a.at-b.at);
+        if(!queue.length||queue[0].at>end)break;
+        const entry=queue.shift();t=entry.at;entry.fn();await host.settled();
+      }
+      t=end;await host.settled();
+    }};
+}
+function fakeHandoffs() {
+  const made=[];
+  const prepare=async opts=>{
+    const i=made.length,root=`/tmp/llm-account-usage-fake${i}`;
+    const h={opts,root,command:`node '${root}/src/setup-cli.cjs' ${opts.action} --fake ${i}`,resultPath:`${root}/results/x.json`,
+      result:null,reads:0,disposed:0,
+      readResult:async()=>{h.reads++;if(h.disposed)throw new Error('read after dispose');return typeof h.result==='function'?h.result():h.result;},
+      dispose:async()=>{h.disposed++;return {removed:true};}};
+    made.push(h);return h;
+  };
+  return {made,prepare};
+}
+function noSudo({world={},deps={},...rest}={}) {
+  const clock=fakeClock(),handoffs=fakeHandoffs(),homes=[];
+  const h=harness({...rest,world:{sudo:'none',feedExists:true,...world},deps:{prepareHandoff:handoffs.prepare,
+    homeOf:async(uid,user)=>{homes.push([uid,user]);return uid===UID&&user===USER?HOME:null;},
+    now:clock.now,setTimer:clock.setTimer,clearTimer:clock.clearTimer,...deps}});
+  return {...h,clock,handoffs,homes,advance:ms=>clock.advance(ms,h.host)};
+}
+const intentsOf=html=>[...html.matchAll(/data-intent="([a-z]+)"/g)].map(m=>m[1]);
+const textOf=html=>html.replace(/<[^>]+>/g,'').replace(/&#39;/g,"'").replace(/&quot;/g,'"').replace(/&amp;/g,'&');
+
+test('F1. no sudo: Connect shows the one handoff line with --report-dir on the existing feed; the result is verified, then connected',async()=>{
+  const h=noSudo();
+  let state=await connectRun(h);
+  assert.equal(state.step,'fallback');
+  assert.equal(h.handoffs.made.length,1);
+  const [handoff]=h.handoffs.made;
+  assert.deepEqual(handoff.opts,{extensionPath:EXT,provider:'claude',target:{cliPath:null,process:PROC,terminalPid:PID},action:'connect',
+    revalidate:handoff.opts.revalidate,runtimeVersion:VERSION,profilePath:PROFILE,reportDir:FEED});
+  assert.equal(state.fallbackCommand,handoff.command);
+  assert.equal(state.fallbackAdmin,false);
+  assert.equal(state.fallbackWaitMs,120000);
+  const review=h.states.find(s=>s.step==='review');
+  assert.equal(review.preview.id,ID);assert.equal(review.preview.profilePath,PROFILE);assert.equal(review.preview.reportDir,FEED);
+  assert.ok(review.preview.changes[0].label.includes(PROFILE)&&review.preview.changes[0].label.includes(FEED));
+  assert.match(textOf(renderWizard(review)),/Without sudo nothing can be undone automatically/);
+  const html=renderWizard(state);
+  assert.ok(html.includes(`<code class="wizard-cmd">${handoff.command.replace(/'/g,'&#39;')}</code>`));
+  assert.deepEqual(intentsOf(html),['copy','cancel']);
+  assert.match(textOf(html),/It stops waiting after 2 minutes\./);
+  // The poll: one read every 250 ms while nothing has come back.
+  await h.advance(1000);
+  assert.equal(handoff.reads,4);
+  assert.equal(h.host.getState().step,'fallback');
+  handoff.result={ok:true,connection:descriptor()};
+  await h.advance(250);
+  state=h.host.getState();
+  assert.equal(state.step,'connected');
+  assert.deepEqual(state.applied.map(c=>c.id),['status']);
+  assert.equal(h.connected.length,1);
+  assert.equal(h.connected[0][0],FEED);assert.deepEqual(h.connected[0][1],PROC);assert.equal(h.connected[0][2].id,ID);
+  assert.ok(h.events.includes('readConnectionFeeds'),'the same descriptor check as the sudo road');
+  assert.equal(handoff.disposed,1);
+  assert.equal(h.clock.pending(),0,'no poll left running');
+  assert.equal(state.fallbackCommand,undefined);
+  assert.deepEqual(h.calls,[],'no sudo call on this road');
+  assert.deepEqual(h.homes,[[UID,USER]]);
+});
+
+test('F2. no sudo and no feed folder: the admin line first; once the folder exists, the connect line with --report-dir',async()=>{
+  const h=noSudo({world:{feedExists:false}});
+  let state=await connectRun(h);
+  assert.equal(state.step,'fallback');
+  assert.equal(state.fallbackAdmin,true);
+  assert.equal(state.fallbackCommand,ADMIN_LINE);
+  assert.equal(h.handoffs.made.length,0,'nothing is staged before the folder exists');
+  const html=renderWizard(state),t=textOf(html);
+  assert.ok(t.includes('An admin step first')&&t.includes(`The shared folder ${FEED} does not exist yet`)&&t.includes(ADMIN_LINE));
+  assert.deepEqual(intentsOf(html),['copy','cancel']);
+  await h.advance(1000);
+  assert.equal(h.host.getState().fallbackAdmin,true);
+  h.world.feedExists=true;
+  await h.advance(250);
+  state=h.host.getState();
+  assert.equal(h.handoffs.made.length,1);
+  assert.equal(h.handoffs.made[0].opts.reportDir,FEED);
+  assert.equal(state.fallbackAdmin,false);
+  assert.equal(state.fallbackCommand,h.handoffs.made[0].command);
+  // The connect line gets its own two minutes from when it was shown (t=1250).
+  await h.advance(119000);
+  assert.equal(h.host.getState().step,'fallback');
+  h.handoffs.made[0].result={ok:true,connection:descriptor()};
+  await h.advance(250);
+  assert.equal(h.host.getState().step,'connected');
+  assert.deepEqual(h.calls,[]);
+});
+
+test('F3. no sudo: a feed folder of the wrong shape is refused with its stat, before or while the admin line is shown',async()=>{
+  const h=noSudo({world:{feedGid:999}});
+  let state=await connectRun(h);
+  assert.equal(state.step,'cancelled');
+  assert.match(state.error,/group gid 999.*It must be owner uid 1053, group gid 1001, mode 2750/);
+  assert.equal(h.handoffs.made.length,0);
+  const late=noSudo({world:{feedExists:false}});
+  await connectRun(late);
+  Object.assign(late.world,{feedExists:true,feedMode:0o2777});
+  await late.advance(250);
+  state=late.host.getState();
+  assert.equal(state.step,'cancelled');
+  assert.match(state.error,/mode 2777/);
+  assert.equal(late.handoffs.made.length,0);
+  assert.equal(late.clock.pending(),0);
+});
+
+test('F4. no sudo: two minutes without a result goes to cancelled and disposes the handoff; the admin wait times out too',async()=>{
+  const h=noSudo();
+  await connectRun(h);
+  await h.advance(119750);
+  assert.equal(h.host.getState().step,'fallback');
+  await h.advance(250);
+  const state=h.host.getState();
+  assert.equal(state.step,'cancelled');
+  assert.match(state.error,/within 2 minutes.*the line no longer works/);
+  assert.equal(h.handoffs.made[0].disposed,1);
+  assert.equal(h.clock.pending(),0);
+  const reads=h.handoffs.made[0].reads;
+  await h.advance(10000);
+  assert.equal(h.handoffs.made[0].reads,reads,'no poll after the timeout');
+  assert.equal(state.fallbackUndo,undefined);
+  const admin=noSudo({world:{feedExists:false}});
+  await connectRun(admin);
+  await admin.advance(120000);
+  assert.equal(admin.host.getState().step,'cancelled');
+  assert.match(admin.host.getState().error,/did not appear within 2 minutes.*Nothing was changed/);
+  assert.equal(admin.clock.pending(),0);
+});
+
+test('F5. no sudo: Cancel stops the poll and disposes the handoff; a line that had already run is still read, never "Nothing was changed"',async()=>{
+  const h=noSudo();
+  await connectRun(h);
+  await h.drive({type:'cancel'});
+  let state=h.host.getState();
+  assert.equal(state.step,'cancelled');
+  assert.equal(h.handoffs.made[0].disposed,1);
+  assert.equal(h.clock.pending(),0);
+  assert.match(textOf(renderWizard(state)),/Cancelled\. Nothing was changed\./);
+  const ran=noSudo();
+  await connectRun(ran);
+  ran.handoffs.made[0].result={ok:true,connection:descriptor()}; // it ran; Cancel lands before the next tick
+  await ran.drive({type:'cancel'});
+  state=ran.host.getState();
+  assert.equal(state.step,'cancelled');
+  assert.match(state.warning,/had already run as claudebwai/);
+  assert.equal(state.fallbackUndo,'waiting');
+  assert.equal(ran.handoffs.made[1].opts.action,'disconnect');
+  assert.equal(state.fallbackCommand,ran.handoffs.made[1].command);
+  assert.ok(!textOf(renderWizard(state)).includes('Nothing was changed'));
+  assert.equal(ran.connected.length,0);
+  assert.deepEqual(ran.calls,[]);
+});
+
+test('F6. no sudo: the line ran but VS Code cannot read the descriptor -> undone, no rollback, the exact disconnect line until it runs',async()=>{
+  const h=noSudo({world:{descriptorReadable:false}});
+  await connectRun(h);
+  h.handoffs.made[0].result={ok:true,connection:descriptor()};
+  await h.advance(250);
+  let state=h.host.getState();
+  assert.equal(state.step,'undone');
+  assert.match(state.error,/connection descriptor could not be verified/);
+  assert.deepEqual(state.kept.map(c=>c.id),['status']);
+  assert.deepEqual(state.undone,[]);
+  assert.equal(h.handoffs.made[0].disposed,1);
+  const undo=h.handoffs.made[1];
+  assert.deepEqual(undo.opts,{extensionPath:EXT,provider:'claude',target:{cliPath:null,process:PROC,terminalPid:PID},action:'disconnect',
+    connectionId:ID,revalidate:undo.opts.revalidate});
+  assert.equal(state.fallbackUndo,'waiting');
+  assert.equal(state.fallbackCommand,undo.command);
+  const html=renderWizard(state),t=textOf(html);
+  assert.ok(t.includes("Without sudo the wizard can't undo this itself.")&&t.includes(PROFILE)&&t.includes(FEED)&&t.includes(undo.command),t);
+  assert.ok(intentsOf(html).includes('copy'));
+  assert.equal(h.connected.length,0);
+  undo.result={ok:true,connection:descriptor({connected:false})};
+  await h.advance(250);
+  state=h.host.getState();
+  assert.equal(state.fallbackUndo,'done');
+  assert.equal(state.fallbackCommand,undefined);
+  assert.equal(undo.disposed,1);
+  assert.equal(h.clock.pending(),0);
+  assert.match(textOf(renderWizard(state)),/The undo line ran as claudebwai: claudebwai's Claude status line is back as it was\./);
+  assert.deepEqual(h.calls,[],'no sudo, so no rollback call');
+});
+
+test('F7. no sudo: each failed result says what changed; only a line that may have changed something gets the undo line',async()=>{
+  const cases=[
+    [{ok:false,code:'SETUP_FAILED',message:'Target-user setup could not finish.'},/its status line was not changed/,false],
+    [{ok:false,code:'CANCELLED',message:'Setup cancelled.'},/cancelled as claudebwai\. Nothing was changed/,false],
+    [{ok:false,code:'SETUP_FAILED_CHANGED',message:'Target-user setup could not finish.'},/stopped after it had changed the status line/,true],
+    [()=>{throw new Error('unverified');},/its result could not be verified/,true],
+  ];
+  for(const [out,error,undo] of cases) {
+    const h=noSudo();
+    await connectRun(h);
+    h.handoffs.made[0].result=out;
+    await h.advance(250);
+    const state=h.host.getState();
+    assert.equal(state.step,'undone');
+    assert.match(state.error,error);
+    assert.equal(h.handoffs.made[0].disposed,1);
+    assert.equal(h.handoffs.made.length,undo?2:1,String(error));
+    assert.equal(state.fallbackUndo,undo?'waiting':undefined);
+    if(undo)assert.equal(state.fallbackCommand,h.handoffs.made[1].command);
+    assert.deepEqual(h.calls,[]);
+  }
+  // An undo line that fails says so, and the line goes away (its dropbox is spent).
+  const h=noSudo();
+  await connectRun(h);
+  h.handoffs.made[0].result={ok:false,code:'SETUP_FAILED_CHANGED',message:'x'};
+  await h.advance(250);
+  h.handoffs.made[1].result={ok:false,code:'SETUP_FAILED',message:'x'};
+  await h.advance(250);
+  const state=h.host.getState();
+  assert.equal(state.fallbackUndo,'failed');
+  assert.equal(state.fallbackCommand,undefined);
+  assert.match(textOf(renderWizard(state)),/could not finish, so claudebwai's Claude status line has to be put back by hand/);
+});
+
+test('F8. the undo line ends with the wizard: Close, a new run and Start again each dispose it and stop its poll',async()=>{
+  const failed=async()=>{
+    const h=noSudo({world:{descriptorReadable:false}});
+    await connectRun(h);
+    h.handoffs.made[0].result={ok:true,connection:descriptor()};
+    await h.advance(250);
+    assert.equal(h.host.getState().fallbackUndo,'waiting');
+    return h;
+  };
+  for(const action of [{type:'close'},OPEN,{type:'retry'}]) {
+    const h=await failed();
+    await h.drive(action);
+    assert.equal(h.handoffs.made[1].disposed,1,action.type);
+    const reads=h.handoffs.made[1].reads;
+    await h.advance(1000);
+    assert.equal(h.handoffs.made[1].reads,reads,`${action.type}: no poll after release`);
+    assert.equal(h.host.getState().fallbackUndo,undefined);
+  }
+});
+
+test('F9. finding 6 on the no-sudo road: focus changes are never actions and never re-read the session',async()=>{
+  const h=noSudo();
+  const before=await connectRun(h);
+  const detects=h.detects.length;
+  for(const action of [{type:'focus'},{type:'activeTerminal',terminal:{processId:9999}},{type:'select',pid:9999}]) {
+    h.host.dispatch(action);
+    await h.advance(250);
+  }
+  const during=h.host.getState();
+  assert.equal(during.step,'fallback');
+  assert.equal(during.fallbackCommand,before.fallbackCommand);
+  assert.equal(h.detects.length,detects,'no session re-read from a focus change');
+  h.handoffs.made[0].result={ok:true,connection:descriptor()};
+  await h.advance(250);
+  assert.equal(h.host.getState().step,'connected');
+  assert.ok(h.detects.slice(detects).every(d=>d.pid===PID),'the re-check reads the terminal chosen at open');
+});
+
+test('F10. no-sudo disconnect: the disconnect line, onDisconnected on its result, and the shared folder stays with a warning',async()=>{
+  const h=noSudo();
+  let state=await h.drive(OPEN_DISCONNECT,{type:'continue'},{type:'connect'});
+  assert.equal(state.step,'fallback');
+  const [handoff]=h.handoffs.made;
+  assert.equal(handoff.opts.action,'disconnect');
+  assert.equal(handoff.opts.connectionId,ID);
+  assert.equal(handoff.opts.reportDir,undefined);
+  assert.equal(state.fallbackCommand,handoff.command);
+  assert.equal(h.homes.length,0,'the saved connection names the profile');
+  handoff.result={ok:true,connection:descriptor({connected:false})};
+  await h.advance(250);
+  state=h.host.getState();
+  assert.equal(state.step,'connected');
+  assert.deepEqual(h.disconnected,[[FEED,ID]]);
+  assert.match(state.warning,/stays: removing it needs an admin/);
+  assert.equal(handoff.disposed,1);
+  assert.deepEqual(h.calls,[]);
+});
+
+test('F11. no sudo: a reconnect uses its saved profile; an unknown home stops before anything is shown',async()=>{
+  const h=noSudo({deps:{homeOf:async()=>{throw new Error('no passwd');}}});
+  const state=await h.drive({...OPEN,connection:CONNECTION},{type:'continue'},{type:'connect'});
+  assert.equal(state.step,'fallback');
+  assert.equal(h.handoffs.made[0].opts.profilePath,PROFILE);
+  assert.equal(h.handoffs.made[0].opts.reportDir,FEED);
+  const lost=noSudo({deps:{homeOf:async()=>null}});
+  const out=await lost.drive(OPEN,{type:'continue'});
+  assert.equal(out.step,'cancelled');
+  assert.equal(out.error,"claudebwai's home folder could not be read from /etc/passwd, so the wizard cannot name its Claude profile. Nothing was changed.");
+  assert.equal(lost.handoffs.made.length,0);
+});
+
+test('F12. dispose() (extension deactivate) stops the poll and disposes the handoff',async()=>{
+  const h=noSudo();
+  await connectRun(h);
+  await h.host.dispose();
+  assert.equal(h.handoffs.made[0].disposed,1);
+  assert.equal(h.clock.pending(),0);
+});
+
+test('F13. the no-sudo screens escape every value they show',()=>{
+  const EVIL='<img src=x onerror=alert(1)>';
+  const base={mode:'connect',target:{provider:'claude',user:EVIL,uid:1,pid:1,process:{}},sudo:'none',busy:false,runId:'r',pending:null,
+    applied:[],undone:[],kept:[{id:'status'}],preview:{profilePath:`/p/${EVIL}`,reportDir:`/f/${EVIL}`,changes:[{id:'status'}]},error:EVIL,warning:null,log:[]};
+  const screens=[{...base,step:'fallback',busy:true,fallbackAdmin:true,fallbackCommand:EVIL,fallbackWaitMs:120000},
+    ...['waiting','failed','done'].flatMap(u=>[{...base,step:'undone',fallbackUndo:u,fallbackCommand:EVIL},{...base,step:'cancelled',fallbackUndo:u,fallbackCommand:EVIL}])];
+  for(const s of screens) {
+    const html=renderWizard(s);
+    assert.ok(html.length>0);
+    assert.ok(!html.includes('<img'),`${s.step}/${s.fallbackUndo||'admin'}`);
+  }
+  assert.ok(textOf(renderWizard(screens[0])).includes('An admin step first'));
+  assert.ok(textOf(renderWizard(screens[1])).includes("can't undo this itself"));
+});

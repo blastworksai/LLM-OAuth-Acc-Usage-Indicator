@@ -49,10 +49,14 @@ async function prepareHandoff({extensionPath,provider,target,action='connect',co
       }
       // Only known, empty directories may be removed. Unexpected entries are
       // neither enumerated nor traversed; ENOTEMPTY leaves them for the owner.
-      for(const [name,handle] of directories) {
-        await handle.close();await attempt(()=>io.rmdir(`${rootAnchor}/${name}`));
+      // Every directory this run may have made is tried by name, pinned or not: a failure between a mkdir and its
+      // open left that folder unpinned, and skipping it kept the root (finding 2's signature: only results/ left).
+      // rmdir never follows a symlink and never removes a non-empty folder; a name never made is ENOENT.
+      for(const name of ['src','collectors']) {
+        await directories.get(name)?.close();await attempt(()=>io.rmdir(`${rootAnchor}/${name}`));
       }
-      if(drop){await drop.close();drop=null;await attempt(()=>io.rmdir(`${rootAnchor}/results`));}
+      if(drop){await drop.close();drop=null;}
+      await attempt(()=>io.rmdir(`${rootAnchor}/results`));
       const current=await io.lstat(root).catch(error=>{if(error.code!=='ENOENT')throw error;});
       if(current && current.isDirectory() && current.ino===identity.ino && current.dev===identity.dev && current.uid===identity.uid)
         await attempt(()=>io.rmdir(root));
@@ -80,6 +84,8 @@ async function prepareHandoff({extensionPath,provider,target,action='connect',co
     const args=action==='connect'?['--provider',provider,...(target.cliPath?['--cli',target.cliPath]:[]),'--result',resultPath,'--runtime-version',runtimeVersion,
       ...(profilePath?['--profile',profilePath]:[]),...(reportDir?['--report-dir',reportDir]:[])]:['--connection-id',connectionId,'--result',resultPath];
     if(action==='connect'||target.cliPath===null)args.push('--target',JSON.stringify({provider,process:target.process}));
+    // The Connect click is the consent (einh's ruling), so the line never waits on a TTY prompt (finding 3).
+    args.push('--consent','granted');
     const command=`node ${quote(path.join(root,'src/setup-cli.cjs'))} ${action} `+args.map((value,index)=>index%2?quote(value):value).join(' ');
     async function readResult() {
       if(disposed)throw invalid();

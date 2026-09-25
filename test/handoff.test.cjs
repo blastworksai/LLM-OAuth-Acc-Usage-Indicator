@@ -45,7 +45,7 @@ test('readable native handoffs carry the captured process identity beside the ex
  assert.deepEqual(JSON.parse(decoded[decoded.indexOf('--target')+1]),{provider:'claude',process:f.target.process});
  assert.equal(decoded[decoded.indexOf('--cli')+1],f.target.cliPath);
 });
-test('a readable staged reconnect whose process exits during consent leaves profile receipt and feed untouched',async t=>{
+test('a readable staged reconnect whose process exits after the command-line consent leaves profile receipt and feed untouched',async t=>{
  const home=await fs.mkdtemp(path.join(os.tmpdir(),'readable-handoff-'));t.after(()=>fs.rm(home,{recursive:true,force:true}));
  const bin=path.join(home,'bin'),profile=path.join(home,'.claude');await fs.mkdir(bin);await fs.mkdir(profile,{mode:0o700});
  const cliPath=path.join(bin,'claude');await fs.symlink(process.execPath,cliPath);await fs.writeFile(path.join(profile,'settings.json'),'{}',{mode:0o600});
@@ -59,15 +59,17 @@ test('a readable staged reconnect whose process exits during consent leaves prof
   profilePath:connection.profilePath,reportDir:connection.reportDir,revalidate:async()=>target});t.after(()=>handoff.dispose());
  const decoded=execFileSync('/bin/sh',['-c',handoff.command.replace(/^node /,'printf \'%s\\n\' ')],{encoding:'utf8'}).trim().split('\n');
  const files=[connection.settingsPath,path.join(path.dirname(connection.launcherPath),'connection.json'),path.join(connection.reportDir,'.connection.json')];
- const before=await Promise.all(files.map(file=>fs.readFile(file)));let live=true,mutationCalls=0;
+ const before=await Promise.all(files.map(file=>fs.readFile(file)));let live=true,mutationCalls=0,prompted=0,verifications=0;
  const verifier=require(path.join(handoff.root,'src/provider.cjs')).verifyTargetProcess;
+ // The process is verified once before the review, then exits: the re-check after consent must stop every write.
  const result=await require(decoded[0]).run(decoded.slice(1),{...dependencies,
-  verifyTargetProcess:(value,options)=>verifier(value,{...options,getProcess:async()=>live?{...target.process,ppid:10,tty_nr:1,pgrp:20,tpgid:20}:null,
-   getExecutable:async()=>fs.realpath(process.execPath)}),
-  readConsent:async()=>{live=false;return 'yes';},
+  verifyTargetProcess:async(value,options)=>{const call=++verifications,verified=await verifier(value,{...options,getProcess:async()=>live?{...target.process,ppid:10,tty_nr:1,pgrp:20,tpgid:20}:null,
+   getExecutable:async()=>fs.realpath(process.execPath)});if(call===1)live=false;return verified;},
+  readConsent:async()=>{prompted++;return 'yes';},
   ensureReportDirectory:async(...args)=>{mutationCalls++;return setup.ensureReportDirectory(...args);},
   setup:{...setup,connectProvider:async options=>{mutationCalls++;return setup.connectProvider(options);}}});
- assert.equal(live,false,'the real matching native process must reach consent before the simulated exit');
+ assert.equal(prompted,0,'the handoff line carries the consent; it never waits on a prompt');
+ assert.equal(verifications,2,'the real matching native process must pass the first check before the simulated exit');
  assert.equal(result.code,1);assert.equal(mutationCalls,0);
  assert.deepEqual(await Promise.all(files.map(file=>fs.readFile(file))),before);
  assert.equal(JSON.parse(await fs.readFile(handoff.resultPath,'utf8')).ok,false);
@@ -191,4 +193,53 @@ test('a failed result may carry one reason code; a malformed reason is refused',
     await publish(bad.handoff,{ok:false,code:'SETUP_FAILED',reason,message:'Target-user setup could not finish.'});
     await assert.rejects(bad.handoff.readResult(),/setup result could not be verified/i,String(reason));
   }
+});
+const decode=command=>execFileSync('/bin/sh',['-c',command.replace(/^node /,'printf \'%s\\n\' ')],{encoding:'utf8'}).trim().split('\n');
+// setup-cli's own parser decides: invalid arguments return code 2 before anything else; valid ones reach home().
+async function parses(argv) {
+ const reached=new Error('parsed');
+ try {return (await require('../src/setup-cli.cjs').run(argv,{setup:{},print:()=>{},home:()=>{throw reached;}})).code!==2;}
+ catch(error) {if(error===reached)return true;throw error;}
+}
+test('finding 2: prepare then dispose on a real tmpdir removes the whole bundle, results/ included',async t=>{
+ for(const published of [false,true]) {
+  const f=await fixture(t),h=f.handoff;
+  assert.equal((await fs.lstat(path.join(h.root,'results'))).isDirectory(),true);
+  if(published)await publish(h,{ok:true,connection:f.connection});
+  assert.deepEqual(await h.dispose(),{removed:true});
+  await assert.rejects(fs.lstat(path.join(h.root,'results')),{code:'ENOENT'});
+  await assert.rejects(fs.lstat(h.root),{code:'ENOENT'});
+ }
+});
+test('finding 2: a staging failure after a folder is made still removes that folder and the root',async t=>{
+ // Each fault lands between a mkdir and the open that pins it; the old cleanup skipped such a folder and kept the root.
+ for(const [key,suffix] of [['open','/results'],['chmod','/results'],['open','/collectors']]) {
+  const tempRoot=await fs.mkdtemp(path.join(os.tmpdir(),'handoff-fault-'));t.after(()=>fs.rm(tempRoot,{recursive:true,force:true}));
+  const io=new Proxy(fs,{get(target,name){if(name===key)return async(file,...rest)=>{
+   if(String(file).endsWith(suffix))throw Object.assign(new Error('injected'),{code:'EMFILE'});return fs[name](file,...rest);};return target[name];}});
+  const target={provider:'claude',cliPath:'/usr/bin/claude',process:{pid:20,uid:process.getuid(),start_ticks:'20',boot_id:'boot'}};
+  await assert.rejects(prepareHandoff({extensionPath,provider:'claude',target,tempRoot,runtimeVersion:'0.4.0',revalidate:async()=>target,fs:io}),{code:'EMFILE'});
+  assert.deepEqual(await fs.readdir(tempRoot),[],`${key} ${suffix}: nothing of the bundle is left`);
+ }
+});
+test('the handoff line carries the consent for connect and disconnect, and setup-cli accepts it',async t=>{
+ const base=connectionIdentity({provider:'claude',uid:process.getuid(),settingsPath:'/home/target/.claude/settings.json'});
+ for(const overrides of [{},{action:'disconnect',connectionId:base.id}]) {
+  const decoded=decode((await fixture(t,overrides)).handoff.command);
+  assert.equal(decoded[decoded.indexOf('--consent')+1],'granted',overrides.action||'connect');
+  assert.equal(await parses(decoded.slice(1)),true,overrides.action||'connect');
+ }
+});
+test('reportDir reaches a connect line as --report-dir, and every line stays inside setup-cli\'s argument limit',async t=>{
+ const base=connectionIdentity({provider:'claude',uid:process.getuid(),settingsPath:'/home/target/.claude/settings.json'});
+ const feed='/var/lib/llm-account-usage/feeds/'+base.id;
+ const full=decode((await fixture(t,{reportDir:feed,profilePath:'/home/target/.claude'})).handoff.command);
+ assert.equal(full[full.indexOf('--report-dir')+1],feed);assert.equal(full[full.indexOf('--profile')+1],'/home/target/.claude');
+ assert.equal(await parses(full.slice(1)),true,'the widest connect line (every option) still parses');
+ const unresolved={provider:'claude',cliPath:null,process:{pid:20,uid:process.getuid(),start_ticks:'20',boot_id:'boot'}};
+ for(const target of [undefined,unresolved]) {
+  const decoded=decode((await fixture(t,{action:'disconnect',connectionId:base.id,reportDir:feed,...(target?{target}:{})})).handoff.command);
+  assert.equal(decoded.includes('--report-dir'),false,'disconnect names its feed by connection id; setup-cli refuses --report-dir there');
+  assert.equal(await parses(decoded.slice(1)),true);
+ }
 });

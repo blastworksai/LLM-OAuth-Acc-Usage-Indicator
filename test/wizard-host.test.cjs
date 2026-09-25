@@ -954,6 +954,8 @@ test('F6. no sudo: the line ran but VS Code cannot read the descriptor -> undone
 test('F7. no sudo: each failed result says what changed; only a line that may have changed something gets the undo line',async()=>{
   const cases=[
     [{ok:false,code:'SETUP_FAILED',message:'Target-user setup could not finish.'},/its status line was not changed/,false],
+    [{ok:false,code:'SETUP_FAILED',reason:'UNSAFE_PATH',message:'Target-user setup could not finish.'},/its status line was not changed\. A file in claudebwai's Claude profile has an unsafe owner/,false],
+    [{ok:false,code:'SETUP_FAILED',reason:'NOT_A_KNOWN_CODE',message:'Target-user setup could not finish.'},/its status line was not changed\.$/,false],
     [{ok:false,code:'CANCELLED',message:'Setup cancelled.'},/cancelled as claudebwai\. Nothing was changed/,false],
     [{ok:false,code:'SETUP_FAILED_CHANGED',message:'Target-user setup could not finish.'},/stopped after it had changed the status line/,true],
     [()=>{throw new Error('unverified');},/its result could not be verified/,true],

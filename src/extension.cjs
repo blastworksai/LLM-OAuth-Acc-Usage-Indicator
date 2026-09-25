@@ -357,7 +357,7 @@ function activate(context) {
     if(!view?.visible || polling || wizardActive())return;
     polling=true;try{await refresh(true);}finally{polling=false;}
   },2000);
-  context.subscriptions.push({dispose(){clearInterval(timer);controller.dispose();}});
+  context.subscriptions.push({dispose(){clearInterval(timer);controller.dispose();void wizardHost?.dispose?.().catch?.(()=>{});}});
   void refresh();
   return {getState:()=>controller.state,getRows:()=>buildRows(controller.state),getViewModel,getHtml,refresh:()=>refresh(),
     getWizardState:()=>wizardState,wizardSettled:async()=>{await wizardHost?.settled();return wizardState;}};

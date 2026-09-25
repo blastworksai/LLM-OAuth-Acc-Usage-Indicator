@@ -114,7 +114,8 @@ async function prepareHandoff({extensionPath,provider,target,action='connect',co
         const current=await verify();
         if(disposed||!current||current.unavailable||current.provider!==(expected.cliPath===null?null:expected.provider)||
           current.cliPath!==expected.cliPath||!sameProcess(current.process,expected.process))throw invalid();
-        return result.ok?result:{ok:false,code:result.code,message:result.code==='CANCELLED'?'Setup cancelled.':'Target-user setup could not finish.'};
+        return result.ok?result:{ok:false,code:result.code,...(Object.hasOwn(result,'reason')?{reason:result.reason}:{}),
+          message:result.code==='CANCELLED'?'Setup cancelled.':'Target-user setup could not finish.'};
       } catch {throw invalid();}
       finally {await file?.close();}
     }

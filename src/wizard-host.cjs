@@ -313,12 +313,13 @@ function createWizardHost({elevate,sharedFeed=require('./shared-feed.cjs'),detec
         if(r.raw.mode!=='disconnect'){fb.changed=true;r.connectionId=out.connection.id;}
         return result(r,{type:'fallbackResult',ok:true,change:{id:'status',as:r.target.user}});
       }
-      const user=r.target.user;
+      const user=r.target.user,why=reasonText(out,user,NAMES[r.target.provider]);
       if(out.code==='SETUP_FAILED_CHANGED'&&r.raw.mode!=='disconnect')fb.changed=true;
-      result(r,{type:'fallbackResult',ok:false,error:out.code==='CANCELLED'?`The line was cancelled as ${user}. Nothing was changed.`
+      const error=out.code==='CANCELLED'?`The line was cancelled as ${user}. Nothing was changed.`
         :fb.changed?`Setup as ${user} stopped after it had changed the status line.`
         :r.raw.mode==='disconnect'?`Disconnect as ${user} could not finish. Nothing was removed.`
-        :`Setup as ${user} could not finish; its status line was not changed.`});
+        :`Setup as ${user} could not finish; its status line was not changed.`;
+      result(r,{type:'fallbackResult',ok:false,error:why&&out.code!=='CANCELLED'?`${error} ${why}`:error});
     } catch(error) {
       if(!fb.stopped&&live(r,'fallback'))result(r,{type:'failed',error:message(error)});
     }

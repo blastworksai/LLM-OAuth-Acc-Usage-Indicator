@@ -12,27 +12,23 @@ Account emails are hidden in these screenshots.
 
 ## Install
 
-> **0.3.5 release candidate:** The multi-profile and cross-user setup described below is candidate behavior.
-> Installed Remote-SSH acceptance checks are deferred and have not been run; this candidate is not live-accepted.
-> Marketplace still carries the prior stable release, without these 0.3.5 changes.
-> To evaluate the candidate, use the 0.3.5 VSIX from a GitHub prerelease when available.
-
-1. For the stable release, install [Account Usage from the VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=BlastworksAI.llm-oauth-acc-usage-indicator).
-   For the 0.3.5 candidate, use **Extensions: Install from VSIX…** as described below.
+1. Install [Account Usage from the VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=BlastworksAI.llm-oauth-acc-usage-indicator).
    For Remote-SSH, install it on the Linux SSH host.
 2. Run **Account Usage: Open Card** and select your AI terminal.
 3. For an unconnected supported terminal, click **Connect Codex**, **Connect Claude** or **Connect Antigravity** on the card.
    If safe process detection cannot name the provider, click **Connect Provider** and choose it.
    Check the profile and approve the connection.
-   In 0.3.5, if the CLI runs as another Linux user, copy the setup command and run it in a separate shell already owned by that user, as described in [setup](docs/SETUP.md#another-linux-user).
+   If the CLI runs as another Linux user, the card opens a connect wizard instead, as described in [setup](docs/SETUP.md#another-linux-user).
 4. Finish one fresh turn in that CLI. Its local adapter publishes the account and quota reading, and the card follows that session.
+   A session that was already running when you connected does not pick up the new hook or statusline, because the CLI reads its settings only at startup: close its terminal, open a fresh one, then finish one turn in it.
 
 For manual installation, download the `.vsix` from [GitHub Releases](https://github.com/blastworksai/LLM-OAuth-Acc-Usage-Indicator/releases), then run **Extensions: Install from VSIX…** in VS Code.
 
-In 0.3.5, connect each provider profile independently, in any order, including multiple profiles of the same provider.
-Use an existing CLI login; the extension does not ask for passwords, API keys or tokens.
+Connect each provider profile independently, in any order, including multiple profiles of the same provider.
+Use an existing CLI login; the extension does not ask for provider passwords, API keys or tokens.
+The only password it can ask for is your own `sudo` password, when connecting a CLI that runs as another Linux user.
 Same-user setup uses VS Code's Node runtime and needs one confirmation.
-Cross-user setup requires `node` on the target user's shell PATH for its setup command.
+Cross-user setup runs `node` as the target user: through `sudo`, it must be on `sudo`'s `secure_path`; without `sudo`, on that user's shell PATH.
 No Python installation is needed.
 
 ## Supported tools and hosts
@@ -46,7 +42,7 @@ No Python installation is needed.
 | Muse and other CLIs | Unsupported | No numbers displayed |
 
 The terminal host must run **Linux**.
-Desktop VS Code with Remote-SSH to Linux is the supported setup, including an explicit setup command for a CLI running as another Linux user.
+Desktop VS Code with Remote-SSH to Linux is the supported setup, including the connect wizard for a CLI running as another Linux user.
 Local Windows/macOS terminals, browser VS Code, WSL, Dev Containers and Codespaces are outside this release's support scope.
 A native provider process must be running in the selected terminal; common package-manager script launchers are supported by binding that exact process rather than guessing from terminal names.
 Provider setup requires the standard Linux shell and GNU-compatible core utilities.
@@ -79,15 +75,19 @@ If the CLI or one of its parent directories is controlled by another Linux owner
 Approve only when you trust everyone who can replace that software.
 Detection has no hard-coded installation root or username; each approval is tied to the exact discovered metadata, and setup does not change existing permissions.
 
-For a CLI owned by another Linux user, the extension shows one command to run in a separate target-user shell.
-It never invokes `sudo`, sends text into the agent's terminal or stops its process.
-Cross-user reports need a target-owned feed that the extension host can read through an existing Linux group: directory permissions at most `2750`, report files at most `0640`, with no group write or access for other users.
-If the feed is not safely readable, the connection is not accepted and setup explains the shared-group permission requirement; it never makes reports world-readable.
+For a CLI owned by another Linux user, the card opens a connect wizard.
+The extension uses `sudo` to change that user's settings and create its feed only after you press **Connect** on a review screen that lists every change and the exact commands.
+Before that screen, `sudo` only checks that it is available, stages the wizard's own setup files and reads the profile as that user.
+The extension never stores a sudo password; without `sudo`, it shows one command to run as that user.
+It never sends text into the agent's terminal or stops its process.
+If a step fails after changes were applied, the wizard undoes them in reverse order and lists anything it had to keep.
+Cross-user reports go to a feed at `/var/lib/llm-account-usage/feeds/<connection-id>/`, owned by the target user, with the VS Code account's primary group and directory mode `2750`; report files are at most `0640`, with no group write or access for other users.
+If the feed is not safely readable, the connection is not accepted; setup never makes reports world-readable.
 Private backups and collector runtime remain under the profile owner's control.
 
 Run **Account Usage: Disconnect Provider** before uninstalling and choose the individual profile by UID and path.
 Disconnect restores only that profile's backed-up statusline or removes its exact managed Codex hook; other profiles stay connected.
-Cross-user disconnect uses a separate target-user command too.
+Cross-user disconnect runs through the same wizard and removes the shared feed folder; without `sudo` the folder stays, because removing it needs an admin.
 Removing an extension cannot guarantee that provider settings are restored automatically.
 
 See [setup and troubleshooting](docs/SETUP.md) and [privacy](docs/PRIVACY.md). When reporting an issue, remove emails, account identifiers, terminal names, paths and session IDs from screenshots and diagnostics.

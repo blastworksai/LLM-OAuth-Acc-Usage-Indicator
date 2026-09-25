@@ -28,32 +28,39 @@ It survives removal of editor installation files, so a configured hook remains r
 Connections are distinguished by provider, numeric Linux UID and settings path, not by an account email or a user-to-account registry.
 These are runtime data on the installing user's machine, never included in the downloadable package.
 
-For explicit cross-user setup, the target user publishes sanitized reports in a separate feed: by default `~/.llm-account-usage-feeds/<connection-id>/`, or an existing directory selected during setup.
-That feed must be owned by the target user and readable by the extension host through an existing Linux group.
+For cross-user setup, the target user publishes sanitized reports in a separate feed at `/var/lib/llm-account-usage/feeds/<connection-id>/`, which the connect wizard creates with `sudo`.
+That feed is owned by the target user, with the VS Code account's primary group, so the extension host can read it.
 Directory permissions are at most `2750` (`0750` without setgid); report files and the connection descriptor are at most `0640`.
 Members of that group can read the reports, including account email when present, and the connection descriptor's UID and local configuration/runtime paths.
 Backed-up settings and the private collector runtime are not placed in the shared feed.
 The extension records the accepted feed path in machine-local editor state.
 It does not add group memberships, change existing permissions or make reports world-readable if access fails.
+Disconnect through the wizard removes the feed folder; a disconnect without `sudo` leaves it in place, because removing it needs an admin.
 
-The copied setup command stages local helper code and a short-lived result containing connection metadata such as provider, UID and paths.
+For a session owned by another Linux account, the extension uses `sudo` to change that account's settings and create its feed only after you press **Connect** on a review screen that lists every change and the exact commands.
+Before that screen, `sudo` only checks that it is available, stages the setup files and reads the profile as that account.
+If `sudo` needs a password, you type it into VS Code's password box; it goes to `sudo -S` for that run only and is never written anywhere.
+The extension never stores a sudo password, never sends text into the agent's terminal and never stops the selected agent.
+With `sudo`, root stages the setup files the target account runs in `/var/lib/llm-account-usage/bundles/`, where that account can read but not change them, and removes them when the run ends; the result comes back to the extension directly.
+
+Without `sudo`, the extension shows one command to run as that account.
+That command stages local helper code and a short-lived result containing connection metadata such as provider, UID and paths.
 This temporary handoff is readable by other local users so the two Linux accounts can exchange the result; it contains no account email, quota readings, backed-up settings or credentials.
 The extension validates the result's owner and selected live process before accepting it, then cleans up the known staged files.
-Running the command is explicit: the extension never invokes `sudo` or stops the selected agent.
 
 The backup is a copy of the **full provider settings or hooks file**, which may include secrets or sensitive configuration you put there. Backups are readable only by your operating-system user and remain after disconnection for recovery. Treat them as private credentials and do not attach them to issues.
 
 When you explicitly approve shared or externally owned Linux CLI paths during connection, each path's kind, numeric owner/group IDs and permission mode are saved in that profile's private launcher.
-Same-user setup also saves the approval in the extension host's local editor state; cross-user setup asks for consent in the target user's shell.
+Same-user setup also saves the approval in the extension host's local editor state; for cross-user setup, pressing **Connect** in the wizard is the consent.
 This approval is not synchronized through VS Code Settings Sync.
 People who control those paths must be trusted; the extension does not make shared software private.
 The collector rechecks the fingerprint before each observation.
 Ownership or permission changes disable collection and require another review.
-World-writable paths and writable settings files remain refused.
+World-writable paths and world-writable settings files remain refused.
 
 Run **Account Usage: Disconnect Provider** before uninstalling and choose each profile you want to remove.
 Disconnect restores only the selected profile's backed-up statusline or removes its exact managed hook; other profiles remain connected.
-Cross-user disconnect requires an explicit command under the target user too.
+Cross-user disconnect runs through the same wizard, with the same `sudo` rules.
 Backups and reports may remain locally for recovery; they can be removed after checking the disconnect result.
 Do not publish this storage folder in a bug report.
 
